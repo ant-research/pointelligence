@@ -4,7 +4,7 @@ Pointelligence is a repository for 3D point cloud research, currently featuring:
 
 * the official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227) (CVPR 2026)—a significant next evolution of [PointCNN](https://github.com/yangyanli/PointCNN) (NeurIPS 2018).
 
-# Clone
+# Clone the Repository
 
 Clone the repository with third-party submodules (FCGF and Pointcept) recursively:
 
