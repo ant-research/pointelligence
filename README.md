@@ -4,6 +4,27 @@ Pointelligence is a repository for 3D point cloud research, currently featuring:
 
 * the official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227) (CVPR 2026)—a significant next evolution of [PointCNN](https://github.com/yangyanli/PointCNN) (NeurIPS 2018).
 
+# Clone
+
+Clone the repository with third-party submodules (FCGF and Pointcept) recursively:
+
+```shell
+git clone --recursive https://github.com/ant-research/pointelligence.git
+cd pointelligence
+```
+
+For reproducibility, checkout the following commits in the submodules:
+
+```shell
+# FCGF (examples/FCGF)
+cd examples/FCGF && git checkout pointcnnpp-version && cd ../..
+
+# Pointcept (examples/Pointcept)
+cd examples/Pointcept && git checkout pointcnnpp-version && cd ../..
+```
+
+If you have already cloned without `--recursive`, run `git submodule update --init --recursive` to fetch the submodules.
+
 # Installation
 
 Some operators are implemented with C++/CUDA as PyTorch extensions, which could be built and installed with the following commands:
