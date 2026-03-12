@@ -1,0 +1,100 @@
+#include <cfenv>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+#include <torch/library.h>
+
+#include "common.h"
+
+namespace sparse_engines_cuda {
+
+void sparse_vector_vector_outer_product_reduction_impl(
+	at::Tensor a, at::Tensor a_idx, at::Tensor b, at::Tensor b_idx, at::Tensor o_idx, at::Tensor o
+) {
+	if (a.size(2) > 1 && b.size(2) == 1) {
+		std::swap(a, b);
+		std::swap(a_idx, b_idx);
+	}
+
+	const auto T = a_idx.size(0);
+	const auto G = a.size(1);
+	const auto M = a.size(2);
+	const auto C = b.size(2);
+
+	const auto a_ptr = a.data_ptr<float>();
+	const auto a_idx_ptr = a_idx.data_ptr<int32_t>();
+	const auto b_ptr = b.data_ptr<float>();
+	const auto b_idx_ptr = b_idx.data_ptr<int32_t>();
+	const auto o_idx_ptr = o_idx.data_ptr<int32_t>();
+	auto o_ptr = o.data_ptr<float>();
+
+	int round = fegetround();
+	fesetround(FE_TONEAREST);
+	for (int t = 0; t < T; ++t) {
+		const auto a_k = a_idx_ptr[t];
+		const auto b_k = b_idx_ptr[t];
+		const auto o_k = o_idx_ptr[t];
+
+		for (int g = 0; g < G; ++g) {
+			const auto a_offset = (a_k * G + g) * M;
+			const auto b_offset = (b_k * G + g) * C;
+			const auto o_offset = (o_k * G + g) * C * M;
+			for (int m = 0; m < M; ++m) {
+				const auto a_reg = a_ptr[a_offset + m];
+				const auto o_ffset_ = o_offset + m * C;
+				for (int c = 0; c < C; ++c) {
+					o_ptr[o_ffset_ + c] = fmaf(a_reg, b_ptr[b_offset + c], o_ptr[o_ffset_ + c]);
+				}
+			}
+		}
+	}
+	fesetround(round);
+}
+
+void sparse_vector_vector_outer_product_reduction_check(at::Tensor a, at::Tensor a_idx, at::Tensor b, at::Tensor b_idx, at::Tensor o_idx){
+	// clang-format off
+    TORCH_CHECK(a.device() == a_idx.device(), "a and a_idx must be on the same device.")
+    TORCH_CHECK(a.device() == b.device(), "a and b must be on the same device.")
+    TORCH_CHECK(a.device() == b_idx.device(), "a and b_idx must be on the same device.")
+    TORCH_CHECK(a.device() == o_idx.device(), "a and o_idx must be on the same device.")
+
+    TORCH_CHECK(a.dtype() == torch::kFloat32, "a must have dtype torch::kFloat32")
+    TORCH_CHECK(a.dim() == 3, "a must be a 3-D tensor.")
+
+    TORCH_CHECK(a_idx.dtype() == torch::kInt32, "a_idx must have dtype torch::kInt32.")
+    TORCH_CHECK(a_idx.dim() == 1, "a_idx must be a 1-D tensor.")
+
+    TORCH_CHECK(b.dtype() == torch::kFloat32, "b must have dtype torch::kFloat32.")
+    TORCH_CHECK(a.size(1) == b.size(1), "a.size(1) must be equal to b.size(1).")
+    TORCH_CHECK(b.dim() == 3, "b must be a 3-D tensor.")
+
+    TORCH_CHECK(b_idx.dtype() == a_idx.dtype(), "b_idx must have same dtype with a_idx.")
+    TORCH_CHECK(b_idx.numel() == a_idx.numel(), "b_idx must have same numel with a_idx.")
+    TORCH_CHECK(b_idx.dim() == 1, "b_idx must be a 1-D tensor.")
+
+    TORCH_CHECK(o_idx.dtype() == a_idx.dtype(), "o_idx must have same dtype with a_idx.")
+    TORCH_CHECK(o_idx.numel() == a_idx.numel(), "o_idx must have same numel with a_idx.")
+    TORCH_CHECK(o_idx.dim() == 1, "o_idx must be a 1-D tensor.")
+	// clang-format on
+}
+
+at::Tensor
+	sparse_vector_vector_outer_product_reduction(at::Tensor a, at::Tensor a_idx, at::Tensor b, at::Tensor b_idx, at::Tensor o_idx, int64_t n) {
+	sparse_vector_vector_outer_product_reduction_check(a, a_idx, b, b_idx, o_idx);
+
+	a = a.contiguous();
+	b = b.contiguous();
+
+	const auto options = at::TensorOptions().dtype(torch::kFloat32).device(a.device());
+	auto o = torch::zeros({n, a.size(1), a.size(2), b.size(2)}, options);
+	sparse_vector_vector_outer_product_reduction_impl(a, a_idx, b, b_idx, o_idx, o);
+
+	return o;
+}
+
+TORCH_LIBRARY_IMPL(sparse_engines_cuda, CPU, m) {
+	m.impl("sparse_vector_vector_outer_product_reduction", &sparse_vector_vector_outer_product_reduction);
+}
+
+} // namespace sparse_engines_cuda

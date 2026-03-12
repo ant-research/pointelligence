@@ -1,0 +1,6 @@
+Deprecated
+wheel
+setuptools>=64.0.0
+torch>=2.6.0
+torchvision>=0.20.0
+triton>=2.0; sys_platform == 'Linux'
