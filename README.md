@@ -1,6 +1,8 @@
 <h1 align="center">Pointelligence<br><sub><sup>Accelerating Point Cloud Learning for Spatial Intelligence</sup></sub></h1>
 
-Pointelligence is the repo for the official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227).
+Pointelligence is a repository for 3D point cloud research, currently featuring:
+
+* the official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227) (CVPR 2026)—a significant next evolution of [PointCNN](https://github.com/yangyanli/PointCNN) (NeurIPS 2018).
 
 # Installation
 
