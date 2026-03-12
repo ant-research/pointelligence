@@ -12,7 +12,7 @@
 	url = git@github.com:chrischoy/FCGF.git
 [submodule "examples/Pointcept"]
 	path = examples/Pointcept
-	url = git@code.alipay.com:3rd/Pointcept.git
+	url = https://github.com/Lihhan/Pointcept.git
 [submodule "examples/FCGF"]
 	path = examples/FCGF
-	url = git@code.alipay.com:3rd/FCGF.git
+	url = https://github.com/Lihhan/FCGF.git
