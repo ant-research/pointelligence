@@ -27,21 +27,7 @@ If you have already cloned without `--recursive`, run `git submodule update --in
 
 # Installation
 
-## Option 1: Docker (Recommended for Reproducibility)
-
-The project provides a `Dockerfile` at the repository root for building a CUDA-enabled environment. Ensure you have [Docker](https://docs.docker.com/get-docker/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed.
-
-```shell
-# Build the image (from the repository root)
-docker build -t pointelligence:latest .
-
-# Run an interactive container with GPU support
-docker run --gpus all -it pointelligence:latest
-```
-
-The container includes PyTorch with CUDA, all dependencies, and pre-built extensions. The working directory inside the container is `/workspace`.
-
-## Option 2: Manual Installation
+## Option 1: Local Installation
 
 Some operators are implemented with C++/CUDA as PyTorch extensions, which could be built and installed with the following commands:
 
@@ -52,6 +38,28 @@ pip install -r requirements.txt
 cd extensions
 pip install --no-build-isolation -e .
 ```
+
+## Option 2: Docker Installation
+
+Use Docker for a containerized environment with all dependencies pre-installed:
+
+```shell
+# Build the Docker image
+docker build -t pointelligence .
+
+# Test the containerized environment
+docker run --gpus all -it -v $(pwd):/workspace pointelligence
+
+# Verify installation
+python -m pytest tests/unittest/ -v
+```
+
+The Docker image includes:
+- CUDA 12.4 + cuDNN + PyTorch 2.6.0+ with GPU support
+- Pre-built CUDA extensions (`sparse_engines_cuda`)
+- All system dependencies and Python packages
+- Sample data preloaded
+- Ready-to-use development environment
 
 # Basic Usages
 
