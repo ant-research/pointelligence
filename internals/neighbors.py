@@ -206,7 +206,39 @@ def radius_search(
 ):
     point_num = max(points.shape[0], query_points.shape[0])
 
-    if point_num <= point_num_max or sample_inds is None:
+    if sample_inds is None:
+        if point_num <= point_num_max:
+            return radius_search_lookup(
+                points=points,
+                queries=query_points,
+                radius=radius,
+                sample_inds=sample_inds,
+                query_sample_inds=query_sample_inds,
+                return_distances=return_distances,
+                distance_type=distance_type,
+            )
+        return radius_search_lookup(
+            points=points,
+            queries=query_points,
+            radius=radius,
+            sample_inds=sample_inds,
+            query_sample_inds=query_sample_inds,
+            return_distances=return_distances,
+            distance_type=distance_type,
+        )
+
+    sample_sizes = (
+        sample_sizes if sample_sizes is not None else torch.bincount(sample_inds)
+    )
+    query_sample_sizes = (
+        query_sample_sizes
+        if query_sample_sizes is not None
+        else torch.bincount(query_sample_inds)
+    )
+
+    # The global lookup path can mix candidates across samples when batches contain
+    # overlapping coordinates. Split batched inputs per sample to keep search strict.
+    if sample_sizes.numel() == 1 and point_num <= point_num_max:
         return radius_search_lookup(
             points=points,
             queries=query_points,
@@ -218,18 +250,13 @@ def radius_search(
         )
 
     # split inputs, run search, then merge results
-    num_splits = (point_num + point_num_max - 1) // point_num_max
-    sample_sizes = (
-        sample_sizes if sample_sizes is not None else torch.bincount(sample_inds)
-    )
-    query_sample_sizes = (
-        query_sample_sizes
-        if query_sample_sizes is not None
-        else torch.bincount(query_sample_inds)
-    )
     sample_num = sample_sizes.numel()
     assert sample_num == query_sample_sizes.numel()
-    step = max(1, sample_num // num_splits)
+    if sample_num > 1:
+        step = 1
+    else:
+        num_splits = (point_num + point_num_max - 1) // point_num_max
+        step = max(1, sample_num // num_splits)
 
     neighbors_list = list()
     num_neighbors_list = list()
