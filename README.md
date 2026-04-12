@@ -1,7 +1,7 @@
 <div align="center">
 
-<!-- Logo placeholder - replace with actual logo when available -->
-<img src="assets/logo.svg" alt="Pointelligence Logo" width="120"/>
+<!-- Logo placeholder - replace with actual logo when available
+<img src="assets/logo.svg" alt="Pointelligence Logo" width="120"/> -->
 
 # Pointelligence
 
@@ -37,6 +37,58 @@
 | 📦 **Ragged Tensors** | Efficient batching without padding — process only valid data |
 | 🔧 **Modular Design** | Build custom architectures from composable primitives |
 | 🐳 **Docker Ready** | One-command setup with pre-built CUDA extensions |
+
+---
+
+## 📊 Performance
+
+PointCNN++ delivers state-of-the-art performance with significantly lower memory usage and faster training times compared to existing methods.
+
+### Memory Efficiency
+
+Our native point-based approach fundamentally avoids the overhead of voxel-based auxiliary data structures:
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+<img src="assets/fig_D.jpeg" alt="Memory Usage Comparison" width="100%"/>
+<br>
+<b>Figure D.</b> Memory usage comparison of one convolution layer.
+</p>
+</td>
+<td width="50%">
+<p align="center">
+<img src="assets/fig_F.jpeg" alt="Peak Memory Comparison" width="100%"/>
+<br>
+<b>Figure F.</b> Peak memory comparison of ResNet-18 backbones.
+</p>
+</td>
+</tr>
+</table>
+
+### Speed Benchmarks
+
+Our co-designed MVMR and VVOR kernels provide exceptional speed in both inference and training:
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+<img src="assets/fig_E.jpeg" alt="Performance Comparison" width="100%"/>
+<br>
+<b>Figure E.</b> Operator-level latency analysis.
+</p>
+</td>
+<td width="50%">
+<p align="center">
+<img src="assets/fig_G.jpeg" alt="Backbone Performance" width="100%"/>
+<br>
+<b>Figure G.</b> End-to-end ResNet-18 backbone performance.
+</p>
+</td>
+</tr>
+</table>
 
 ---
 
