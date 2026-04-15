@@ -31,6 +31,7 @@ def voxelize_3d(
     return indices
 
 
+@torch.compiler.disable
 def build_triplets(
     points: Tensor,
     sample_inds: Tensor,
@@ -109,6 +110,21 @@ def build_triplets(
                 False
             ), f'Unknown sort_by argument "{sort_by}", it should be i, j, or k!'
 
+        # Normalize all triplet indices to a consistent dtype.
+        # The upstream code paths produce mixed dtypes (i: int64 from cumsum,
+        # j: int32 from radius_search, k: int64 from torch.sum promotion).
+        # Triton's autotuner keys on pointer dtypes, so mixed dtypes cause
+        # redundant cache entries and mid-training autotune stalls.
+        # Use int32 when safe, int64 otherwise. We check point counts
+        # (already CPU ints) as upper bounds instead of calling .max().item()
+        # which would force GPU→CPU syncs.
+        _INT32_MAX = 2147483647
+        max_possible = max(query_points.shape[0], points.shape[0])
+        idx_dtype = torch.int32 if max_possible <= _INT32_MAX else torch.int64
+        i = i.to(idx_dtype)
+        j = j.to(idx_dtype)
+        k = k.to(idx_dtype)
+
     if return_num_neighbors:
         return i, j, k, num_neighbors
     else:
@@ -129,6 +145,7 @@ def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler
     return radius_scaler
 
 
+@torch.compiler.disable
 def handle_stride_and_build_triplets(
     m: MetaData,
     stride: float,

@@ -17,7 +17,9 @@ def sparse_matrix_vector_multiplication_reduction(
     b = b.contiguous()
 
     T, G, M, C = a_idx.numel(), a.shape[1], a.shape[3], a.shape[2]
-    o = torch.zeros((n_o, G, M), dtype=a.dtype, device=a.device)
+    input_dtype = a.dtype
+    # Accumulate in fp32 for numerical stability, cast back after
+    o = torch.zeros((n_o, G, M), dtype=torch.float32, device=a.device)
 
     grid = lambda META: (
         triton.cdiv(T, META["L"])
@@ -30,7 +32,7 @@ def sparse_matrix_vector_multiplication_reduction(
         a, a_idx, b, b_idx, o, o_idx, T, G, M, C
     )
 
-    return o
+    return o.to(input_dtype) if input_dtype != torch.float32 else o
 
 
 def _backward_sparse_matrix_vector_multiplication_reduction(ctx, grad):
