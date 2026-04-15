@@ -48,6 +48,12 @@ dmypy.json
 *.bak
 *.cache
 
+# Git worktrees (separate checkouts, not repo content)
+worktrees/
+
+# Claude Code skills (generated symlinks from .agent/skills/)
+.claude/skills/
+
 # Large binary files
 *.pth
 *.pkl
@@ -59,6 +65,3 @@ data/
 checkpoints/
 outputs/
 results/
-
-# Git worktrees
-worktrees/
