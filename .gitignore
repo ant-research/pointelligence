@@ -1,4 +1,3 @@
-<<<<<<< feat%2Fcubedist
 __pycache__/
 *.py[cod]
 *$py.class
@@ -49,71 +48,17 @@ dmypy.json
 *.bak
 *.cache
 
-# *.pth
-# *.pkl
-# *.pt
-# *.h5
-# data/
-# checkpoints/
-# outputs/
-# results/
-=======
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.pyd
-*.o
-*.a
-*.dylib
-*.dll
+# Large binary files
+*.pth
+*.pkl
+*.pt
+*.h5
 
-build/
-dist/
-*.egg-info/
-*.egg
-*.whl
+# Data, checkpoints, outputs
+data/
+checkpoints/
+outputs/
+results/
 
-venv/
-env/
-ENV/
-.venv/
-
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-.ipynb_checkpoints
-
-.pytest_cache/
-.coverage
-htmlcov/
-
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-*.log
-*.log.*
-
-*.cubin
-*.ptx
-*.fatbin
-
-*.tmp
-*.temp
-*.bak
-*.cache
-
-# *.pth
-# *.pkl
-# *.pt
-# *.h5
-# data/
-# checkpoints/
-# outputs/
-# results/
->>>>>>> master
+# Git worktrees
+worktrees/

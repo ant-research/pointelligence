@@ -93,7 +93,7 @@ class BasicBlock(nn.Module):
                 sample_sizes=m.sample_sizes,
                 neighbor_radius=neighbor_radius,
                 kernel_indexer=partial(voxelize_3d, kernel_size=3),
-                grid_size=m.grid_size,
+                radius_scaler=radius_scaler_for_kernel_size(kernel_size=3),
                 return_num_neighbors=False,
             )
 
