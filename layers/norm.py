@@ -50,11 +50,18 @@ class RaggedNorm(nn.Module):
             return torch.segment_reduce(x, reduce=reduce_op, lengths=lengths, axis=0)
 
     def forward(self, x, lengths=None):
+        # All normalization runs in fp32 for numerical stability.
+        # Input is upcast, output is cast back to input dtype.
+        input_dtype = x.dtype
+
         if self.norm_type == "batch":
-            return self.bn(x)
+            out = self.bn(x.float())
+            return out.to(input_dtype)
 
         if lengths is None:
             raise ValueError(f"lengths argument is required for {self.norm_type} norm")
+
+        x = x.float()
 
         if self.norm_type == "instance":
             x_norm = self._instance_norm(x, lengths)
@@ -66,8 +73,9 @@ class RaggedNorm(nn.Module):
             raise ValueError(f"Unknown norm_type: {self.norm_type}")
 
         if self.affine:
-            return x_norm * self.weight + self.bias
-        return x_norm
+            x_norm = x_norm * self.weight.float() + self.bias.float()
+
+        return x_norm.to(input_dtype)
 
     def _instance_norm(self, x, lengths):
         # 1. Mean

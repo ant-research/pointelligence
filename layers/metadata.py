@@ -78,7 +78,6 @@ class MetaData:
             'query_sample_sizes': kwargs.get('query_sample_sizes', self.query_sample_sizes),
             'sort_by': kwargs.get('sort_by', self.sort_by),
             'return_num_neighbors': kwargs.get('return_num_neighbors', self.return_num_neighbors),
-            'distance_type': kwargs.get('distance_type', self.distance_type),
             'radius_scaler': radius_scaler,
         }
         

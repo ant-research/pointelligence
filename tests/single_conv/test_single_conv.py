@@ -9,7 +9,7 @@ import random
 import glob
 from functools import partial
 
-if 'CUDA_LAUNCH_BLOCKING' not in os.environ:
+if os.environ.get('CUDA_LAUNCH_BLOCKING_FORCE'):
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 RANDOM_SEED = 42
@@ -58,7 +58,7 @@ def global_warmup(device='cuda', num_iterations=3):
         print(f"Global warmup warning: {e}")
 
 
-def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_channels=128, kernel_size=3, device='cuda', warmup=True, batch_indices=None, batch_sizes=None, num_iters=5):
+def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_channels=128, kernel_size=3, device='cuda', warmup=True, batch_indices=None, batch_sizes=None, num_iters=5, dtype=torch.float32, use_compile=False):
     if not POINTCNN_AVAILABLE:
         return None
     
@@ -79,13 +79,13 @@ def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_ch
             torch.arange(0, sample_sizes.numel(), device=device),
             sample_sizes
         )
-        sampled_coords, sampled_sample_inds, new_grid_size, _ = downsample(
+        sampled_coords, sampled_sample_inds, new_grid_size, ds_indices = downsample(
             points=coords,
             sample_inds=sample_inds,
             grid_size=voxel_size,
             stride=1.0
         )
-        sampled_features = features[sampled_sample_inds]
+        sampled_features = features[ds_indices]
         sampled_sample_sizes = torch.bincount(sampled_sample_inds)
         
         actual_in_channels = sampled_features.shape[1] if len(sampled_features.shape) > 1 else in_channels
@@ -103,8 +103,16 @@ def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_ch
             )
         
         conv = PointConv3d(
-            actual_in_channels, out_channels, kernel_size=kernel_size_3
+            actual_in_channels, out_channels, kernel_size=kernel_size_3,
+            dtype=dtype,
         ).to(device)
+
+        # Cast features to target dtype (coords stay fp32 for spatial precision)
+        sampled_features = sampled_features.to(dtype=dtype)
+
+        if use_compile:
+            from tests.test_harness import compile_model
+            conv = compile_model(conv)
 
         test_metadata = build_metadata()
         try:
@@ -330,25 +338,82 @@ def load_batch_pointclouds(coord_files, feature_dim=64, device='cuda'):
     }
 
 
-def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channels=64, out_channels=128, kernel_size=3, batch_size=4, point_scale_factor=1.0, random_seed=None):
+def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channels=64, out_channels=128, kernel_size=3, batch_size=4, point_scale_factor=1.0, random_seed=None, dtype=torch.float32, use_compile=False, synthetic=False, synthetic_points=10000):
     
+    dtype_label = "fp16" if dtype == torch.float16 else "fp32"
+    compile_label = "compiled" if use_compile else "eager"
+    mode_label = f"{dtype_label}-{compile_label}"
+
     print(f"\n{'='*80}")
     print(f"Starting single convolution layer benchmark test (Device: {device}, Batch Size: {batch_size})")
-    print(f"Data Directory: {sampledata_dir}")
+    print(f"Mode: {mode_label}")
+    print(f"Data Directory: {sampledata_dir if not synthetic else 'SYNTHETIC'}")
     print(f"Kernel Size: {kernel_size}, In Channels: {in_channels}, Out Channels: {out_channels}")
     print(f"{'='*80}\n")
-    
+
+    if synthetic:
+        from tests.test_harness import generate_synthetic_batch
+        # Generate synthetic data at a few scales
+        synthetic_scales = [synthetic_points, synthetic_points * 5, synthetic_points * 10]
+        all_results = []
+        for scale_points in synthetic_scales:
+            scale_label = f"synthetic_{scale_points//1000}k"
+            print(f"\n{'='*80}")
+            print(f"Synthetic scale: {scale_label} ({scale_points} points/cloud)")
+            print(f"{'='*80}")
+            batch_data = generate_synthetic_batch(
+                scale_points, batch_size, in_channels, dtype=torch.float32, device=device
+            )
+            coords = batch_data['coords']
+            features = batch_data['features']
+            config_label = f"{scale_label}_bs{batch_size}"
+
+            results = {
+                'config_name': config_label,
+                'total_points': batch_data['total_points'],
+                'voxel_size': voxel_size,
+                'in_channels': in_channels,
+                'out_channels': out_channels,
+                'kernel_size': kernel_size,
+                'data_source': 'synthetic',
+                'scale_bin': scale_label,
+                'mode': mode_label,
+            }
+
+            if POINTCNN_AVAILABLE:
+                try:
+                    po_result = test_convolution(
+                        coords, features, voxel_size, in_channels, out_channels, kernel_size,
+                        device, warmup=True, batch_indices=None,
+                        batch_sizes=batch_data['batch_sizes'],
+                        dtype=dtype, use_compile=use_compile,
+                    )
+                    if po_result:
+                        results['pointops'] = po_result
+                        print(f"  Forward: {po_result['forward_ms']:.2f}ms, "
+                              f"Backward: {po_result['backward_ms']:.2f}ms")
+                except Exception as e:
+                    print(f"  Failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    results['pointops'] = None
+
+            all_results.append(results)
+            _clear_cuda_memory()
+
+        return all_results
+
     if not os.path.exists(sampledata_dir):
         print(f"\n Data directory does not exist: {sampledata_dir}")
         return None
-    
-    scale_bins = sorted([d for d in os.listdir(sampledata_dir) 
+
+    scale_bins = sorted([d for d in os.listdir(sampledata_dir)
                         if d.startswith('scale_') and os.path.isdir(os.path.join(sampledata_dir, d))])
-    
+
     if len(scale_bins) == 0:
         print(f"\n No scale_* directories found")
         return None
-    
+
     scale_bins = scale_bins[:9]
     print(f"\nFound {len(scale_bins)} scale bins (testing first 9): {scale_bins}")
     
@@ -472,7 +537,8 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
             try:
                 po_result = test_convolution(
                     coords, features, voxel_size, in_channels, out_channels, kernel_size,
-                    device, warmup=True, batch_indices=batch_indices, batch_sizes=batch_sizes
+                    device, warmup=True, batch_indices=batch_indices, batch_sizes=batch_sizes,
+                    dtype=dtype, use_compile=use_compile,
                 )
                 if po_result:
                     results['pointops'] = po_result
@@ -566,55 +632,72 @@ def main():
                        help='Kernel size')
     parser.add_argument('--batch_size', type=int, default=4,
                        help='Batch size')
-    
+    parser.add_argument('--dtype', type=str, default='fp32',
+                       choices=['fp32', 'fp16', 'all'],
+                       help='Data type for features/weights')
+    parser.add_argument('--compile', type=str, default='eager',
+                       choices=['eager', 'compiled', 'all'],
+                       help='Execution mode')
+    parser.add_argument('--synthetic', action='store_true',
+                       help='Use synthetic data instead of real data')
+    parser.add_argument('--synthetic_points', type=int, default=10000,
+                       help='Points per cloud for synthetic data')
+
     args = parser.parse_args()
     
     device = args.device if torch.cuda.is_available() else 'cpu'
     
+    from tests.test_harness import resolve_modes
+
+    modes = resolve_modes(args.dtype, getattr(args, 'compile'))
+
     print("\n" + "="*80)
     print("pointcnn Single Convolution Layer Benchmark")
     print("="*80)
     print(f"Device: {device}")
-    print(f"Data Directory: {args.data_dir}")
+    print(f"Data: {args.data_dir if not args.synthetic else 'SYNTHETIC'}")
+    print(f"Modes: {[m.label for m in modes]}")
     print(f"Convolution Config: {args.in_channels} -> {args.out_channels}, kernel_size={args.kernel_size}")
     print("="*80 + "\n")
-    
+
     all_results = []
-    
-    print("\n" + "="*80)
-    print("="*80)
-    print(f"Test: Batch Size = {args.batch_size}")
-    print("="*80)
-    print("="*80 + "\n")
-    
-    results = run_benchmark(
-        sampledata_dir=args.data_dir, 
-        device=device, 
-        voxel_size=args.voxel_size,
-        in_channels=args.in_channels,
-        out_channels=args.out_channels,
-        kernel_size=args.kernel_size,
-        batch_size=args.batch_size
-    )
-    
-    if results is not None and len(results) > 0:
-        for r in results:
-            r['batch_size'] = args.batch_size
-        all_results.extend(results)
-        print(f"\n✓ Batch Size={args.batch_size} test completed, {len(results)} scales")
-    else:
-        print(f"\n⚠ Batch Size={args.batch_size} test produced no results")
-    
+
+    for mode in modes:
+        print("\n" + "="*80)
+        print(f"Mode: {mode.label} | Batch Size = {args.batch_size}")
+        print("="*80 + "\n")
+
+        results = run_benchmark(
+            sampledata_dir=args.data_dir,
+            device=device,
+            voxel_size=args.voxel_size,
+            in_channels=args.in_channels,
+            out_channels=args.out_channels,
+            kernel_size=args.kernel_size,
+            batch_size=args.batch_size,
+            dtype=mode.dtype,
+            use_compile=mode.compile,
+            synthetic=args.synthetic,
+            synthetic_points=args.synthetic_points,
+        )
+
+        if results is not None and len(results) > 0:
+            for r in results:
+                r['batch_size'] = args.batch_size
+                r['mode'] = mode.label
+            all_results.extend(results)
+            print(f"\n[{mode.label}] completed, {len(results)} scales")
+        else:
+            print(f"\n[{mode.label}] produced no results")
+
     if len(all_results) == 0:
-        print("\n✗ Benchmark failed - no results produced")
+        print("\nBenchmark failed - no results produced")
         return 1
-    
+
     print("\n" + "="*80)
+    print(f"Benchmark completed! {len(all_results)} test configurations across {len(modes)} mode(s)")
     print("="*80)
-    print(f"✓ Benchmark completed! Total {len(all_results)} test configurations completed")
-    print("="*80)
-    print("="*80)
-    
+
     return 0
 
 

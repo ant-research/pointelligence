@@ -67,7 +67,7 @@ def load_batch_pointclouds(coord_files, feature_dim=3, device='cuda'):
         'feature_dim': feature_dim
     }
 
-def test_resnet18(coords, features, grid_size=0.1, in_channels=64, device='cuda', warmup=True, sample_sizes=None, num_iters=10):
+def test_pointcnnpp_resnet18(coords, features, grid_size=0.1, in_channels=64, device='cuda', warmup=True, sample_sizes=None, num_iters=10, dtype=torch.float32, use_compile=False):
     if not POINTCNNPP_AVAILABLE:
         return None
     
@@ -97,8 +97,15 @@ def test_resnet18(coords, features, grid_size=0.1, in_channels=64, device='cuda'
         num_samples = sample_inds.max().item() + 1 if sample_inds.numel() > 0 else 0
         sample_sizes = torch.bincount(sample_inds, minlength=num_samples)
         
-        model = resnet18(in_channels=in_channels).to(device)
-        
+        model = resnet18(in_channels=in_channels).to(device=device, dtype=dtype)
+
+        # Cast features to target dtype (coords stay fp32 for spatial precision)
+        features = features.to(dtype=dtype)
+
+        if use_compile:
+            from tests.test_harness import compile_model
+            model = compile_model(model)
+
         def forward_no_measure(x, points, sample_sizes, grid_size):
             with torch.no_grad():
                 return model(x, points, sample_sizes, grid_size)
@@ -209,38 +216,89 @@ def test_resnet18(coords, features, grid_size=0.1, in_channels=64, device='cuda'
         traceback.print_exc()
         return None
 
-def run_benchmark(sampledata_dir=None, device='cuda', grid_size=0.05):
+def run_benchmark(sampledata_dir=None, device='cuda', grid_size=0.05, dtype=torch.float32, use_compile=False, synthetic=False, synthetic_points=10000):
     
+    dtype_label = "fp16" if dtype == torch.float16 else "fp32"
+    compile_label = "compiled" if use_compile else "eager"
+    mode_label = f"{dtype_label}-{compile_label}"
+
     print(f"\n{'='*80}")
-    print(f"Starting Benchmark Test (Device: {device})")
-    print(f"Data Directory: {sampledata_dir}")
+    print(f"Starting Benchmark Test (Device: {device}, Mode: {mode_label})")
+    print(f"Data: {sampledata_dir if not synthetic else 'SYNTHETIC'}")
     print(f"{'='*80}\n")
-    
+
+    if synthetic:
+        from tests.test_harness import generate_synthetic_batch
+        synthetic_scales = [synthetic_points, synthetic_points * 5]
+        all_results = []
+
+        for scale_points in synthetic_scales:
+            scale_label = f"synthetic_{scale_points//1000}k"
+            batch_data = generate_synthetic_batch(
+                scale_points, BATCH_SIZE, 64, dtype=torch.float32, device=device
+            )
+            coords = batch_data['coords']
+            features = batch_data['features']
+            sample_sizes = torch.tensor(batch_data['batch_sizes'], device=device, dtype=torch.long)
+
+            results = {
+                'config_name': scale_label,
+                'total_points': batch_data['total_points'],
+                'grid_size': grid_size,
+                'in_channels': 64,
+                'data_source': 'synthetic',
+                'mode': mode_label,
+            }
+
+            if POINTCNNPP_AVAILABLE:
+                try:
+                    r = test_pointcnnpp_resnet18(
+                        coords, features, grid_size, 64, device,
+                        warmup=True, sample_sizes=sample_sizes,
+                        dtype=dtype, use_compile=use_compile,
+                    )
+                    if r:
+                        results['pointcnnpp'] = r
+                        print(f"  [{scale_label}] Inference: {r['inference_ms']:.2f}ms, "
+                              f"Training: {r['training_ms']:.2f}ms")
+                except Exception as e:
+                    print(f"  [{scale_label}] Failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    results['pointcnnpp'] = None
+
+            all_results.append(results)
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        return all_results
+
     if not os.path.exists(sampledata_dir):
         print(f"\nData directory does not exist: {sampledata_dir}")
         return None
-    
-    scale_bins = sorted([d for d in os.listdir(sampledata_dir) 
+
+    scale_bins = sorted([d for d in os.listdir(sampledata_dir)
                         if d.startswith('scale_') and os.path.isdir(os.path.join(sampledata_dir, d))])
-    
+
     if len(scale_bins) == 0:
         print(f"\nNo scale_* directories found")
         return None
-    
+
     print(f"\nFound {len(scale_bins)} scale bins: {scale_bins}")
-    
+
     all_results = []
-    
+
     warmup_sizes = [50, 5000, 10000, 50000, 100000]
-    
+
     if POINTCNNPP_AVAILABLE:
         for size in warmup_sizes:
             warmup_coords = torch.randn(size, 3, device=device)
             warmup_features = torch.randn(size, 64, device=device)
             warmup_sample_sizes = torch.tensor([size], device=device, dtype=torch.long)
-            _ = test_pointcnnpp_resnet18(warmup_coords, warmup_features, device=device, warmup=False, grid_size=grid_size, sample_sizes=warmup_sample_sizes)
+            _ = test_pointcnnpp_resnet18(warmup_coords, warmup_features, device=device, warmup=False, grid_size=grid_size, sample_sizes=warmup_sample_sizes, dtype=dtype, use_compile=use_compile)
             torch.cuda.empty_cache()
-    
+
     if device == 'cuda':
         torch.cuda.empty_cache()
     gc.collect()
@@ -292,7 +350,8 @@ def run_benchmark(sampledata_dir=None, device='cuda', grid_size=0.05):
             try:
                 pointcnnpp_result = test_pointcnnpp_resnet18(
                     coords, features, grid_size, feature_dim,
-                    device, warmup=True, sample_sizes=sample_sizes
+                    device, warmup=True, sample_sizes=sample_sizes,
+                    dtype=dtype, use_compile=use_compile,
                 )
                 if pointcnnpp_result:
                     results['pointcnnpp'] = pointcnnpp_result
@@ -329,68 +388,82 @@ def main():
                        help='Compute device (cuda or cpu)')
     parser.add_argument('--grid_size', type=float, default=0.1,
                        help='Grid size')
-    
+    parser.add_argument('--dtype', type=str, default='fp32',
+                       choices=['fp32', 'fp16', 'all'],
+                       help='Data type for features/weights')
+    parser.add_argument('--compile', type=str, default='eager',
+                       choices=['eager', 'compiled', 'all'],
+                       help='Execution mode')
+    parser.add_argument('--synthetic', action='store_true',
+                       help='Use synthetic data instead of real data')
+    parser.add_argument('--synthetic_points', type=int, default=10000,
+                       help='Points per cloud for synthetic data')
+
     args = parser.parse_args()
-    
+
     device = args.device if torch.cuda.is_available() else 'cpu'
-    
+
+    from tests.test_harness import resolve_modes
+    modes = resolve_modes(args.dtype, getattr(args, 'compile'))
+
     print("\n" + "="*80)
     print("PointCNNpp ResNet18 Architecture Benchmark")
     print("="*80)
     print(f"Device: {device}")
-    print(f"Data Directory: {args.data_dir if args.data_dir else 'Using synthetic data'}")
+    print(f"Data: {args.data_dir if not args.synthetic else 'SYNTHETIC'}")
+    print(f"Modes: {[m.label for m in modes]}")
     print("="*80 + "\n")
-    
-    results = run_benchmark(sampledata_dir=args.data_dir, device=device, grid_size=args.grid_size)
-    
-    if results is None or len(results) == 0:
+
+    all_results = []
+
+    for mode in modes:
+        print("\n" + "="*80)
+        print(f"Mode: {mode.label}")
+        print("="*80)
+
+        results = run_benchmark(
+            sampledata_dir=args.data_dir, device=device, grid_size=args.grid_size,
+            dtype=mode.dtype, use_compile=mode.compile,
+            synthetic=args.synthetic, synthetic_points=args.synthetic_points,
+        )
+
+        if results is not None and len(results) > 0:
+            for r in results:
+                r['mode'] = mode.label
+            all_results.extend(results)
+            print(f"\n[{mode.label}] completed, {len(results)} scales")
+        else:
+            print(f"\n[{mode.label}] produced no results")
+
+    if len(all_results) == 0:
         print("\nBenchmark failed")
         return 1
-    
+
     # Print statistics table
     print("\n" + "="*120)
-    print("Performance Statistics Summary (Averaged across all input points)")
+    print("Performance Statistics Summary")
     print("="*120)
-    
-    # Collect valid results
-    table_data = []
-    for result in results:
+
+    header = f"{'Mode':<20} {'Input Points':<15} {'Inference (ms)':<18} {'Training (ms)':<18} {'Training Memory (GB)':<25}"
+    print(header)
+    print("-" * 120)
+
+    for result in all_results:
         if result.get('pointcnnpp') is not None:
-            pointcnnpp_data = result['pointcnnpp']
-            table_data.append({
-                'input_points': result.get('total_points', result.get('original_points', 0)),
-                'inference_ms': pointcnnpp_data.get('inference_ms', 0.0),
-                'training_ms': pointcnnpp_data.get('training_ms', 0.0),
-                'training_memory_gb': pointcnnpp_data.get('training_peak_memory_gb', 0.0),
-            })
-    
-    if len(table_data) == 0:
-        print("No valid results to display")
-    else:
-        # Calculate averages across all input points
-        avg_input_points = sum(d['input_points'] for d in table_data) / len(table_data)
-        avg_inference_ms = sum(d['inference_ms'] for d in table_data) / len(table_data)
-        avg_training_ms = sum(d['training_ms'] for d in table_data) / len(table_data)
-        avg_training_memory_gb = sum(d['training_memory_gb'] for d in table_data) / len(table_data)
-        
-        # Print table header
-        header = f"{'Input Points':<15} {'Inference (ms)':<18} {'Training (ms)':<18} {'Training Memory (GB)':<25}"
-        print(header)
-        print("-" * 100)
-        
-        # Print averaged row
-        row = (f"{avg_input_points:<15,.0f} "
-               f"{avg_inference_ms:<18.2f} "
-               f"{avg_training_ms:<18.2f} "
-               f"{avg_training_memory_gb:<25.2f}")
-        print(row)
-        
-        print("="*100)
-    
+            d = result['pointcnnpp']
+            row = (f"{result.get('mode', 'N/A'):<20} "
+                   f"{result.get('total_points', 0):<15,} "
+                   f"{d.get('inference_ms', 0.0):<18.2f} "
+                   f"{d.get('training_ms', 0.0):<18.2f} "
+                   f"{d.get('training_peak_memory_gb', 0.0):<25.2f}")
+            print(row)
+
+    print("="*120)
+
     print("\n" + "="*80)
-    print("Benchmark completed!")
+    print(f"Benchmark completed! {len(all_results)} configurations across {len(modes)} mode(s)")
     print("="*80)
-    
+
     return 0
 
 if __name__ == "__main__":
