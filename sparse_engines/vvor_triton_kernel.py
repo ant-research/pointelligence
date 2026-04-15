@@ -5,17 +5,31 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config(
-            {
-                "L": 128,
-                "BLOCK_SIZE_G": 1,
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_C": 32,
-            },
-            num_warps=1,
-        ),
+        # VVOR: outer product a[:, :, None] * b[:, None, :] -> (G, M, C) per triplet.
+        # Register pressure is higher than MVMR due to the 3D block_o accumulator.
+        # Smaller M/C tiles help fit in registers; more warps help hide latency.
+
+        # --- L=32: high parallelism ---
+        triton.Config({"L": 32, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=1),
+        triton.Config({"L": 32, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 32, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 32}, num_warps=2),
+        # --- L=64: balanced ---
+        triton.Config({"L": 64, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=1),
+        triton.Config({"L": 64, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 64, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 64, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 16}, num_warps=2),
+        # --- L=128: original config + variants ---
+        triton.Config({"L": 128, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=1),
+        triton.Config({"L": 128, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 128, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 128, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 16}, num_warps=2),
+        triton.Config({"L": 128, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
+        # --- L=256: more sequential, better reuse ---
+        triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=2),
+        triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=2),
     ],
     key=["T", "G", "M", "C"],
+    reset_to_zero=["o"],
 )
 @triton.jit
 def sparse_vector_vector_outer_product_reduction_kernel(
@@ -71,6 +85,8 @@ def sparse_vector_vector_outer_product_reduction_kernel(
     b_offset = tl.load(b_idx + t_offset)
     o_offset = tl.load(o_idx + t_offset)
 
+    # Native fp16: load, multiply, and accumulate all in native dtype.
+    # The fp32 output buffer + atomic_add provides final precision.
     block_a = tl.load(a_ptrs + a_offset * (G * M), mask=gm_mask)
     block_b = tl.load(b_ptrs + b_offset * (G * C), mask=gc_mask)
     block_o = block_a[:, :, None] * block_b[:, None, :]
@@ -88,9 +104,9 @@ def sparse_vector_vector_outer_product_reduction_kernel(
             b_offset = b_offset_next
 
         if o_offset_next != o_offset:
-            tl.atomic_add(o_ptrs + o_offset * (G * M * C), block_o, mask=gmc_mask)
+            tl.atomic_add(o_ptrs + o_offset * (G * M * C), block_o.to(tl.float32), mask=gmc_mask)
             o_offset = o_offset_next
             block_o = block_a[:, :, None] * block_b[:, None, :]
         else:
-            block_o = tl.fma(block_a[:, :, None], block_b[:, None, :], block_o)
-    tl.atomic_add(o_ptrs + o_offset * (G * M * C), block_o, mask=gmc_mask)
+            block_o += block_a[:, :, None] * block_b[:, None, :]
+    tl.atomic_add(o_ptrs + o_offset * (G * M * C), block_o.to(tl.float32), mask=gmc_mask)

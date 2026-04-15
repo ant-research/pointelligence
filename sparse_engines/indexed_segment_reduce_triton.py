@@ -156,12 +156,19 @@ def indexed_segment_reduce(
         raise ValueError(f"Mode must be one of {list(reduce_map.keys())}")
 
     x = x.contiguous()
+    input_dtype = x.dtype
+
+    # Upcast fp16 to fp32 for numerical stability in reductions
+    if input_dtype == torch.float16:
+        x = x.float()
 
     zero = torch.tensor([0], device=lengths.device, dtype=lengths.dtype)
     offsets = torch.cat([zero, torch.cumsum(lengths, 0)[:-1]]).contiguous()
 
-    # Op now returns single tensor, unpacking removed
     y = torch.ops.sparse_engines.indexed_segment_reduce_op(
         x, indices, offsets, lengths, reduce_map[reduce]
     )
+
+    if input_dtype == torch.float16:
+        y = y.to(input_dtype)
     return y

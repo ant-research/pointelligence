@@ -4,6 +4,7 @@ from torch import Tensor
 from internals.grid_sample import grid_sample_filter
 
 
+@torch.compiler.disable
 def downsample(
     points: Tensor,
     sample_inds: Tensor,
