@@ -1,3 +1,9 @@
+"""Global and local pooling for ragged point cloud features.
+
+Provides GlobalPool (per-sample aggregation) and max_pool3d (local
+neighborhood max-pooling with strided downsampling).
+"""
+
 from typing import Tuple
 
 import torch

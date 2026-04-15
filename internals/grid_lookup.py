@@ -1,3 +1,10 @@
+"""Spatial hash grid for accelerating neighborhood queries.
+
+Builds a GPU-resident grid structure that maps 3D coordinates to sorted
+bucket indices, enabling O(1) lookup of candidate neighbors during
+radius search.
+"""
+
 import torch
 
 from .constants import Constants

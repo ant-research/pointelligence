@@ -26,11 +26,11 @@ try:
     from layers.conv import PointConv3d
     from layers.metadata import MetaData
     from layers.downsample import downsample
-    POINTCNN_AVAILABLE = True
-    print("✓ pointcnn available")
+    POINTCNNPP_AVAILABLE = True
+    print("✓ PointCNN++ available")
 except ImportError as e:
-    print(f"pointcnn unavailable: {e}")
-    POINTCNN_AVAILABLE = False
+    print(f"PointCNN++ unavailable: {e}")
+    POINTCNNPP_AVAILABLE = False
     downsample = None
     repeat_interleave_indices = None
 
@@ -59,7 +59,7 @@ def global_warmup(device='cuda', num_iterations=3):
 
 
 def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_channels=128, kernel_size=3, device='cuda', warmup=True, batch_indices=None, batch_sizes=None, num_iters=5, dtype=torch.float32, use_compile=False):
-    if not POINTCNN_AVAILABLE:
+    if not POINTCNNPP_AVAILABLE:
         return None
     
     global_warmup(device=device)
@@ -237,7 +237,7 @@ def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_ch
 
         num_points = sampled_coords.shape[0]
         
-        print(f"\n[pointcnn_SingleConv] Input Points: {num_points/1e3:.1f}K")
+        print(f"\n[PointCNN++ SingleConv] Input Points: {num_points/1e3:.1f}K")
         print(f"Forward: {forward_avg:.2f}ms, Backward: {backward_avg:.2f}ms")
         print(f"Forward Memory: {forward_memory_gb:.2f}GB, Backward Memory: {backward_memory_gb:.2f}GB")
 
@@ -251,7 +251,7 @@ def test_convolution(coords, features, voxel_size=0.025, in_channels=128, out_ch
         }
         
     except Exception as e:
-        print(f"pointcnn test failed: {e}")
+        print(f"PointCNN++ test failed: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -380,7 +380,7 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
                 'mode': mode_label,
             }
 
-            if POINTCNN_AVAILABLE:
+            if POINTCNNPP_AVAILABLE:
                 try:
                     po_result = test_convolution(
                         coords, features, voxel_size, in_channels, out_channels, kernel_size,
@@ -389,14 +389,14 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
                         dtype=dtype, use_compile=use_compile,
                     )
                     if po_result:
-                        results['pointops'] = po_result
+                        results['pointcnnpp'] = po_result
                         print(f"  Forward: {po_result['forward_ms']:.2f}ms, "
                               f"Backward: {po_result['backward_ms']:.2f}ms")
                 except Exception as e:
                     print(f"  Failed: {e}")
                     import traceback
                     traceback.print_exc()
-                    results['pointops'] = None
+                    results['pointcnnpp'] = None
 
             all_results.append(results)
             _clear_cuda_memory()
@@ -532,8 +532,8 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
         print(f"Single convolution layer test")
         print(f"{'-'*80}")
         
-        print(f"\n    Testing pointcnn...")
-        if POINTCNN_AVAILABLE:
+        print(f"\n    Testing PointCNN++...")
+        if POINTCNNPP_AVAILABLE:
             try:
                 po_result = test_convolution(
                     coords, features, voxel_size, in_channels, out_channels, kernel_size,
@@ -541,15 +541,15 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
                     dtype=dtype, use_compile=use_compile,
                 )
                 if po_result:
-                    results['pointops'] = po_result
+                    results['pointcnnpp'] = po_result
                     print(f"      ✓ Complete - Forward: {po_result['forward_ms']:.2f}ms, "
                           f"Backward: {po_result['backward_ms']:.2f}ms")
             except Exception as e:
                 print(f"      ✗ Failed: {e}")
-                results['pointops'] = None
+                results['pointcnnpp'] = None
         else:
             print("      ⚠ Unavailable")
-            results['pointops'] = None
+            results['pointcnnpp'] = None
         
         all_results.append(results)
         
@@ -560,7 +560,7 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
     print(f"{'='*80}\n")
     
     print(f"\n{'='*120}")
-    print(f"pointcnn Single Convolution Layer Performance Comparison Table")
+    print(f"PointCNN++ Single Convolution Layer Performance Comparison Table")
     print(f"{'='*120}")
     
     header = (
@@ -575,7 +575,7 @@ def run_benchmark(sampledata_dir=None, device='cuda', voxel_size=0.05, in_channe
         config_str = f"{config_name} (v={voxel_size_val})"
         
         methods = [
-            ('pointcnn', 'pointops', 'Points'),
+            ('PointCNN++', 'pointcnnpp', 'Points'),
         ]
         
         for method_name, method_key, unit_type in methods:
@@ -617,7 +617,7 @@ def _clear_cuda_memory():
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='pointcnn Single Convolution Benchmark')
+    parser = argparse.ArgumentParser(description='PointCNN++ Single Convolution Benchmark')
     parser.add_argument('--data_dir', type=str, default=None,
                        help='Real point cloud data directory')
     parser.add_argument('--device', type=str, default='cuda',
@@ -652,7 +652,7 @@ def main():
     modes = resolve_modes(args.dtype, getattr(args, 'compile'))
 
     print("\n" + "="*80)
-    print("pointcnn Single Convolution Layer Benchmark")
+    print("PointCNN++ Single Convolution Layer Benchmark")
     print("="*80)
     print(f"Device: {device}")
     print(f"Data: {args.data_dir if not args.synthetic else 'SYNTHETIC'}")

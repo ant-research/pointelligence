@@ -1,3 +1,10 @@
+"""Index manipulation utilities for ragged tensor operations.
+
+Provides cumsum_exclusive, repeat_interleave_indices, arrange_indices,
+and other primitives used to manage variable-length batched data without
+padding.
+"""
+
 import torch
 
 from .constants import Constants

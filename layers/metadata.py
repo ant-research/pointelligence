@@ -1,3 +1,10 @@
+"""MetaData dataclass for point cloud spatial bookkeeping.
+
+Carries points, sample indices/sizes, grid_size, and convolution triplets
+(i, j, k) through the network. Acts as the "metadata" that guides how
+features flow through convolution, pooling, and normalization layers.
+"""
+
 from dataclasses import dataclass
 from typing import Optional, Tuple, Callable
 from functools import partial

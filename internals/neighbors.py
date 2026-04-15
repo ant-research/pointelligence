@@ -1,3 +1,10 @@
+"""GPU-accelerated radius-based neighborhood search.
+
+Finds all points within a fixed radius of each query point, producing
+(i, j) pairs that represent the sparse neighborhood graph. Supports
+batched point clouds via per-sample confinement.
+"""
+
 import torch
 
 from .constants import Constants
