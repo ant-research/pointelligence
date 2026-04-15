@@ -1,18 +1,8 @@
-[submodule "Pointcept"]
-	path = Pointcept
-	url = https://github.com/Lihhan/Pointcept.git
-[submodule "examples/registration/registration"]
-	path = examples/registration/registration
-	url = https://github.com/Lihhan/FCGF.git
 [submodule "examples/Pointcept"]
 	path = examples/Pointcept
 	url = https://github.com/Lihhan/Pointcept.git
+	branch = pointcnnpp-version
 [submodule "examples/FCGF"]
 	path = examples/FCGF
 	url = https://github.com/Lihhan/FCGF.git
-[submodule "examples/Pointcept"]
-	path = examples/Pointcept
-	url = https://github.com/Lihhan/Pointcept.git
-[submodule "examples/FCGF"]
-	path = examples/FCGF
-	url = https://github.com/Lihhan/FCGF.git
+	branch = pointcnnpp-version
