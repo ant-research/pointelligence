@@ -1,3 +1,10 @@
+"""Normalization layers for ragged (variable-length) point cloud batches.
+
+Provides batch, instance, group, and layer normalization that operate
+correctly on concatenated samples with different point counts, using
+segment reductions instead of padding.
+"""
+
 import torch
 import torch.nn as nn
 

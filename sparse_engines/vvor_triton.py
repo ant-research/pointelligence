@@ -1,3 +1,10 @@
+"""VVOR: Vector-Vector Outer product and Reduction.
+
+Computes weight gradients in the backward pass of point convolution.
+Given triplets (i, j, k), accumulates grad_weight[k] += input[j] (x) grad_output[i].
+Paired with MVMR for the forward pass.
+"""
+
 import torch
 from torch import Tensor
 

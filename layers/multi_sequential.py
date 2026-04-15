@@ -1,3 +1,10 @@
+"""Sequential container that threads MetaData alongside features.
+
+Like nn.Sequential, but passes multiple arguments (features, MetaData)
+through each layer, supporting the (Tensor, MetaData) -> (Tensor, MetaData)
+calling convention used by point convolution blocks.
+"""
+
 import torch.nn as nn
 
 

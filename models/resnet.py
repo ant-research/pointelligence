@@ -1,3 +1,10 @@
+"""ResNet architectures (18/34/50/101/152) for native point convolution.
+
+Standard ResNet building blocks (BasicBlock, Bottleneck) adapted to use
+PointConv3d instead of Conv2d, with ragged normalization and strided
+downsampling via voxel grid filtering.
+"""
+
 from typing import Any, Callable, Optional, Union, Tuple
 
 import torch

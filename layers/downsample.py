@@ -1,3 +1,10 @@
+"""Voxel-based point cloud downsampling.
+
+Reduces point density by selecting representative points per voxel
+using grid_sample_filter with center_nearest mode, which preserves
+thin structures better than random selection.
+"""
+
 import torch
 from torch import Tensor
 

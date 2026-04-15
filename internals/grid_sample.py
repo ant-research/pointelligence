@@ -1,3 +1,10 @@
+"""Grid-based point cloud downsampling with configurable reduction modes.
+
+Voxelizes a point cloud and selects one representative point per voxel.
+Supports center_nearest (closest to voxel center), random, mean, and
+center reductions.
+"""
+
 import torch
 from .indexing import arange_cached
 from .grid_lookup import build_lookup_struct

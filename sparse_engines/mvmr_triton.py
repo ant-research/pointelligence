@@ -1,3 +1,10 @@
+"""MVMR: Matrix-Vector Multiplication and Reduction.
+
+The core forward-pass sparse engine for point convolution. Given triplets
+(i, j, k), computes output[i] += weight[k] @ input[j] via a Triton kernel
+with autotuned block sizes. See PointCNN++ (arXiv:2511.23227) Section 3.4.
+"""
+
 import torch
 from torch import Tensor
 

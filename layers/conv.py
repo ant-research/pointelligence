@@ -1,3 +1,10 @@
+"""Point convolution layer (PointConv3d).
+
+Implements convolution on native 3D points using the (i, j, k) triplet
+representation and the MVMR sparse engine. This is the core operator
+introduced in PointCNN++ (arXiv:2511.23227).
+"""
+
 import math
 from typing import Optional, Callable, Tuple
 
