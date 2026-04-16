@@ -21,8 +21,6 @@ void sparse_vector_vector_outer_product_reduction_impl(
 
 void bucket_arrange_check(at::Tensor bucket_indices);
 
-void indexed_distance_check(at::Tensor a, at::Tensor idx_a, at::Tensor b, at::Tensor idx_b);
-
 #ifndef WITHOUT_CUDA
 void sparse_vector_vector_outer_product_reduction_impl_cuda(
 	at::Tensor a, at::Tensor a_idx, at::Tensor b, at::Tensor b_idx, at::Tensor o_idx, at::Tensor o

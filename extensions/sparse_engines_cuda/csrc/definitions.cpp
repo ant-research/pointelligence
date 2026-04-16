@@ -23,6 +23,6 @@ PyObject* PyInit__C(void) {
 TORCH_LIBRARY(sparse_engines_cuda, m) {
 	m.def("sparse_matrix_vector_multiplication_reduction(Tensor a, Tensor a_idx, Tensor b, Tensor b_idx, Tensor o_idx, int n) -> Tensor");
 	m.def("sparse_vector_vector_outer_product_reduction(Tensor a, Tensor a_idx, Tensor b, Tensor b_idx, Tensor o_idx, int n) -> Tensor");
-	m.def("indexed_distance(Tensor a, Tensor a_idx, Tensor b, Tensor b_idx, int distance_type) -> Tensor");
+
 	m.def("bucket_arrange(Tensor bucket_indices, int num_buckets) -> (Tensor, Tensor)");
 }
