@@ -1,3 +1,10 @@
+"""Convolution triplet (i, j, k) construction.
+
+Builds the sparse connectivity that maps each (query i, neighbor j) pair
+to a kernel weight index k via local voxelization. The triplets define
+the data-weight routing for PointConv3d.
+"""
+
 from functools import partial
 from typing import Tuple, Callable, Optional
 
@@ -132,6 +139,35 @@ def build_triplets(
 
 
 def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler: float = 1.0, distance_type: str = "ball"):
+    """Compute the radius_scaler that determines the neighborhood search radius.
+
+    PointCNN++ decouples kernel resolution from the receptive field's physical
+    span. kernel_size controls the fineness of the weight grid (e.g., 3^3 or
+    5^3 kernel cells), while receptive_field_scaler controls how much physical
+    space the search sphere covers, as a volume multiplier of the kernel_size^3
+    cube. This decoupling allows using a fine kernel (large kernel_size) over a
+    small region, or a coarse kernel over a large region, independently.
+
+    The returned radius_scaler is used as:
+        neighbor_radius = grid_size * radius_scaler
+
+    And inside build_triplets, grid_size is recovered as:
+        grid_size = neighbor_radius / radius_scaler
+
+    so that voxelize_3d always discretizes at the original grid_size scale,
+    regardless of receptive_field_scaler.
+
+    Args:
+        kernel_size: Number of kernel cells per dimension (e.g., 3 -> 3^3 = 27 weights)
+        receptive_field_scaler: Volume multiplier. 1.0 means the search sphere has
+            the same volume as the kernel_size^3 cube. >1.0 searches wider (more
+            neighbors per kernel cell). Default: 1.0
+        distance_type: "ball" (spherical search) or "cube" (cubic search)
+
+    Returns:
+        radius_scaler: Multiply by grid_size to get the physical search radius.
+            For kernel_size=3, ball mode, rfs=1.0: radius_scaler ≈ 1.86
+    """
     kernel_size = _triple(kernel_size)
     kernel_size_max = max(kernel_size)
 
@@ -141,7 +177,7 @@ def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler
     else:
         volume = math.pow(kernel_size_max, 3) * receptive_field_scaler
         radius_scaler = math.pow(3 * volume / (4 * math.pi), 1 / 3)
-        
+
     return radius_scaler
 
 
@@ -186,7 +222,6 @@ def handle_stride_and_build_triplets(
             )
             m.sample_sizes = torch.bincount(m.sample_inds)
 
-            # Use PointOps style mapping: pass grid_size directly to build_triplets
             m.i, m.j, m.k, m.num_neighbors = build_triplets(
                 points=points_,
                 sample_inds=sample_inds_,
@@ -208,7 +243,6 @@ def handle_stride_and_build_triplets(
         if m.empty_triplets():
             radius_scaler = radius_scaler_for_kernel_size(kernel_size, receptive_field_scaler, distance_type)
             neighbor_radius = m.grid_size * radius_scaler
-            # Use PointOps style mapping: pass radius_scaler to build_triplets
             m.i, m.j, m.k, m.num_neighbors = build_triplets(
                 points=m.points,
                 sample_inds=m.sample_inds,
