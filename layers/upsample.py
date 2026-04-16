@@ -11,46 +11,34 @@ from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kerne
 
 class Upsample(torch.nn.Module):
     """
-    Upsample layer that aggregates features from high-resolution points to low-resolution points.
-    
-    The search radius is computed based on kernel_size, receptive_field_scaler, and distance_type.
-    A minimum radius requirement is enforced to ensure at least one neighbor can be found.
-    
+    Upsample layer: each high-res output point gathers features from nearby
+    low-res input points via learned convolution weights.
+
+        output[i_high] += weight[k] @ input[j_low]
+
+    The neighborhood search is direct: high-res points (query) search among
+    low-res points (source). The search radius uses grid_size_low as its base
+    to guarantee every high-res point finds at least one low-res neighbor.
+
+    Minimum radius requirement:
+        Low-res points are spaced at grid_size_low (one per voxel from
+        center_nearest downsampling). The worst case is a high-res point at
+        a voxel corner, at distance sqrt(3)/2 * grid_size_low from the
+        nearest low-res point. The radius must exceed this:
+
+            radius_min = grid_size_low * sqrt(3) / 2  (~0.87 * grid_size_low)
+            radius      = grid_size_low * radius_scaler  (~1.86 * grid_size_low for ks=3)
+
     Args:
         in_channels: Number of input channels
         out_channels: Number of output channels
-        kernel_size: Convolution kernel size (default: 3). Should match the kernel_size used in 
-                    the corresponding downsampling layer for proper radius alignment.
+        kernel_size: Convolution kernel size (default: 3)
         bias: Whether to use bias in convolution
-        receptive_field_scaler: Scaling factor for the receptive field (default: 1.0). 
-                               Increase this value to enlarge the search radius.
-        distance_type: Distance metric type, either "ball" or "cube" (default: "ball")
-        straight_recover: If True, directly recover triplets from parent (faster but neighbors may not be 
-                         fully accurate if upsampling parameters differ from downsampling parameters).
-                         If False, recompute triplets using upsampling layer parameters (slower but more accurate).
-                         Default: False
-    
-    Note on parameter selection:
-        To ensure at least one neighbor is found during upsampling, the computed radius must be
-        at least as large as the high-resolution grid_size. The radius is computed as:
-        
-            radius = grid_size_high * radius_scaler_for_kernel_size(kernel_size, receptive_field_scaler, distance_type)
-        
-        For kernel_size=3 and distance_type="ball", radius_scaler ≈ 1.86 with receptive_field_scaler=1.0.
-        If the computed radius is smaller than grid_size_high, a warning will be issued.
-        
-        To fix insufficient radius:
-        Increase receptive_field_scaler (e.g., to 1.2 or 1.5)
-    
-    Note on straight_recover:
-        When straight_recover=True, the cached triplets from downsampling are reused directly.
-        This is faster but the neighbors may not be fully accurate if:
-        - The upsampling layer's kernel_size differs from the downsampling layer's kernel_size
-        - The upsampling layer's receptive_field_scaler differs from the downsampling layer's receptive_field_scaler
-        - The upsampling layer's distance_type differs from the downsampling layer's distance_type
-        
-        When straight_recover=False, triplets are recomputed using the upsampling layer's parameters,
-        ensuring accurate neighbors but at the cost of additional computation time.
+        receptive_field_scaler: Volume multiplier for the search sphere (default: 1.0)
+        distance_type: Distance metric, "ball" or "cube" (default: "ball")
+        straight_recover: If True, reuse cached triplets from the corresponding
+            downsampling step (faster, but may be inaccurate if kernel_size,
+            receptive_field_scaler, or distance_type differ). Default: False
     """
 
     def __init__(
@@ -97,37 +85,44 @@ class Upsample(torch.nn.Module):
         )
 
         if use_cached:
-            # Fast path: directly recover triplets from parent (cached during downsampling)
-            # Note: This is faster but neighbors may not be fully accurate if upsampling parameters
-            # differ from downsampling parameters (kernel_size, receptive_field_scaler, distance_type)
+            # Fast path: reuse triplets cached during downsampling
             i_high = m_low.parent.i_upsample
             j_low = m_low.parent.j_upsample
             k = m_low.parent.k_upsample
         else:
-            # Slow path: recompute triplets using upsampling layer parameters
+            # Direct search: high-res queries among low-res sources
+            grid_size_low = m_low.grid_size
             radius_scaler = radius_scaler_for_kernel_size(
-                self.kernel_size, 
+                self.kernel_size,
                 self.receptive_field_scaler,
                 self.distance_type
             )
-            neighbor_radius = grid_size_high * radius_scaler
+            neighbor_radius = grid_size_low * radius_scaler
 
-            i, j, k, _ = build_triplets(
-                points=points_high,
-                sample_inds=sample_inds_high,
-                sample_sizes=sample_sizes_high,
+            import math
+            radius_min = grid_size_low * math.sqrt(3) / 2
+            if neighbor_radius < radius_min:
+                warnings.warn(
+                    f"Upsample search radius ({neighbor_radius:.4f}) is smaller than "
+                    f"the minimum required ({radius_min:.4f} = grid_size_low * sqrt(3)/2). "
+                    f"Some high-res points may receive zero output. "
+                    f"Increase receptive_field_scaler (currently {self.receptive_field_scaler})."
+                )
+
+            i_high, j_low, k, _ = build_triplets(
+                points=m_low.points,
+                sample_inds=m_low.sample_inds,
+                sample_sizes=m_low.sample_sizes,
                 neighbor_radius=neighbor_radius,
                 kernel_indexer=partial(voxelize_3d, kernel_size=self.kernel_size),
-                query_points=m_low.points,
-                query_sample_inds=m_low.sample_inds,
-                query_sample_sizes=m_low.sample_sizes,
+                query_points=points_high,
+                query_sample_inds=sample_inds_high,
+                query_sample_sizes=sample_sizes_high,
                 sort_by="k",
                 return_num_neighbors=False,
                 radius_scaler=radius_scaler,
             )
-            
-            i_high, j_low = j, i
-            
+
         x_high = self.conv(x_low, i_high, j_low, k, points_high.shape[0])
 
         m_high = MetaData(
