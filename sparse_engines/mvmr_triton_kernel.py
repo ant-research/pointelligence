@@ -29,7 +29,7 @@ import triton.language as tl
         triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=2),
         triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_C": 64}, num_warps=4),
     ],
-    key=["T", "G", "M", "C"],
+    key=["G", "M", "C"],
     reset_to_zero=["o"],
 )
 @triton.jit

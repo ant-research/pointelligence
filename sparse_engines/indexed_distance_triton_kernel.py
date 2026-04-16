@@ -18,7 +18,7 @@ import triton.language as tl
         triton.Config({"BLOCK_SIZE": 64, "num_warps": 4}, num_stages=1),
         triton.Config({"BLOCK_SIZE": 128, "num_warps": 4}, num_stages=1),
     ],
-    key=["n"],
+    key=[],
 )
 @triton.jit
 def indexed_distance_kernel_euclidean(
@@ -68,7 +68,7 @@ def indexed_distance_kernel_euclidean(
         triton.Config({"BLOCK_SIZE": 64, "num_warps": 4}, num_stages=1),
         triton.Config({"BLOCK_SIZE": 128, "num_warps": 4}, num_stages=1),
     ],
-    key=["n"],
+    key=[],
 )
 @triton.jit
 def indexed_distance_kernel_chebyshev(
