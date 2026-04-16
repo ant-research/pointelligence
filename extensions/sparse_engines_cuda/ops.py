@@ -4,12 +4,9 @@ from torch import Tensor
 __all__ = [
     "sparse_matrix_vector_multiplication_reduction",
     "sparse_vector_vector_outer_product_reduction",
-    "indexed_distance",
+
     "bucket_arrange",
 ]
-
-def indexed_distance(a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, distance_type: int = 0) -> Tensor:
-    return torch.ops.sparse_engines_cuda.indexed_distance(a, a_idx, b, b_idx, distance_type)
 
 def bucket_arrange(bucket_indices: Tensor, num_buckets: int) -> (Tensor, Tensor):
     return torch.ops.sparse_engines_cuda.bucket_arrange(bucket_indices, num_buckets)
