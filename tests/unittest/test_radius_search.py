@@ -10,6 +10,7 @@ from scipy import spatial
 
 from internals.neighbors import radius_search
 from internals.neighbors import radius_search_brute_force
+from internals.neighbors import radius_search_tiled
 from internals.neighbors import repeat_interleave_indices
 from internals.indexing import cumsum_inclusive_zero_prefixed
 
@@ -54,6 +55,30 @@ def batch_radius_search_lookup(
         points_sample_inds,
         query_sample_inds,
         point_num_max=point_num_max,
+    )
+    num_neighbors_cumsum = cumsum_inclusive_zero_prefixed(num_neighbors)
+
+    return neighbors, num_neighbors_cumsum
+
+
+def batch_radius_search_tiled(
+    points, num_points, queries, num_queries, radius, point_num_max
+):
+    points_sample_inds = repeat_interleave_indices(
+        repeats=num_points, output_size=points.shape[0], may_contain_zero_repeats=False
+    )
+    query_sample_inds = repeat_interleave_indices(
+        repeats=num_queries,
+        output_size=queries.shape[0],
+        may_contain_zero_repeats=False,
+    )
+
+    neighbors, num_neighbors = radius_search_tiled(
+        points,
+        queries,
+        radius,
+        points_sample_inds,
+        query_sample_inds,
     )
     num_neighbors_cumsum = cumsum_inclusive_zero_prefixed(num_neighbors)
 
@@ -334,6 +359,28 @@ def test():
             description="Batch Radius Search Native-(%s)" % config,
         )
         print(t_radius_search_lookup.timeit(number))
+
+        neighbors_tiled, num_neighbors_cumsum_tiled = batch_radius_search_tiled(
+            **augments
+        )
+        iou = compute_iou(
+            neighbors_numpy,
+            num_neighbors_cumsum_numpy,
+            neighbors_tiled,
+            num_neighbors_cumsum_tiled,
+        )
+        assert iou > 1 - 1e-3, "IoU: %f" % iou
+        print(
+            datetime.datetime.now(),
+            ": batch_radius_search_tiled passed!-(%s)" % config,
+        )
+
+        t_radius_search_tiled = benchmark.Timer(
+            stmt="batch_radius_search_tiled(" + augments_str + ")",
+            globals={**augments, "batch_radius_search_tiled": batch_radius_search_tiled},
+            description="Batch Radius Search Tiled-(%s)" % config,
+        )
+        print(t_radius_search_tiled.timeit(number))
 
         if debug:  # too slow, so run it only in debug mode, where #points is small...
             neighbors_brute_force, num_neighbors_cumsum_brute_force = (

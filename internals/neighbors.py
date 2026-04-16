@@ -16,7 +16,19 @@ from .indexing import cumsum_exclusive
 from .indexing import arrange_indices
 from .indexing import repeat_interleave_indices
 
-from sparse_engines.indexed_distance_triton import indexed_distance
+from sparse_engines.indexed_distance_mask_triton_kernel import (
+    indexed_distance_mask_kernel,
+    indexed_distance_mask_and_dist_kernel,
+    indexed_distance_mask_kernel_chebyshev,
+    indexed_distance_mask_and_dist_kernel_chebyshev,
+)
+from sparse_engines.brute_force_radius_triton_kernel import (
+    _tiled_radius_count_kernel,
+    _tiled_radius_compact_kernel,
+    _tiled_radius_count_kernel_chebyshev,
+    _tiled_radius_compact_kernel_chebyshev,
+)
+import triton
 
 
 def clamp_by_radius(
@@ -29,13 +41,55 @@ def clamp_by_radius(
     dtype_num_neighbors=torch.int64,
     distance_type="ball",
 ):
-    distances_all = indexed_distance(queries, q_inds, points, p_inds, distance_type=distance_type)
-    neighbors_mask = distances_all <= radius
-    neighbors_indices = torch.nonzero(neighbors_mask).squeeze(-1)
-    del neighbors_mask
+    """Filter candidate (query, point) pairs to those within a given radius.
 
-    distances = distances_all[neighbors_indices] if return_distances else None
-    del distances_all
+    Takes flat arrays of candidate pair indices produced by grid lookup and
+    computes exact distances, keeping only pairs where dist <= radius.
+
+    Args:
+        queries: (Q, 3) query point coordinates.
+        q_inds: (C,) query index for each candidate pair.
+        points: (P, 3) reference point coordinates.
+        p_inds: (C,) point index for each candidate pair.
+        radius: scalar distance threshold.
+        return_distances: if True, also return per-neighbor distances.
+        dtype_num_neighbors: dtype for the per-query neighbor count tensor.
+        distance_type: "ball" (Euclidean) or "chebyshev" (L-inf).
+
+    Returns:
+        neighbors: (N,) point indices of confirmed neighbors.
+        num_neighbors: (Q,) neighbor count per query.
+        distances (optional): (N,) distances for confirmed neighbors.
+    """
+    n = q_inds.numel()
+    device = queries.device
+
+    # Select fused kernel pair based on distance type
+    if distance_type == "ball":
+        mask_kernel = indexed_distance_mask_kernel
+        mask_and_dist_kernel = indexed_distance_mask_and_dist_kernel
+    else:
+        mask_kernel = indexed_distance_mask_kernel_chebyshev
+        mask_and_dist_kernel = indexed_distance_mask_and_dist_kernel_chebyshev
+
+    # Fused kernel: compute distance + mask in one pass, saving the
+    # intermediate (C,) float32 distances tensor and a separate comparison.
+    mask = torch.empty((n,), dtype=torch.bool, device=device)
+    grid = lambda META: (triton.cdiv(n, META["BLOCK_SIZE"]),)
+    if return_distances:
+        distances_all = torch.empty((n,), dtype=queries.dtype, device=device)
+        mask_and_dist_kernel[grid](
+            queries, q_inds, points, p_inds, mask, distances_all, radius, n)
+        neighbors_indices = torch.nonzero(mask).squeeze(-1)
+        del mask
+        distances = distances_all[neighbors_indices]
+        del distances_all
+    else:
+        mask_kernel[grid](
+            queries, q_inds, points, p_inds, mask, radius, n)
+        neighbors_indices = torch.nonzero(mask).squeeze(-1)
+        del mask
+        distances = None
 
     neighbors = p_inds[neighbors_indices]
     del p_inds
@@ -71,6 +125,31 @@ def radius_search_lookup(
     dtype_num_neighbors=torch.int64,
     distance_type="ball",
 ):
+    """Grid-accelerated fixed-radius neighbor search.
+
+    Uses a shifted spatial hash grid to find candidate pairs, then filters
+    by exact distance. The algorithm:
+      1. Hash both points and queries into a uniform grid (cell size = 2*radius).
+         The smaller set gets 8 half-cell shifts to guarantee coverage across
+         cell boundaries — any true neighbor pair shares a cell in >= 1 shift.
+      2. Build a lookup structure (sorted unique hashes) on whichever set
+         produces fewer grid entries; the other set queries into it.
+      3. Expand per-cell matches into flat (q_ind, p_ind) candidate arrays.
+      4. Compute exact distances via Triton kernel and keep pairs <= radius.
+
+    Args:
+        points: (P, 3) reference point coordinates.
+        queries: (Q, 3) query point coordinates.
+        radius: search radius.
+        sample_inds: (P,) int batch index per point, or None for single-batch.
+        query_sample_inds: (Q,) int batch index per query, or None.
+        return_distances: if True, also return per-neighbor distances.
+        dtype_num_neighbors: dtype for per-query neighbor counts.
+        distance_type: "ball" (Euclidean) or "chebyshev" (L-inf).
+
+    Returns:
+        Same as clamp_by_radius: (neighbors, num_neighbors[, distances]).
+    """
     if sample_inds is not None:
         assert query_sample_inds is not None
     else:
@@ -162,6 +241,23 @@ def radius_search_lookup(
 
 
 def radius_search_brute_force(points, queries, radius, return_distances=False):
+    """O(P*Q) brute-force radius search via full distance matrix.
+
+    Reference implementation for correctness testing. Computes
+    ``torch.cdist(queries, points)`` and filters by radius in-place
+    to limit peak memory.
+
+    Args:
+        points: (P, 3) reference points.
+        queries: (Q, 3) query points.
+        radius: search radius.
+        return_distances: if True, also return per-neighbor distances.
+
+    Returns:
+        neighbors: (N,) point indices of confirmed neighbors.
+        num_neighbors: (Q,) neighbor count per query.
+        distances (optional): (N,) distances for confirmed neighbors.
+    """
     distance_matrix = torch.cdist(queries, points, p=2.0)
 
     # in-place manipulation to save memory usage: distance_matrix = min(distance_matrix-radius, 0)
@@ -199,6 +295,113 @@ def radius_search_brute_force(points, queries, radius, return_distances=False):
         return neighbors, num_neighbors
 
 
+def _compute_batch_ranges(sample_inds, query_sample_inds, num_points, num_queries, device):
+    """Convert per-point sample_inds to per-query (p_start, p_end) ranges."""
+    if sample_inds is None:
+        q_batch_starts = torch.zeros(num_queries, dtype=torch.int64, device=device)
+        q_batch_ends = torch.full((num_queries,), num_points, dtype=torch.int64, device=device)
+        return q_batch_starts, q_batch_ends
+
+    p_sizes = torch.bincount(sample_inds)
+    p_offsets = torch.zeros(p_sizes.numel() + 1, dtype=torch.int64, device=device)
+    p_offsets[1:] = torch.cumsum(p_sizes, 0)
+
+    q_batch_starts = p_offsets[query_sample_inds.long()]
+    q_batch_ends = p_offsets[query_sample_inds.long() + 1]
+    return q_batch_starts, q_batch_ends
+
+
+def radius_search_tiled(
+    points,
+    queries,
+    radius,
+    sample_inds=None,
+    query_sample_inds=None,
+    return_distances=False,
+    dtype_num_neighbors=torch.int64,
+    distance_type="ball",
+):
+    """Tiled brute-force radius search (PyKeOPS-style).
+
+    Never materializes the full Q×P distance matrix. Computes distances
+    in tiles of BLOCK_P points per query, streaming results to output.
+    Two passes: count neighbors, then compact.
+
+    Same signature as ``radius_search_lookup`` — drop-in replacement.
+    Faster than grid-accelerated search when radius/grid_size is large
+    (> ~5-7x), where the grid provides little pruning benefit.
+
+    Args:
+        points: (P, 3) reference point coordinates.
+        queries: (Q, 3) query point coordinates.
+        radius: search radius.
+        sample_inds: (P,) int batch index per point, or None for single-batch.
+        query_sample_inds: (Q,) int batch index per query, or None.
+        return_distances: if True, also return per-neighbor distances.
+        dtype_num_neighbors: dtype for per-query neighbor counts.
+        distance_type: "ball" (Euclidean) or "chebyshev" (L-inf).
+
+    Returns:
+        neighbors: (N,) point indices of confirmed neighbors.
+        num_neighbors: (Q,) neighbor count per query.
+        distances (optional): (N,) distances for confirmed neighbors.
+    """
+    if sample_inds is not None:
+        assert query_sample_inds is not None
+    else:
+        assert query_sample_inds is None
+
+    device = points.device
+    num_points, num_queries = points.shape[0], queries.shape[0]
+    BLOCK_P = 256
+
+    q_batch_starts, q_batch_ends = _compute_batch_ranges(
+        sample_inds, query_sample_inds, num_points, num_queries, device)
+
+    # Select kernels based on distance type
+    if distance_type == "ball":
+        count_kernel = _tiled_radius_count_kernel
+        compact_kernel = _tiled_radius_compact_kernel
+        radius_param = radius * radius  # squared for Euclidean
+    else:
+        count_kernel = _tiled_radius_count_kernel_chebyshev
+        compact_kernel = _tiled_radius_compact_kernel_chebyshev
+        radius_param = radius
+
+    # Pass 1: count
+    num_neighbors = torch.zeros(num_queries, dtype=torch.int32, device=device)
+    grid = (num_queries,)
+    count_kernel[grid](
+        queries, points, q_batch_starts, q_batch_ends,
+        num_neighbors, radius_param, num_queries,
+        BLOCK_P=BLOCK_P,
+    )
+
+    # Compute write offsets
+    num_neighbors_out = num_neighbors.to(dtype_num_neighbors)
+    offsets, total = cumsum_exclusive(num_neighbors_out, return_sum=True)
+
+    if total == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        if return_distances:
+            return empty, num_neighbors_out, torch.empty(0, dtype=queries.dtype, device=device)
+        return empty, num_neighbors_out
+
+    # Pass 2: compact
+    out_neighbors = torch.empty(total, dtype=torch.int32, device=device)
+    out_distances = torch.empty(total, dtype=queries.dtype, device=device) if return_distances else torch.empty(0, device=device)
+    compact_kernel[grid](
+        queries, points, q_batch_starts, q_batch_ends,
+        offsets, out_neighbors, out_distances,
+        radius_param, num_queries, return_distances,
+        BLOCK_P=BLOCK_P,
+    )
+
+    if return_distances:
+        return out_neighbors, num_neighbors_out, out_distances
+    return out_neighbors, num_neighbors_out
+
+
 def radius_search(
     points,
     query_points,
@@ -210,8 +413,75 @@ def radius_search(
     sample_sizes=None,
     query_sample_sizes=None,
     distance_type="ball",
+    tiled_batch_threshold=20000,
 ):
+    """Top-level entry point for fixed-radius neighbor search.
+
+    Adaptively selects between two backends:
+      - **Grid-accelerated** (``radius_search_lookup``): best when per-batch
+        point counts are large and radius is small relative to the scene.
+      - **Tiled brute-force** (``radius_search_tiled``): best when per-batch
+        point counts are small (≤ ``tiled_batch_threshold``) or radius is
+        large relative to point spacing. Never materializes the full distance
+        matrix, scaling as O(Q × P_batch) regardless of radius.
+
+    The heuristic: if the max per-batch point count (across both points and
+    queries) is ≤ ``tiled_batch_threshold``, use tiled; otherwise use grid.
+
+    For large batched clouds (> point_num_max), splits by sample boundaries
+    and runs the chosen backend per chunk to bound memory.
+
+    Args:
+        points: (P, 3) reference point coordinates.
+        query_points: (Q, 3) query point coordinates.
+        radius: search radius.
+        sample_inds: (P,) batch index per point, or None for single-batch.
+        query_sample_inds: (Q,) batch index per query, or None.
+        return_distances: if True, also return per-neighbor distances.
+        point_num_max: threshold above which to split into chunks.
+        sample_sizes: (B,) pre-computed per-sample point counts (avoids bincount).
+        query_sample_sizes: (B,) pre-computed per-sample query counts.
+        distance_type: "ball" (Euclidean) or "chebyshev" (L-inf).
+        tiled_batch_threshold: max per-batch size to prefer tiled over grid.
+            Set to 0 to always use grid, or a large value to always use tiled.
+
+    Returns:
+        neighbors: (N,) point indices of confirmed neighbors.
+        num_neighbors: (Q,) neighbor count per query.
+        distances (optional): (N,) distances for confirmed neighbors.
+    """
     point_num = max(points.shape[0], query_points.shape[0])
+
+    # Choose backend based on per-batch size
+    use_tiled = False
+    if sample_inds is not None and tiled_batch_threshold > 0:
+        _sample_sizes = (
+            sample_sizes if sample_sizes is not None else torch.bincount(sample_inds)
+        )
+        _query_sample_sizes = (
+            query_sample_sizes
+            if query_sample_sizes is not None
+            else torch.bincount(query_sample_inds)
+        )
+        max_batch = max(
+            _sample_sizes.max().item(),
+            _query_sample_sizes.max().item(),
+        )
+        use_tiled = max_batch <= tiled_batch_threshold
+    elif sample_inds is None:
+        use_tiled = point_num <= tiled_batch_threshold
+
+    if use_tiled:
+        return radius_search_tiled(
+            points=points,
+            queries=query_points,
+            radius=radius,
+            sample_inds=sample_inds,
+            query_sample_inds=query_sample_inds,
+            return_distances=return_distances,
+            dtype_num_neighbors=torch.int64,
+            distance_type=distance_type,
+        )
 
     if point_num <= point_num_max or sample_inds is None:
         return radius_search_lookup(
@@ -283,6 +553,20 @@ def radius_search(
 
 
 def segment_sort(input, indices_for_repeat, distances=None, max_distance=None):
+    """Sort elements within each segment defined by ``indices_for_repeat``.
+
+    Each segment corresponds to one query's neighbor set. Sorts by distance
+    if provided, otherwise by random jitter (for stochastic clipping).
+
+    Args:
+        input: (N,) values to reorder (typically neighbor indices).
+        indices_for_repeat: (N,) segment id for each element.
+        distances: (N,) optional sort key within each segment.
+        max_distance: pre-computed max(distances) to avoid a reduction.
+
+    Returns:
+        (N,) reordered ``input`` with elements sorted within segments.
+    """
     if distances is None:
         segment_distances = torch.rand_like(
             indices_for_repeat, dtype=torch.float32
@@ -305,6 +589,23 @@ def clip_neighbors(
     max_distance=None,
     randomize=True,
 ):
+    """Cap each query's neighbor count to ``neighbor_clip``.
+
+    When distances are provided, keeps the closest neighbors. Otherwise,
+    if ``randomize=True``, shuffles before clipping for stochastic sampling.
+
+    Args:
+        neighbors: (N,) flat neighbor indices from radius search.
+        num_neighbors: (Q,) per-query neighbor counts.
+        neighbor_clip: maximum neighbors to keep per query.
+        distances: (N,) optional distances for distance-based selection.
+        max_distance: pre-computed max distance (avoids reduction).
+        randomize: if True and no distances, randomly shuffle before clipping.
+
+    Returns:
+        (neighbors_clipped, num_neighbors_clipped,
+         num_neighbors_clipped_cumsum, indices_for_repeat)
+    """
     randomize = (
         False if distances is not None else randomize
     )  # disable randomize when distance is provided
@@ -345,6 +646,19 @@ def clip_neighbors(
 
 
 def nearest_neighbors(neighbors, num_neighbors, distances):
+    """Extract the single closest neighbor for each query.
+
+    Finds the minimum distance within each query's neighbor set and returns
+    the corresponding point index. Handles ties by keeping one arbitrarily.
+
+    Args:
+        neighbors: (N,) flat neighbor indices.
+        num_neighbors: (Q,) per-query neighbor counts.
+        distances: (N,) per-neighbor distances.
+
+    Returns:
+        (Q,) point index of the nearest neighbor for each query.
+    """
     indices_for_repeat = repeat_interleave_indices(
         repeats=num_neighbors,
         output_size=neighbors.numel(),

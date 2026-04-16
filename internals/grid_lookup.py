@@ -6,8 +6,10 @@ radius search.
 """
 
 import torch
+import triton
 
 from .constants import Constants
+from .grid_hash_triton_kernel import grid_hash_kernel_4d
 
 
 def compute_overlapped_grid_indices(points, grid_size, overlap, dtype=torch.int32):
@@ -80,14 +82,24 @@ def reduce_indices_to_1d(inds, inds_min=None, inds_stride=None, dtype=None):
         inds_stride = inds_stride.roll(1, dims=-1)
         inds_stride[0, 0] = 1
 
-    if not (isinstance(inds_min, int) and 0 == inds_min):
-        inds_ = (inds - inds_min).to(dtype).mul_(inds_stride)
+    n, d = inds.shape
+    if d == 4 and inds.is_contiguous() and inds.is_cuda:
+        # Fused Triton kernel: replaces (sub, mul, sum) with a single launch
+        inds_1d = torch.empty((n,), dtype=dtype, device=inds.device)
+        grid = lambda META: (triton.cdiv(n, META["BLOCK_SIZE"]),)
+        grid_hash_kernel_4d[grid](
+            inds, inds_1d,
+            inds_min.reshape(-1), inds_stride.reshape(-1),
+            n)
     else:
-        if dtype == inds.dtype:  # do not use in-place mul here!
-            inds_ = inds.mul(inds_stride)
-        else:  # to(dtype) creates a tensor with new storage, thus it is safe to use in-place mul_ here.
-            inds_ = inds.to(dtype).mul_(inds_stride)
-    inds_1d = torch.sum(inds_, dim=-1)
+        if not (isinstance(inds_min, int) and 0 == inds_min):
+            inds_ = (inds - inds_min).to(dtype).mul_(inds_stride)
+        else:
+            if dtype == inds.dtype:
+                inds_ = inds.mul(inds_stride)
+            else:
+                inds_ = inds.to(dtype).mul_(inds_stride)
+        inds_1d = torch.sum(inds_, dim=-1)
     return inds_1d, inds_min, inds_stride, dtype
 
 
