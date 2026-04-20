@@ -124,6 +124,7 @@ def radius_search_lookup(
     return_distances=False,
     dtype_num_neighbors=torch.int64,
     distance_type="ball",
+    max_candidate_mem_bytes=2 * 1024**3,
 ):
     """Grid-accelerated fixed-radius neighbor search.
 
@@ -203,41 +204,126 @@ def radius_search_lookup(
     )
     del q_repeat_num
 
-    indices_for_repeat = repeat_interleave_indices(
-        repeats_cumsum=q_repeat_num_cumsum,
-        output_size=q_repeat_num_sum,
-        may_contain_zero_repeats=True,
+    # ── Candidate expansion + radius filtering ──
+    # Each candidate pair costs ~29 bytes across all temporary tensors
+    # (indices_for_repeat int64 + q_inds int32 + p_inds_offset int64 +
+    #  arange int64 + mask bool = 8+4+8+8+1 = 29 bytes).
+    # If the total fits within the memory budget, use the fast monolithic path.
+    # Otherwise, process queries in adaptive chunks to cap peak memory.
+    _BYTES_PER_CANDIDATE = 29
+    max_candidates = max_candidate_mem_bytes // _BYTES_PER_CANDIDATE
+
+    if q_repeat_num_sum <= max_candidates:
+        # ── Fast path: all candidates fit in memory budget ──
+        indices_for_repeat = repeat_interleave_indices(
+            repeats_cumsum=q_repeat_num_cumsum,
+            output_size=q_repeat_num_sum,
+            may_contain_zero_repeats=True,
+        )
+        q_inds = arange_cached(num_queries, device=device, dtype=torch.int32)
+        if not shift_on_points:
+            q_inds = torch.reshape(q_inds.unsqueeze(dim=-1).expand(-1, num_shifts), (-1,))
+        q_inds = q_inds[indices_for_repeat]
+
+        p_inds_offset = p_grid_splits[q_lookup_inds_int64]
+        del p_grid_splits, q_lookup_inds_int64
+        p_inds_offset -= q_repeat_num_cumsum
+        del q_repeat_num_cumsum
+        p_inds_offset = p_inds_offset[indices_for_repeat]
+        del indices_for_repeat
+
+        p_inds = arange_cached(q_inds.numel(), device=device, dtype=torch.int64)
+        p_inds = p_point_inds[p_inds_offset.to(torch.int64).add_(p_inds)]
+        del p_inds_offset
+        del p_point_inds
+
+        results = clamp_by_radius(
+            queries, q_inds, points, p_inds,
+            radius, return_distances, dtype_num_neighbors, distance_type,
+        )
+        del q_inds, p_inds
+        return results
+
+    # ── Chunked path: split queries to stay within memory budget ──
+    effective_q = q_repeat_num_cumsum.shape[0]
+
+    # Find chunk boundaries where cumulative candidates cross budget thresholds
+    thresholds = torch.arange(
+        max_candidates, q_repeat_num_sum + max_candidates,
+        max_candidates, device=device, dtype=torch.int64,
     )
-    q_inds = arange_cached(num_queries, device=device, dtype=torch.int32)
+    split_indices = torch.searchsorted(q_repeat_num_cumsum, thresholds).clamp(max=effective_q)
+    split_indices = torch.cat([
+        torch.zeros(1, device=device, dtype=split_indices.dtype),
+        split_indices,
+    ]).unique()
+
+    q_inds_base = arange_cached(num_queries, device=device, dtype=torch.int32)
     if not shift_on_points:
-        q_inds = torch.reshape(q_inds.unsqueeze(dim=-1).expand(-1, num_shifts), (-1,))
-    q_inds = q_inds[indices_for_repeat]
+        q_inds_base = torch.reshape(
+            q_inds_base.unsqueeze(dim=-1).expand(-1, num_shifts), (-1,)
+        )
 
-    p_inds_offset = p_grid_splits[q_lookup_inds_int64]
-    del p_grid_splits, q_lookup_inds_int64
-    p_inds_offset -= q_repeat_num_cumsum
-    del q_repeat_num_cumsum
-    p_inds_offset = p_inds_offset[indices_for_repeat]
-    del indices_for_repeat
+    num_neighbors_accum = torch.zeros(num_queries, dtype=dtype_num_neighbors, device=device)
+    all_neighbors = []
+    all_distances = []
 
-    p_inds = arange_cached(q_inds.numel(), device=device, dtype=torch.int32)
-    p_inds = p_point_inds[p_inds_offset.add_(p_inds)]
-    del p_inds_offset
-    del p_point_inds
+    for ci in range(len(split_indices) - 1):
+        start = split_indices[ci].item()
+        end = split_indices[ci + 1].item()
+        if start == end:
+            continue
 
-    results = clamp_by_radius(
-        queries,
-        q_inds,
-        points,
-        p_inds,
-        radius,
-        return_distances,
-        dtype_num_neighbors,
-        distance_type,
-    )
-    del q_inds, p_inds
+        base_offset = q_repeat_num_cumsum[start]
+        chunk_total = (
+            q_repeat_num_cumsum[end] if end < effective_q else q_repeat_num_sum
+        ) - base_offset
+        if chunk_total == 0:
+            continue
 
-    return results
+        chunk_cumsum = q_repeat_num_cumsum[start:end] - base_offset
+
+        indices_for_repeat = repeat_interleave_indices(
+            repeats_cumsum=chunk_cumsum,
+            output_size=chunk_total,
+            may_contain_zero_repeats=True,
+        )
+
+        chunk_q_inds = q_inds_base[start:end][indices_for_repeat]
+
+        chunk_p_offset = p_grid_splits[q_lookup_inds_int64[start:end]]
+        chunk_p_offset = (chunk_p_offset - chunk_cumsum)[indices_for_repeat]
+        del indices_for_repeat
+
+        local_arange = torch.arange(chunk_total, device=device, dtype=torch.int64)
+        chunk_p_inds = p_point_inds[chunk_p_offset.to(torch.int64).add_(local_arange)]
+        del chunk_p_offset, local_arange
+
+        result = clamp_by_radius(
+            queries, chunk_q_inds, points, chunk_p_inds,
+            radius, return_distances, dtype_num_neighbors, distance_type,
+        )
+        del chunk_q_inds, chunk_p_inds
+
+        all_neighbors.append(result[0])
+        num_neighbors_accum.add_(result[1])
+        if return_distances:
+            all_distances.append(result[2])
+
+    del q_repeat_num_cumsum, q_lookup_inds_int64, p_grid_splits, p_point_inds
+
+    if all_neighbors:
+        neighbors = torch.cat(all_neighbors)
+    else:
+        neighbors = torch.empty(0, dtype=torch.int32, device=device)
+
+    if return_distances:
+        distances = (
+            torch.cat(all_distances) if all_distances
+            else torch.empty(0, dtype=queries.dtype, device=device)
+        )
+        return neighbors, num_neighbors_accum, distances
+    return neighbors, num_neighbors_accum
 
 
 def radius_search_brute_force(points, queries, radius, return_distances=False):
