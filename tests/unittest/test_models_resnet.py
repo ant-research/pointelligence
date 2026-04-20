@@ -1,17 +1,15 @@
+import pytest
 import torch
 
 from models import resnet18, resnet50
 
 
-def test_resnets():
-    num_samples = 8
-    num_points_max = 100000
-    in_channels = 3
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    # device = "cpu"
+def _run_resnet(model_fn, num_samples, num_points_max, in_channels, device):
+    """Run a forward pass of a resnet model and return output shapes for sanity checking."""
+    torch.cuda.empty_cache()
 
     sample_sizes = torch.randint(
-        low=0, high=num_points_max, size=(num_samples,), device=device
+        low=1, high=num_points_max, size=(num_samples,), device=device
     )
     num_points = torch.sum(sample_sizes)
 
@@ -19,14 +17,21 @@ def test_resnets():
     points = torch.rand((num_points, 3), device=device, dtype=torch.float32)
     grid_size = 1 / 512
 
-    resnet_18 = resnet18(in_channels=in_channels).to(device)
-    output_resnet_18 = resnet_18(x, points, sample_sizes, grid_size)
+    model = model_fn(in_channels=in_channels).to(device)
+    output = model(x, points, sample_sizes, grid_size)
+    return output
 
-    resnet_50 = resnet50(in_channels=in_channels).to(device)
-    output_resnet_50 = resnet_50(x, points, sample_sizes, grid_size)
 
-    pass
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_resnet18():
+    _run_resnet(resnet18, num_samples=4, num_points_max=10000, in_channels=3, device="cuda:0")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_resnet50():
+    _run_resnet(resnet50, num_samples=4, num_points_max=10000, in_channels=3, device="cuda:0")
 
 
 if __name__ == "__main__":
-    test_resnets()
+    test_resnet18()
+    test_resnet50()

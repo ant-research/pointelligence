@@ -21,13 +21,22 @@ class Upsample(torch.nn.Module):
     to guarantee every high-res point finds at least one low-res neighbor.
 
     Minimum radius requirement:
-        Low-res points are spaced at grid_size_low (one per voxel from
-        center_nearest downsampling). The worst case is a high-res point at
-        a voxel corner, at distance sqrt(3)/2 * grid_size_low from the
-        nearest low-res point. The radius must exceed this:
+        Low-res points come from center_nearest downsampling: one point per
+        voxel, chosen as the point closest to the voxel center. Crucially,
+        center_nearest does NOT place the representative AT the center — it
+        picks from existing points, which may all be clustered at one corner.
 
-            radius_min = grid_size_low * sqrt(3) / 2  (~0.87 * grid_size_low)
+        The worst case is an isolated voxel (no adjacent occupied voxels)
+        where the center_nearest representative is at one corner and a
+        high-res query point is at the opposite corner. The maximum
+        within-voxel distance is the full voxel diagonal:
+
+            radius_min = grid_size_low * sqrt(3)  (~1.73 * grid_size_low)
             radius      = grid_size_low * radius_scaler  (~1.86 * grid_size_low for ks=3)
+
+        This leaves only ~7% margin. For kernel_size=3 with default
+        receptive_field_scaler=1.0, the guarantee holds but is tight.
+        It breaks when receptive_field_scaler < ~0.81.
 
     Args:
         in_channels: Number of input channels
@@ -100,12 +109,14 @@ class Upsample(torch.nn.Module):
             neighbor_radius = grid_size_low * radius_scaler
 
             import math
-            radius_min = grid_size_low * math.sqrt(3) / 2
+            # The true worst case is the full voxel diagonal (center_nearest
+            # can place the representative at any corner, not near the center).
+            radius_min = grid_size_low * math.sqrt(3)
             if neighbor_radius < radius_min:
                 warnings.warn(
                     f"Upsample search radius ({neighbor_radius:.4f}) is smaller than "
-                    f"the minimum required ({radius_min:.4f} = grid_size_low * sqrt(3)/2). "
-                    f"Some high-res points may receive zero output. "
+                    f"the worst-case voxel diagonal ({radius_min:.4f} = grid_size_low * sqrt(3)). "
+                    f"Some high-res points in isolated voxels may find zero neighbors. "
                     f"Increase receptive_field_scaler (currently {self.receptive_field_scaler})."
                 )
 
