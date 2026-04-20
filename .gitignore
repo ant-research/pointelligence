@@ -65,3 +65,5 @@ data/
 checkpoints/
 outputs/
 results/
+.claude/
+scripts/job_state.json

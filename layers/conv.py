@@ -120,11 +120,13 @@ class GeneralConv(Module):
             self.kernel_size,
         ).permute(3, 0, 1, 2)
 
-        # Reshape input from 2D (N, in_channels) to 3D (N, 1, in_channels)
-        # This is required for backward pass compatibility with vvor_triton
-        # which expects 3D tensors: a.shape[2] should exist
+        # Reshape input from 2D (N, C_in) to 3D (N, G, C_in/G).
+        # The group dimension must match the weight's so that VVOR (backward)
+        # produces grad_weight with shape (K, G, Ci/G, Co/G) matching the
+        # weight after reshape+permute. Using (N, 1, C_in) breaks grouped
+        # convolutions because VVOR would output (K, 1, C_in, Co/G) instead.
         if input.dim() == 2:
-            input_3d = input.view(input.shape[0], 1, -1).contiguous()
+            input_3d = input.view(input.shape[0], self.groups, -1).contiguous()
         else:
             input_3d = input.contiguous()
 

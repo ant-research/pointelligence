@@ -346,16 +346,14 @@ def test():
 
         t_radius_search_numpy = benchmark.Timer(
             stmt="batch_radius_search_numpy(" + augments_np_str + ")",
-            setup="from __main__ import batch_radius_search_numpy",
-            globals=augments_np,
+            globals={**augments_np, "batch_radius_search_numpy": batch_radius_search_numpy},
             description="Batch Radius Search Numpy-(%s)" % config,
         )
         print(t_radius_search_numpy.timeit(1))
 
         t_radius_search_lookup = benchmark.Timer(
             stmt="batch_radius_search_lookup(" + augments_str + ")",
-            setup="from __main__ import batch_radius_search_lookup",
-            globals=augments,
+            globals={**augments, "batch_radius_search_lookup": batch_radius_search_lookup},
             description="Batch Radius Search Native-(%s)" % config,
         )
         print(t_radius_search_lookup.timeit(number))
@@ -400,8 +398,7 @@ def test():
 
             t_radius_search_brute_force = benchmark.Timer(
                 stmt="batch_radius_search_brute_force(" + augments_str + ")",
-                setup="from __main__ import batch_radius_search_brute_force",
-                globals=augments,
+                globals={**augments, "batch_radius_search_brute_force": batch_radius_search_brute_force},
                 description="Batch Radius Search Native-(%s)" % config,
             )
             print(t_radius_search_brute_force.timeit(number))

@@ -348,40 +348,35 @@ def test():
 
     t_subsample_numpy = benchmark.Timer(
         stmt="batch_grid_sample_average_numpy_sort(" + augments_np_str + ")",
-        setup="from __main__ import batch_grid_sample_average_numpy_sort",
-        globals=augments_np,
+        globals={**augments_np, "batch_grid_sample_average_numpy_sort": batch_grid_sample_average_numpy_sort},
         description="Batch Subsample Average Numpy",
     )
     print(t_subsample_numpy.timeit(number))
 
     t_subsample_sort = benchmark.Timer(
         stmt="batch_grid_sample_average_sort(" + augments_str + ")",
-        setup="from __main__ import batch_grid_sample_average_sort",
-        globals=augments,
+        globals={**augments, "batch_grid_sample_average_sort": batch_grid_sample_average_sort},
         description="Batch Subsample Average Sort",
     )
     print(t_subsample_sort.timeit(number))
 
     t_subsample = benchmark.Timer(
         stmt="batch_grid_sample_average_per_sample(" + augments_str + ")",
-        setup="from __main__ import batch_grid_sample_average_per_sample",
-        globals=augments,
+        globals={**augments, "batch_grid_sample_average_per_sample": batch_grid_sample_average_per_sample},
         description="Batch Subsample Average per Sample",
     )
     print(t_subsample.timeit(number))
 
     t_subsample_average = benchmark.Timer(
         stmt="batch_grid_sample_average(" + augments_str + ")",
-        setup="from __main__ import batch_grid_sample_average",
-        globals=augments,
+        globals={**augments, "batch_grid_sample_average": batch_grid_sample_average},
         description="Batch Subsample Average",
     )
     print(t_subsample_average.timeit(number))
 
     t_subsample_center_nearest = benchmark.Timer(
         stmt="batch_grid_sample_center_nearest(" + augments_str + ")",
-        setup="from __main__ import batch_grid_sample_center_nearest",
-        globals=augments,
+        globals={**augments, "batch_grid_sample_center_nearest": batch_grid_sample_center_nearest},
         description="Batch Subsample Center Nearest",
     )
     print(t_subsample_center_nearest.timeit(number))
