@@ -1,6 +1,7 @@
 Deprecated
 wheel
 setuptools>=64.0.0
-torch>=2.6.0
-torchvision>=0.20.0
+torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 triton>=2.0; sys_platform == 'Linux'
