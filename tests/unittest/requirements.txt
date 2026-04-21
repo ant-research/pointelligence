@@ -1,2 +1,4 @@
+pytest
+pytest-benchmark
 pykeops>=2.0
 scipy
