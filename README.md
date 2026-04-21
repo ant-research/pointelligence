@@ -27,39 +27,12 @@ If you have already cloned without `--recursive`, run `git submodule update --in
 
 # Installation
 
-## Option 1: Local Installation
-
 Some operators are implemented with C++/CUDA as PyTorch extensions, which could be built and installed with the following commands:
 
 ```shell
-conda create -n pointelligence python=3.10 -y
-conda activate pointelligence
-pip install -r requirements.txt
 cd extensions
 pip install --no-build-isolation -e .
 ```
-
-## Option 2: Docker Installation
-
-Use Docker for a containerized environment with all dependencies pre-installed:
-
-```shell
-# Build the Docker image
-docker build -t pointelligence .
-
-# Test the containerized environment
-docker run --gpus all -it -v $(pwd):/workspace pointelligence
-
-# Verify installation
-python -m pytest tests/unittest/ -v
-```
-
-The Docker image includes:
-- CUDA 12.4 + cuDNN + PyTorch 2.6.0+ with GPU support
-- Pre-built CUDA extensions (`sparse_engines_cuda`)
-- All system dependencies and Python packages
-- Sample data preloaded
-- Ready-to-use development environment
 
 # Basic Usages
 

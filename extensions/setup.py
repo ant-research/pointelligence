@@ -30,13 +30,9 @@ def get_cuda_arch_list():
 
 # https://en.wikipedia.org/wiki/CUDA
 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-    arch_list = get_cuda_arch_list()
-    if arch_list is not None:
-        arch_list += "+PTX"
-        print(f"TORCH_CUDA_ARCH_LIST={arch_list}")
-        os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
-    else:
-        print("Using default CUDA architecture list for build")
+    arch_list = get_cuda_arch_list() + "+PTX"
+    print(f"TORCH_CUDA_ARCH_LIST={arch_list}")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
 
 # usage: TORCH_CUDA_ARCH_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0+PTX" pip install --no-build-isolation -e .
 
