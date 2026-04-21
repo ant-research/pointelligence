@@ -1,8 +1,8 @@
 [submodule "examples/Pointcept"]
 	path = examples/Pointcept
-	url = https://github.com/Lihhan/Pointcept.git
+	url = git@code.alipay.com:yangyan.lyy/Pointcept.git
 	branch = pointcnnpp-version
 [submodule "examples/FCGF"]
 	path = examples/FCGF
-	url = https://github.com/Lihhan/FCGF.git
+	url = git@code.alipay.com:yangyan.lyy/FCGF.git
 	branch = pointcnnpp-version
