@@ -1,10 +1,46 @@
-<h1 align="center">Pointelligence<br><sub><sup>Accelerating Point Cloud Learning for Spatial Intelligence</sup></sub></h1>
+<div align="center">
 
-Pointelligence is a repository for 3D point cloud research, currently featuring:
+<!-- Logo placeholder - replace with actual logo when available -->
+<img src="assets/logo.svg" alt="Pointelligence Logo" width="120"/>
 
-* the official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227) (CVPR 2026)—a significant next evolution of [PointCNN](https://github.com/yangyanli/PointCNN) (NeurIPS 2018).
+# Pointelligence
 
-# Clone the Repository
+### 🚀 Accelerating Point Cloud Learning for Spatial Intelligence
+
+[![arXiv](https://img.shields.io/badge/arXiv-2511.23227-b31b1b.svg)](https://arxiv.org/abs/2511.23227)
+[![CVPR 2026](https://img.shields.io/badge/CVPR-2026-4b44ce.svg)](https://arxiv.org/abs/2511.23227)
+[![GitHub](https://img.shields.io/badge/GitHub-Code-181717.svg?logo=github)](https://github.com/ant-research/pointelligence)
+<!-- [![PyTorch 2.6+](https://img.shields.io/badge/PyTorch-2.6+-ee4c2c.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE) -->
+
+<p align="center">
+  <a href="#-installation">Installation</a> •
+  <a href="#-basic-usages">Usage</a> •
+  <a href="#-citation">Citation</a> •
+  <a href="#-advanced-topics">Advanced</a>
+</p>
+
+</div>
+
+---
+
+## 📖 About
+
+**Pointelligence** is a high-performance library for 3D point cloud deep learning research. It provides efficient GPU-accelerated primitives and ready-to-use neural network architectures for spatial intelligence tasks.
+
+### ✨ Highlights
+
+| Feature | Description |
+|---------|-------------|
+| 🎯 **PointCNN++** | Official implementation of [PointCNN++](https://arxiv.org/abs/2511.23227) (CVPR 2026) — a significant evolution of [PointCNN](https://github.com/yangyanli/PointCNN) (NeurIPS 2018) |
+| ⚡ **High Performance** | Optimized CUDA kernels for native point convolution with minimal memory overhead |
+| 📦 **Ragged Tensors** | Efficient batching without padding — process only valid data |
+| 🔧 **Modular Design** | Build custom architectures from composable primitives |
+| 🐳 **Docker Ready** | One-command setup with pre-built CUDA extensions |
+
+---
+
+## 📥 Clone the Repository
 
 Clone the repository with third-party submodules (FCGF and Pointcept) recursively:
 
@@ -25,26 +61,53 @@ cd examples/Pointcept && git checkout pointcnnpp-version && cd ../..
 
 If you have already cloned without `--recursive`, run `git submodule update --init --recursive` to fetch the submodules.
 
-# Installation
+## 🛠️ Installation
+
+### Option 1: Local Installation
 
 Some operators are implemented with C++/CUDA as PyTorch extensions, which could be built and installed with the following commands:
 
 ```shell
+conda create -n pointelligence python=3.10 -y
+conda activate pointelligence
+pip install -r requirements.txt
 cd extensions
 pip install --no-build-isolation -e .
 ```
 
-# Basic Usages
+### Option 2: Docker Installation
 
-## Point Cloud Registration Task
+Use Docker for a containerized environment with all dependencies pre-installed:
+
+```shell
+# Build the Docker image
+docker build -t pointelligence .
+
+# Test the containerized environment
+docker run --gpus all -it -v $(pwd):/workspace pointelligence
+
+# Verify installation
+python -m pytest tests/unittest/ -v
+```
+
+The Docker image includes:
+- CUDA 12.4 + cuDNN + PyTorch 2.6.0+ with GPU support
+- Pre-built CUDA extensions (`sparse_engines_cuda`)
+- All system dependencies and Python packages
+- Sample data preloaded
+- Ready-to-use development environment
+
+## 💡 Basic Usages
+
+### Point Cloud Registration Task
 
 in `examples/FCGF`
 
-## Point Cloud Segmentation Task
+### Point Cloud Segmentation Task
 
 in `examples/Pointcept`
 
-# Citation
+## 📚 Citation
 Pointelligence is the repo for the official implementation of:
 * [PointCNN++: Performant Convolution on Native Points](https://arxiv.org/abs/2511.23227)\
     [Lihan Li](https://lihhan.github.io/), Haofeng Zhong, Rui Bu, Mingchao Sun, [Wenzheng Chen](https://wenzhengchen.github.io/), [Baoquan Chen](https://baoquanchen.info/), [Yangyan Li](https://yangyan.li)
@@ -60,17 +123,17 @@ Pointelligence is the repo for the official implementation of:
     }
     ```
   
-# Feature Requests and Issues
+## 🐛 Feature Requests and Issues
 To ensure they are tracked effectively, please submit feature requests and issue reports here rather than via email.
 
 
-# Advanced Topics
+## 🔬 Advanced Topics
 
 While we provide a suite of ready-to-use backbones, our framework is explicitly designed to facilitate the construction of custom network architectures from scratch. We review several key concepts below; combined with the reference implementations in the `models` directory, these resources are intended to help users quickly master the library's workflow.
 
-## Ragged Tensors for Efficient Batching
+### Ragged Tensors for Efficient Batching
 
-### The Inefficiency of Padding
+#### The Inefficiency of Padding
 The total number of points often varies significantly from one sample to another within a single batch. As illustrated below, the **straightforward approach** deals with this irregularity (e.g., samples having 2, 7, and 4 points) by forcing data into fixed-size dense tensors. While this satisfies the rigid structural requirements of standard frameworks, it overlooks the data's inherent sparsity. Smaller samples must be padded out with non-existent "ghost" data, squandering significant memory and compute cycles on empty space.
 
 ```text
@@ -97,7 +160,7 @@ Row 2 (Sample 3):  [P][P][P][P][.][.][.]
 VISUAL RESULT: Significant portions of memory are useless padding.
 ```
 
-### The Ragged Tensor Solution
+#### The Ragged Tensor Solution
 Ragged tensors represent a **dedicated solution** to the inefficiency shown above. As visualized below, this format is explicitly designed to handle irregularity. Instead of maintaining separate, padded rows in a grid, the Ragged tensor stores the entire batch as a single, contiguous sequence containing only valid points. This packed data is managed by a lightweight auxiliary metadata structure that tracks the individual sample sizes. By eliminating padding entirely, this approach ensures processing applies only to actual geometric and feature data.
 
 ```text
@@ -124,21 +187,21 @@ A small separate structure tracks where samples sizes:
 Sample Sizes:  [ 2,  7,  4 ]
 ```
 
-## Downsampling and Upsampling
+### Downsampling and Upsampling
 
-### Downsampling
-We employ a voxel-based strategy using the $grid\_sample\_filter$ routine with $center\_nearest$ reduction mode. Instead of snapping coordinates to the grid, this method selects the point nearest to the voxel center, which preserves thin structures and sparse regions better than random downsampling while maintaining comparable negligible latency. To ensure efficiency, the routine processes batched samples as a single, unified point cloud, leveraging highly optimized GPU sorting and search primitives.
+#### Downsampling
+We employ a voxel-based strategy using the `grid_sample_filter` routine with `center_nearest` reduction mode. Instead of snapping coordinates to the grid, this method selects the point nearest to the voxel center, which preserves thin structures and sparse regions better than random downsampling while maintaining comparable negligible latency. To ensure efficiency, the routine processes batched samples as a single, unified point cloud, leveraging highly optimized GPU sorting and search primitives.
 
-Because the $grid\_sample\_filter$ routine relies on the $grid\_size$ argument, the resolution of the processed point cloud is directly tied to this parameter. Conceptually, $grid\_size$ acts as the fundamental spatial unit, analogous to pixel size in the image domain. With this baseline established, architectural concepts such as $receptive\_field$ and $strides$ can be intuitively defined as relative multiples of $grid\_size$.
+Because the `grid_sample_filter` routine relies on the `grid_size` argument, the resolution of the processed point cloud is directly tied to this parameter. Conceptually, `grid_size` acts as the fundamental spatial unit, analogous to pixel size in the image domain. With this baseline established, architectural concepts such as `receptive_field` and `strides` can be intuitively defined as relative multiples of `grid_size`.
 
-The $grid\_size$ parameter governs the critical trade-off between computational efficiency and model accuracy. A smaller $grid\_size$ enhances spatial resolution—potentially improving accuracy—but incurs greater computation and memory overhead. Conversely, a larger $grid\_size$ reduces resource demands but may sacrifice fine-grained detail. To mitigate issues from irregular data, such as excessive point concentrations in small regions, we recommend applying a preliminary 'sanity' downsample (e.g., at $\frac{1}{3} \times grid\_size$) before feeding the data into a network configured for the target $grid\_size$.
+The `grid_size` parameter governs the critical trade-off between computational efficiency and model accuracy. A smaller `grid_size` enhances spatial resolution—potentially improving accuracy—but incurs greater computation and memory overhead. Conversely, a larger `grid_size` reduces resource demands but may sacrifice fine-grained detail. To mitigate issues from irregular data, such as excessive point concentrations in small regions, we recommend applying a preliminary 'sanity' downsample (e.g., at 1/3 × `grid_size`) before feeding the data into a network configured for the target `grid_size`.
 
-### Upsampling
+#### Upsampling
 Unlike in image processing where target pixel locations are fixed, the spatial locations of upsampled points in a point cloud are not inherently known. Therefore, a recommended practice is to explicitly reuse the retained set of original, pre-downsampled points as the upsampling target. This approach is both efficient and unambiguous. Note that the retention and retrieval of these original points must be managed by the enclosing pipeline or calling procedure.
 
-## Neighborhood Computation and Representation
+### Neighborhood Computation and Representation
 
-We opt for a fixed radius search over a fixed-number (K-Nearest Neighbors, or KNN) search, as its spatially-local receptive field is better suited for spatial learning, whereas KNN is often a choice imposed by architectural limitations. Given sets of "source" and "query" points—which may be identical—and a specified radius, the $radius\_search$ routine computes neighborhood points using highly optimized GPU sorting and search primitives. This routine supports batched point cloud samples by processing the entire batch as a single, unified point cloud, while ensuring that the search remains logically confined to each individual sample.
+We opt for a fixed radius search over a fixed-number (K-Nearest Neighbors, or KNN) search, as its spatially-local receptive field is better suited for spatial learning, whereas KNN is often a choice imposed by architectural limitations. Given sets of "source" and "query" points—which may be identical—and a specified radius, the `radius_search` routine computes neighborhood points using highly optimized GPU sorting and search primitives. This routine supports batched point cloud samples by processing the entire batch as a single, unified point cloud, while ensuring that the search remains logically confined to each individual sample.
 
 As illustrated in the vertical flow diagram below, the connectivity of a batched point cloud is most efficiently represented as a unified list of $(i, j)$ pairs, effectively "flattening" the complex topology of multiple samples into a compact stream of edges. In this scheme, every point in the batch is assigned a unique global index, allowing neighborhoods to be defined simply by the link between a query point $i$ and its neighbor $j$. This approach elegantly stores only the valid edges that actually exist. Crucially, no lines cross the empty gaps between Sample 1, Sample 2, and Sample 3.
 
@@ -162,26 +225,26 @@ Neighbor (j):  0 1  0 1      2  3 4 5  3 4 5  3 4 5  6 7  6 7  8    9  10 11 12 
 +---------------------------------------------------------------------------------+
 ```
 
-## Convolution on Native Points
+### Convolution on Native Points
 
 The full process of convolution on native points involves four steps: output location generation, neighborhood search, convolution triplet construction and the Matrix-Vector Multiplication and Reduction (MVMR). The actual convolution computation occurs in the final MVMR stage, while the preceding three steps serve to structure the input data for this calculation.
 
-### Output Location Generation
+#### Output Location Generation
 This step defines the spatial centers for the convolution operations. Depending on the desired architectural effect, the output locations are generated in one of three ways:
-* Standard Convolution ($stride=1$): The input points serve directly as the output locations.
-* Strided Convolution ($stride > 1$): Output locations are generated by downsampling the input points via $grid\_sample\_filter$ with a target grid size of $grid\_size_{input} \times stride$ (see [Downsampling](#downsampling)). Note that the $grid\_size$ of the output point cloud would be $grid\_size_{input} \times stride$.
+* **Standard Convolution** (`stride=1`): The input points serve directly as the output locations.
+* **Strided Convolution** (`stride > 1`): Output locations are generated by downsampling the input points via `grid_sample_filter` with a target grid size of `grid_size_input × stride` (see [Downsampling](#downsampling)). Note that the `grid_size` of the output point cloud would be `grid_size_input × stride`.
 * Transposed Convolution (Upconvolution): The output locations are explicitly set to the pre-calculated 'upsampled' points, as described in the [Upsampling](#upsampling) section.
 
-### Neighborhood Search
-This step executes the neighbor finding process detailed in [Neighborhood Computation and Representation](#neighborhood-computation-and-representation) by invoking the $radius\_search$ routine. The generated output locations serve as the **query points**, while the input points serve as the **source points**.
+#### Neighborhood Search
+This step executes the neighbor finding process detailed in [Neighborhood Computation and Representation](#neighborhood-computation-and-representation) by invoking the `radius_search` routine. The generated output locations serve as the **query points**, while the input points serve as the **source points**.
 
-The search radius is determined by the formula $radius = radius\_scaler \times grid\_size$. The $radius\_scaler$ defines the geometric relationship between the spherical search region and the cubic receptive field (governed by the $receptive\_field$ hyperparameter). Common configurations for $radius\_scaler$ include:
+The search radius is determined by the formula `radius = radius_scaler × grid_size`. The `radius_scaler` defines the geometric relationship between the spherical search region and the cubic receptive field (governed by the `receptive_field` hyperparameter). Common configurations for `radius_scaler` include:
 
-* **Inscribed Sphere:** $radius\_scaler = \frac{1}{2} \times receptive\_field$. The search ball is the largest sphere that fits inside the ${receptive\_field}^3$ cube.
-* **Equal Volume (Default):** $radius\_scaler = \sqrt[3]{\frac{3}{4 \pi}} \times receptive\_field$. The search ball has the same volume as the ${receptive\_field}^3$ cube.
-* **Circumscribed Sphere:** $radius\_scaler = \frac{\sqrt{3}}{2} \times receptive\_field$. The search ball is the smallest sphere that encloses the ${receptive\_field}^3$ cube.
+* **Inscribed Sphere:** `radius_scaler = 0.5 × receptive_field`. The search ball is the largest sphere that fits inside the `receptive_field³` cube.
+* **Equal Volume (Default):** `radius_scaler = ∛(3/4π) × receptive_field`. The search ball has the same volume as the `receptive_field³` cube.
+* **Circumscribed Sphere:** `radius_scaler = (√3)/2 × receptive_field`. The search ball is the smallest sphere that encloses the `receptive_field³` cube.
 
-### Convolution Triplet Construction
+#### Convolution Triplet Construction
 
 To perform convolution on the irregular structure as depicted by the neighborhood $(i, j)$ pairs, we must explicitly link each neighborhood edge to the model's parameters. As illustrated in the diagram below, this is achieved by extending the neighborhood list into Convolution Triplets $(i, j, k)$. Unlike image convolutions where weight usage is implicit based on a fixed pixel grid, point clouds require a calculated assignment. As illustrated below, for every connection between a query point $i$ and neighbor $j$, a specific kernel weight index $k$ (from a shared bank of weights, e.g., $0 \dots 8$) is determined based on the position of neighbor $j$ within the local coordinate system centered at query point $i$. This "triplet" structure explicitly routes data from the neighbor $j$, through the correct weight $k$, to the target point $i$. Note that the kernel weights are shared across all samples in the batch. This triplet representation provides the basis for an efficient convolution implementation.
 
@@ -208,13 +271,13 @@ Kernel (k):    4 5  5 4      4  4 6 8  2 4 5  1 3 4  4 7  1 4  4    4  2  6  8  
 +---------------------------------------------------------------------------------+
 ```
 
-More specifically, to determine the kernel index $k$, neighborhood points are first transformed into the query point's local coordinate system and normalized to a unit scale. A simple $voxelize\_3d$ routine then uniformly discretizes this unit space into $kernel\_size^3$ voxels; the index $k$ is assigned based on which voxel a neighbor occupies. Although the visualization above sorts triplets by query index $i$ for clarity, the actual implementation typically re-sorts them by kernel index $k$. This optimization reorganizes the data to maximize efficiency during the subsequent Matrix-Vector Multiplication and Reduction (MVMR) stage.
+More specifically, to determine the kernel index $k$, neighborhood points are first transformed into the query point's local coordinate system and normalized to a unit scale. A simple `voxelize_3d` routine then uniformly discretizes this unit space into `kernel_size³` voxels; the index $k$ is assigned based on which voxel a neighbor occupies. Although the visualization above sorts triplets by query index $i$ for clarity, the actual implementation typically re-sorts them by kernel index $k$. This optimization reorganizes the data to maximize efficiency during the subsequent Matrix-Vector Multiplication and Reduction (MVMR) stage.
 
-It is crucial to distinguish between $receptive\_field$ and $kernel\_size$, as these concepts are explicitly decoupled in our framework. While often synonymous in single-layer image convolutions, here they serve distinct roles: $receptive\_field$ defines the **physical spatial extent** of the neighborhood search, whereas $kernel\_size$ determines the **resolution** of the local voxelization (i.e., the granularity of the weight grid applied within that space). This decoupling provides flexible, fine-grained control over the architectural design.
+It is crucial to distinguish between `receptive_field` and `kernel_size`, as these concepts are explicitly decoupled in our framework. While often synonymous in single-layer image convolutions, here they serve distinct roles: `receptive_field` defines the **physical spatial extent** of the neighborhood search, whereas `kernel_size` determines the **resolution** of the local voxelization (i.e., the granularity of the weight grid applied within that space). This decoupling provides flexible, fine-grained control over the architectural design.
 
-### Matrix-Vector Multiplication and Reduction (MVMR)
+#### Matrix-Vector Multiplication and Reduction (MVMR)
 
-As detailed in the research paper of [PointCNN++](https://arxiv.org/abs/2511.23227), the actual heavy lifting of the convolution arithmetic occurs in this final stage. To encapsulate this complexity, we provide a high-level $PointConv3d$ layer. The $forward$ function of this layer accepts the input feature tensor and the generated convolution triplets (typically pre-sorted by the kernel index $k$) to execute the operation. This design ensures that the GPU pipelines remain saturated with dense arithmetic (Matrix-Vector Multiplication) rather than stalling on irregular memory access.
+As detailed in the research paper of [PointCNN++](https://arxiv.org/abs/2511.23227), the actual heavy lifting of the convolution arithmetic occurs in this final stage. To encapsulate this complexity, we provide a high-level `PointConv3d` layer. The `forward` function of this layer accepts the input feature tensor and the generated convolution triplets (typically pre-sorted by the kernel index $k$) to execute the operation. This design ensures that the GPU pipelines remain saturated with dense arithmetic (Matrix-Vector Multiplication) rather than stalling on irregular memory access.
 
 It is worth emphasizing that in this framework, **feature tensors are first-class citizens**. They are the primary carriers of the learned signal and the subject of all gradient backpropagation. The spatial coordinates, having served their purpose in generating the neighbor lists and triplets, are treated simply as "metadata" that guides the data-weight flow, rather than being part of the arithmetic computation itself.
 
