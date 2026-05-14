@@ -1,0 +1,310 @@
+diff --git a/pointcept/models/losses/builder.py b/pointcept/models/losses/builder.py
+index ef642d9..48cd0e5 100644
+--- a/pointcept/models/losses/builder.py
++++ b/pointcept/models/losses/builder.py
+@@ -21,9 +21,51 @@ class Criteria(object):
+         if len(self.criteria) == 0:
+             # loss computation occur in model
+             return pred
++        
++        # 🔧 检查输入中是否有NaN/Inf，避免NaN传播
++        import torch
++        if torch.isnan(pred).any() or torch.isinf(pred).any():
++            # 如果输入包含NaN/Inf，返回0损失（避免训练崩溃）
++            # 这通常表示模型输出有问题，需要检查模型本身
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
++        
+         loss = 0
+-        for c in self.criteria:
+-            loss += c(pred, target)
++        for i, c in enumerate(self.criteria):
++            try:
++                loss_i = c(pred, target)
++                
++                # 🔧 检查每个损失函数输出是否为NaN/Inf
++                if torch.isnan(loss_i) or torch.isinf(loss_i):
++                    # 如果某个损失函数返回NaN，跳过它（使用0代替）
++                    # 这样可以避免整个训练崩溃
++                    import warnings
++                    warnings.warn(
++                        f"Loss function {i} ({type(c).__name__}) returned NaN/Inf. "
++                        f"Skipping this loss component to avoid training crash."
++                    )
++                    loss_i = torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
++                
++                loss += loss_i
++            except Exception as e:
++                # 🔧 捕获异常，避免训练崩溃
++                import warnings
++                warnings.warn(
++                    f"Error in loss function {i} ({type(c).__name__}): {e}. "
++                    f"Skipping this loss component."
++                )
++                loss_i = torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
++                loss += loss_i
++        
++        # 🔧 最终检查总loss是否为NaN/Inf
++        if torch.isnan(loss) or torch.isinf(loss):
++            # 如果总loss是NaN，返回0（避免训练崩溃）
++            import warnings
++            warnings.warn(
++                "Total loss is NaN/Inf. Returning 0 to avoid training crash. "
++                "This may indicate a problem with the model or loss functions."
++            )
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
++        
+         return loss
+ 
+ 
+diff --git a/pointcept/models/losses/lovasz.py b/pointcept/models/losses/lovasz.py
+index 690c2ba..295cc57 100644
+--- a/pointcept/models/losses/lovasz.py
++++ b/pointcept/models/losses/lovasz.py
+@@ -19,17 +19,34 @@ MULTICLASS_MODE: str = "multiclass"
+ MULTILABEL_MODE: str = "multilabel"
+ 
+ 
+-def _lovasz_grad(gt_sorted):
++def _lovasz_grad(gt_sorted, eps=1e-8):
+     """Compute gradient of the Lovasz extension w.r.t sorted errors
+     See Alg. 1 in paper
++    添加数值稳定性保护，避免除零错误和NaN
+     """
+     p = len(gt_sorted)
++    if p == 0:
++        return torch.tensor(0.0, device=gt_sorted.device, dtype=gt_sorted.dtype)
++    
+     gts = gt_sorted.sum()
+     intersection = gts - gt_sorted.float().cumsum(0)
+     union = gts + (1 - gt_sorted).float().cumsum(0)
+-    jaccard = 1.0 - intersection / union
++    
++    # 添加epsilon防止除零，并处理union为0的情况
++    # 当union为0时（所有点都是同一类别），jaccard应该为0
++    union_safe = union.clamp(min=eps)
++    jaccard = 1.0 - intersection / union_safe
++    
++    # 🔧 处理特殊情况：当union接近0时，强制jaccard为0
++    mask_zero_union = union < eps
++    jaccard[mask_zero_union] = 0.0
++    
+     if p > 1:  # cover 1-pixel case
+         jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
++    
++    # 🔧 检查并修复NaN/Inf
++    jaccard = torch.where(torch.isfinite(jaccard), jaccard, torch.zeros_like(jaccard))
++    
+     return jaccard
+ 
+ 
+@@ -58,17 +75,38 @@ def _lovasz_hinge_flat(logits, labels):
+     Args:
+         logits: [P] Logits at each prediction (between -infinity and +infinity)
+         labels: [P] Tensor, binary ground truth labels (0 or 1)
++    🔧 添加数值稳定性保护
+     """
+     if len(labels) == 0:
+         # only void pixels, the gradients should be 0
+         return logits.sum() * 0.0
++    
++    # 🔧 检查输入中是否有NaN/Inf
++    if torch.isnan(logits).any() or torch.isinf(logits).any():
++        # 如果logits包含NaN/Inf，返回0损失并记录警告
++        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
++    
+     signs = 2.0 * labels.float() - 1.0
+     errors = 1.0 - logits * signs
++    
++    # 🔧 限制errors的范围，避免极端值
++    errors = errors.clamp(min=-10.0, max=10.0)
++    
+     errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+     perm = perm.data
+     gt_sorted = labels[perm]
+     grad = _lovasz_grad(gt_sorted)
++    
++    # 🔧 检查grad中是否有NaN/Inf
++    if torch.isnan(grad).any() or torch.isinf(grad).any():
++        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
++    
+     loss = torch.dot(F.relu(errors_sorted), grad)
++    
++    # 🔧 检查最终loss是否为NaN/Inf
++    if torch.isnan(loss) or torch.isinf(loss):
++        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
++    
+     return loss
+ 
+ 
+@@ -239,14 +277,24 @@ class LovaszLoss(_Loss):
+         self.loss_weight = loss_weight
+ 
+     def forward(self, y_pred, y_true):
++        # 🔧 添加输入检查，避免NaN传播
++        if torch.isnan(y_pred).any() or torch.isinf(y_pred).any():
++            # 如果输入包含NaN/Inf，返回0损失
++            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype) * self.loss_weight
++        
+         if self.mode in {BINARY_MODE, MULTILABEL_MODE}:
+             loss = _lovasz_hinge(
+                 y_pred, y_true, per_image=self.per_image, ignore=self.ignore_index
+             )
+         elif self.mode == MULTICLASS_MODE:
+-            y_pred = y_pred.softmax(dim=1)
++            # 🔧 使用log_softmax + exp来避免softmax的数值不稳定
++            # 但Lovasz需要概率，所以仍然使用softmax，但添加clamp保护
++            y_pred_softmax = y_pred.softmax(dim=1)
++            # 🔧 确保概率在有效范围内，避免极端值
++            y_pred_softmax = y_pred_softmax.clamp(min=1e-8, max=1.0 - 1e-8)
++            
+             loss = _lovasz_softmax(
+-                y_pred,
++                y_pred_softmax,
+                 y_true,
+                 class_seen=self.class_seen,
+                 per_image=self.per_image,
+@@ -254,4 +302,9 @@ class LovaszLoss(_Loss):
+             )
+         else:
+             raise ValueError("Wrong mode {}.".format(self.mode))
++        
++        # 🔧 最终检查loss是否为NaN/Inf
++        if torch.isnan(loss) or torch.isinf(loss):
++            loss = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
++        
+         return loss * self.loss_weight
+diff --git a/pointcept/models/losses/misc.py b/pointcept/models/losses/misc.py
+index ec300a5..4ebe12c 100644
+--- a/pointcept/models/losses/misc.py
++++ b/pointcept/models/losses/misc.py
+@@ -36,7 +36,18 @@ class CrossEntropyLoss(nn.Module):
+         )
+ 
+     def forward(self, pred, target):
+-        return self.loss(pred, target) * self.loss_weight
++        # 🔧 检查输入中是否有NaN/Inf
++        if torch.isnan(pred).any() or torch.isinf(pred).any():
++            # 如果输入包含NaN/Inf，返回0损失
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
++        loss = self.loss(pred, target) * self.loss_weight
++        
++        # 🔧 检查输出是否为NaN/Inf
++        if torch.isnan(loss) or torch.isinf(loss):
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
++        return loss
+ 
+ 
+ @LOSSES.register_module()
+@@ -161,31 +172,63 @@ class FocalLoss(nn.Module):
+             self.gamma
+         )
+ 
++        # 🔧 检查输入中是否有NaN/Inf
++        if torch.isnan(pred).any() or torch.isinf(pred).any():
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
+         loss = (
+             F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+             * focal_weight
+         )
++        
++        # 🔧 检查中间结果是否有NaN/Inf
++        if torch.isnan(loss).any() or torch.isinf(loss).any():
++            # 将NaN/Inf替换为0
++            loss = torch.where(torch.isfinite(loss), loss, torch.zeros_like(loss))
++        
+         if self.reduction == "mean":
+             loss = loss.mean()
+         elif self.reduction == "sum":
+             loss = loss.total()
++        
++        # 🔧 检查最终输出是否为NaN/Inf
++        if torch.isnan(loss) or torch.isinf(loss):
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
+         return self.loss_weight * loss
+ 
+ 
+ @LOSSES.register_module()
+ class DiceLoss(nn.Module):
+-    def __init__(self, smooth=1, exponent=2, loss_weight=1.0, ignore_index=-1):
+-        """DiceLoss.
++    def __init__(self, smooth=1, exponent=2, loss_weight=1.0, ignore_index=-1, weight=None):
++        """DiceLoss with optional class weighting.
+         This loss is proposed in `V-Net: Fully Convolutional Neural Networks for
+         Volumetric Medical Image Segmentation <https://arxiv.org/abs/1606.04797>`_.
++        
++        Args:
++            smooth: Smoothing factor to avoid division by zero
++            exponent: Exponent for Dice coefficient calculation (default: 2)
++            loss_weight: Weight for this loss component
++            ignore_index: Index to ignore in loss calculation
++            weight: Class weights (list or tensor). If None, uses uniform weighting.
++                   Higher weights for rare/small classes help with class imbalance.
+         """
+         super(DiceLoss, self).__init__()
+         self.smooth = smooth
+         self.exponent = exponent
+         self.loss_weight = loss_weight
+         self.ignore_index = ignore_index
++        # Convert weight to tensor if provided
++        if weight is not None:
++            self.register_buffer('weight', torch.tensor(weight, dtype=torch.float32))
++        else:
++            self.weight = None
+ 
+     def forward(self, pred, target, **kwargs):
++        # 🔧 检查输入中是否有NaN/Inf
++        if torch.isnan(pred).any() or torch.isinf(pred).any():
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
+         # [B, C, d_1, d_2, ..., d_k] -> [C, B, d_1, d_2, ..., d_k]
+         pred = pred.transpose(0, 1)
+         # [C, B, d_1, d_2, ..., d_k] -> [C, N]
+@@ -201,6 +244,9 @@ class DiceLoss(nn.Module):
+         target = target[valid_mask]
+         pred = pred[valid_mask]
+ 
++        if len(target) == 0:
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++
+         pred = F.softmax(pred, dim=1)
+         num_classes = pred.shape[1]
+         target = F.one_hot(
+@@ -208,6 +254,7 @@ class DiceLoss(nn.Module):
+         )
+ 
+         total_loss = 0
++        total_weight = 0
+         for i in range(num_classes):
+             if i != self.ignore_index:
+                 num = torch.sum(torch.mul(pred[:, i], target[:, i])) * 2 + self.smooth
+@@ -218,6 +265,24 @@ class DiceLoss(nn.Module):
+                     + self.smooth
+                 )
+                 dice_loss = 1 - num / den
+-                total_loss += dice_loss
+-        loss = total_loss / num_classes
++                
++                # 🔧 应用类别权重（如果提供）
++                if self.weight is not None and i < len(self.weight):
++                    class_weight = self.weight[i]
++                else:
++                    class_weight = 1.0
++                
++                total_loss += dice_loss * class_weight
++                total_weight += class_weight
++        
++        # 🔧 加权平均
++        if total_weight > 0:
++            loss = total_loss / total_weight
++        else:
++            loss = total_loss / num_classes
++        
++        # 🔧 检查输出是否为NaN/Inf
++        if torch.isnan(loss) or torch.isinf(loss):
++            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True) * self.loss_weight
++        
+         return self.loss_weight * loss

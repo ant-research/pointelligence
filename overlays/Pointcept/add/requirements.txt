@@ -1,0 +1,33 @@
+# PyTorch Geometric and related packages
+# torch-cluster
+# torch-scatter
+# torch-sparse
+# torch-geometric
+
+# Core dependencies
+h5py
+pyyaml
+tensorboard
+tensorboardx
+wandb
+yapf
+addict
+einops
+scipy
+plyfile
+termcolor
+timm
+ftfy
+regex
+tqdm
+matplotlib
+black
+open3d
+pyquaternion
+nuscenes-devkit
+
+# Git dependencies
+# git+https://github.com/octree-nn/ocnn-pytorch.git
+# git+https://github.com/openai/CLIP.git
+# git+https://github.com/Dao-AILab/flash-attention.git
+

@@ -1,0 +1,236 @@
+diff --git a/pointcept/datasets/__init__.py b/pointcept/datasets/__init__.py
+index 6b2aaaf..84d2a2b 100644
+--- a/pointcept/datasets/__init__.py
++++ b/pointcept/datasets/__init__.py
+@@ -17,8 +17,15 @@ from .nuscenes import NuScenesDataset
+ from .waymo import WaymoDataset
+ 
+ # object
+-from .modelnet import ModelNetDataset
+-from .shapenet_part import ShapeNetPartDataset
++try:
++    from .modelnet import ModelNetDataset
++except (ImportError, ModuleNotFoundError):
++    ModelNetDataset = None
++
++try:
++    from .shapenet_part import ShapeNetPartDataset
++except (ImportError, ModuleNotFoundError):
++    ShapeNetPartDataset = None
+ 
+ # dataloader
+ from .dataloader import MultiDatasetDataloader
+diff --git a/pointcept/datasets/defaults.py b/pointcept/datasets/defaults.py
+index 0a3b4ca..4ed0bf3 100644
+--- a/pointcept/datasets/defaults.py
++++ b/pointcept/datasets/defaults.py
+@@ -44,8 +44,17 @@ class DefaultDataset(Dataset):
+         cache=False,
+         ignore_index=-1,
+         loop=1,
++        **kwargs  # 允许额外的参数，用于兼容采样器配置等
+     ):
+         super(DefaultDataset, self).__init__()
++        # 忽略采样器相关参数（这些参数不应该影响数据集）
++        kwargs.pop('use_class_balanced_sampler', None)
++        kwargs.pop('sampler_config', None)
++        if kwargs:
++            # 如果有其他未知参数，记录警告但不报错
++            logger = get_root_logger()
++            logger.warning(f"DefaultDataset received unknown kwargs: {list(kwargs.keys())}, ignoring them.")
++        
+         self.data_root = data_root
+         self.split = split
+         self.transform = Compose(transform)
+@@ -53,7 +62,7 @@ class DefaultDataset(Dataset):
+         self.ignore_index = ignore_index
+         self.loop = (
+             loop if not test_mode else 1
+-        )  # force make loop = 1 while in test mode
++        )  # force make loop = 1 while in test_mode
+         self.test_mode = test_mode
+         self.test_cfg = test_cfg if test_mode else None
+ 
+@@ -146,7 +155,9 @@ class DefaultDataset(Dataset):
+     def prepare_train_data(self, idx):
+         # load data
+         data_dict = self.get_data(idx)
++        # print(f"data_dict: {data_dict.keys()}")
+         data_dict = self.transform(data_dict)
++        # print("data_dict after transform: ", data_dict.keys())
+         return data_dict
+ 
+     def prepare_test_data(self, idx):
+diff --git a/pointcept/datasets/nuscenes.py b/pointcept/datasets/nuscenes.py
+index d3ab8f0..5759feb 100644
+--- a/pointcept/datasets/nuscenes.py
++++ b/pointcept/datasets/nuscenes.py
+@@ -55,7 +55,31 @@ class NuScenesDataset(DefaultDataset):
+ 
+     def get_data(self, idx):
+         data = self.data_list[idx % len(self.data_list)]
+-        lidar_path = os.path.join(self.data_root, "raw", data["lidar_path"])
++        # robustly resolve lidar file path under various processed layouts
++        rel = data["lidar_path"]
++        candidates = []
++        # common bases
++        bases = [
++            os.path.join(self.data_root, "raw"),
++            self.data_root,
++            os.path.join(self.data_root, "samples"),
++        ]
++        # possible extensions or name tweaks
++        rel_variants = {rel}
++        if rel.endswith(".pcd.bin"):
++            rel_variants.add(rel.replace(".pcd.bin", ".bin"))
++            rel_variants.add(rel.replace(".pcd.bin", ".npy"))
++        for base in bases:
++            for rv in rel_variants:
++                candidates.append(os.path.join(base, rv))
++        lidar_path = None
++        for p in candidates:
++            if os.path.isfile(p):
++                lidar_path = p
++                break
++        if lidar_path is None:
++            raise FileNotFoundError(f"Cannot locate lidar file. Tried: {candidates}")
++
+         points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape(
+             [-1, 5]
+         )
+diff --git a/pointcept/datasets/transform.py b/pointcept/datasets/transform.py
+index 018723b..326eec0 100644
+--- a/pointcept/datasets/transform.py
++++ b/pointcept/datasets/transform.py
+@@ -842,6 +842,7 @@ class GridSample(object):
+                 mask = np.zeros_like(data_dict["segment"]).astype(bool)
+                 mask[data_dict["sampled_index"]] = True
+                 data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
++            
+             data_dict = index_operator(data_dict, idx_unique)
+             if self.return_inverse:
+                 data_dict["inverse"] = np.zeros_like(inverse)
+@@ -893,6 +894,23 @@ class GridSample(object):
+         else:
+             raise NotImplementedError
+ 
++    @staticmethod
++    def fnv_hash_vec(arr):
++        """
++        FNV64-1A
++        """
++        assert arr.ndim == 2
++        # Floor first for negative coordinates
++        arr = arr.copy()
++        arr = arr.astype(np.uint64, copy=False)
++        hashed_arr = np.uint64(14695981039346656037) * np.ones(
++            arr.shape[0], dtype=np.uint64
++        )
++        for j in range(arr.shape[1]):
++            hashed_arr *= np.uint64(1099511628211)
++            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
++        return hashed_arr
++
+     @staticmethod
+     def ravel_hash_vec(arr):
+         """
+@@ -912,22 +930,85 @@ class GridSample(object):
+         keys += arr[:, -1]
+         return keys
+ 
+-    @staticmethod
+-    def fnv_hash_vec(arr):
++
++@TRANSFORMS.register_module()
++class PointCloudDownsample(object):
++    """
++    Point Cloud Downsampling using PointCloudDownsample (optimized version).
++    
++    This transform uses the optimized PointCloudDownsample which:
++    1. Selects the point closest to voxel center (centered=True) instead of random selection
++    2. Preserves original point coordinates (not voxel center coordinates)
++    3. Better geometric structure preservation
++    
++    Args:
++        grid_size (float): Grid resolution for downsampling. Defaults to 0.1.
++        centered (bool): If True, selects the point closest to the voxel center.
++            If False, randomly selects a point from the voxel. Defaults to True.
++    """
++    
++    def __init__(self, grid_size=0.1, centered=True):
++        self.grid_size = grid_size
++        self.centered = centered
++        # Lazy import to avoid circular dependencies
++        try:
++            from pointcept.models.pointcloud_operator.point_sampler.point_downsample import PointCloudDownsample as PCDownsample
++            self._downsampler_class = PCDownsample
++        except ImportError:
++            raise ImportError("PointCloudDownsample is not available. Please check pointcloud_operator installation.")
++    
++    def __call__(self, data_dict):
+         """
+-        FNV64-1A
++        Downsample point cloud using PointCloudDownsample.
++        
++        Args:
++            data_dict: Dictionary containing point cloud data with keys:
++                - coord: [N, 3] numpy array, point coordinates
++                - Other keys in index_valid_keys will be indexed accordingly
+         """
+-        assert arr.ndim == 2
+-        # Floor first for negative coordinates
+-        arr = arr.copy()
+-        arr = arr.astype(np.uint64, copy=False)
+-        hashed_arr = np.uint64(14695981039346656037) * np.ones(
+-            arr.shape[0], dtype=np.uint64
+-        )
+-        for j in range(arr.shape[1]):
+-            hashed_arr *= np.uint64(1099511628211)
+-            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+-        return hashed_arr
++        assert "coord" in data_dict.keys()
++        
++        # Get index_valid_keys (similar to GridSample)
++        if "index_valid_keys" not in data_dict:
++            index_valid_keys = [
++                "coord",
++                "color",
++                "normal",
++                "strength",
++                "segment",
++                "instance",
++                "origin_coord",
++            ]
++        else:
++            index_valid_keys = data_dict["index_valid_keys"]
++        
++        # Convert numpy to torch (always use CPU for transform stage)
++        coord = data_dict["coord"]
++        if isinstance(coord, np.ndarray):
++            coord_torch = torch.from_numpy(coord.copy()).float()
++        elif isinstance(coord, torch.Tensor):
++            coord_torch = coord.clone().detach().float().cpu()
++        else:
++            coord_torch = torch.tensor(coord, dtype=torch.float32)
++        
++        # Create batch list (single batch, all points in one batch)
++        # In ContrastiveViewsGenerator, each view is processed separately
++        batch_list = torch.tensor([coord_torch.shape[0]], dtype=torch.long)
++        
++        # Initialize downsampler (create new instance each time to avoid state issues)
++        downsampler = self._downsampler_class(verbose=False, centered=self.centered)
++        
++        # Perform downsampling on CPU (transform happens before ToTensor)
++        with torch.no_grad():
++            point_indices, new_batch_list = downsampler(coord_torch, batch_list, self.grid_size)
++        
++        # Convert indices to numpy for consistency with existing code
++        point_indices_np = point_indices.cpu().numpy()
++        
++        # Apply indexing to all valid keys using index_operator for consistency
++        data_dict = index_operator(data_dict, point_indices_np)
++        
++        return data_dict
+ 
+ 
+ @TRANSFORMS.register_module()

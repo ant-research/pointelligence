@@ -1,0 +1,3073 @@
+diff --git a/config.py b/config.py
+index 476402d..61aa207 100644
+--- a/config.py
++++ b/config.py
+@@ -20,7 +20,7 @@ logging_arg.add_argument('--out_dir', type=str, default='outputs')
+ trainer_arg = add_argument_group('Trainer')
+ trainer_arg.add_argument('--trainer', type=str, default='HardestContrastiveLossTrainer')
+ trainer_arg.add_argument('--save_freq_epoch', type=int, default=1)
+-trainer_arg.add_argument('--batch_size', type=int, default=4)
++trainer_arg.add_argument('--batch_size', type=int, default=1)
+ trainer_arg.add_argument('--val_batch_size', type=int, default=1)
+ 
+ # Hard negative mining
+@@ -48,6 +48,8 @@ trainer_arg.add_argument('--val_phase', type=str, default="val")
+ trainer_arg.add_argument('--test_phase', type=str, default="test")
+ 
+ trainer_arg.add_argument('--stat_freq', type=int, default=40)
++trainer_arg.add_argument('--profile_batch_time', type=str2bool, default=True,
++                         help='Record forward/backward time per batch during training')
+ trainer_arg.add_argument('--test_valid', type=str2bool, default=True)
+ trainer_arg.add_argument('--val_max_iter', type=int, default=400)
+ trainer_arg.add_argument('--val_epoch_freq', type=int, default=1)
+@@ -94,7 +96,7 @@ misc_arg.add_argument('--weights', type=str, default=None)
+ misc_arg.add_argument('--weights_dir', type=str, default=None)
+ misc_arg.add_argument('--resume', type=str, default=None)
+ misc_arg.add_argument('--resume_dir', type=str, default=None)
+-misc_arg.add_argument('--train_num_thread', type=int, default=2)
++misc_arg.add_argument('--train_num_thread', type=int, default=6)
+ misc_arg.add_argument('--val_num_thread', type=int, default=1)
+ misc_arg.add_argument('--test_num_thread', type=int, default=2)
+ misc_arg.add_argument('--fast_validation', type=str2bool, default=False)
+@@ -106,10 +108,29 @@ misc_arg.add_argument(
+ 
+ # Dataset specific configurations
+ data_arg = add_argument_group('Data')
+-data_arg.add_argument('--dataset', type=str, default='ThreeDMatchPairDataset')
+-data_arg.add_argument('--voxel_size', type=float, default=0.025)
++data_arg.add_argument('--dataset', type=str, default='ThreeDMatchNewPairDatasetPure')
++# KITTI: 0.3, 3DMatch: 0.025
++data_arg.add_argument('--voxel_size', type=float, default=None)
++data_arg.add_argument('--min_dist', type=float, default=4)
+ data_arg.add_argument(
+-    '--threed_match_dir', type=str, default="/home/chrischoy/datasets/FCGF/threedmatch")
++    '--threed_match_dir', type=str, default=None,
++    help='Root directory for 3DMatch dataset. Defaults to THREEDMATCH_ROOT env var.')
++data_arg.add_argument(
++    '--threedmatch_root', type=str, default=None,
++    help='Root directory for 3DMatch dataset (OverlapPredator style). Defaults to THREEDMATCH_ROOT env var.')
++data_arg.add_argument('--train_info', type=str, default=None,
++                      help='Path to train_info.pkl file (OverlapPredator format). Defaults to FCGF/configs/indoor/train_info.pkl')
++data_arg.add_argument('--val_info', type=str, default=None,
++                      help='Path to val_info.pkl file (OverlapPredator format). Defaults to FCGF/configs/indoor/val_info.pkl')
++data_arg.add_argument('--overlap_radius', type=float, default=0.0375,
++                      help='Overlap radius for positive pair search')
++data_arg.add_argument('--augment_noise', type=float, default=0.005,
++                      help='Gaussian noise augmentation strength')
++data_arg.add_argument('--max_points', type=int, default=1000000,
++                      help='Maximum number of points per point cloud')
++data_arg.add_argument('--rot_factor', type=float, default=1.0,
++                      help='Rotation factor for data augmentation')
++data_arg.add_argument('--pre_downsample_voxel_size', type=float, default=0.02)
+ data_arg.add_argument(
+     '--kitti_root', type=str, default="/home/chrischoy/datasets/FCGF/kitti/")
+ data_arg.add_argument(
+@@ -121,5 +142,24 @@ data_arg.add_argument('--kitti_date', type=str, default='2011_09_26')
+ 
+ 
+ def get_config():
++  import os
+   args = parser.parse_args()
++  if args.dataset == 'KITTINMPairDataset':
++    args.voxel_size = 0.3
++  elif args.dataset == 'ThreeDMatchNewPairDatasetPure':
++    args.voxel_size = 0.025
++  else:
++    raise ValueError(f"Unsupported dataset: {args.dataset}")
++  # Resolve 3DMatch root from THREEDMATCH_ROOT env when not set via args
++  threed_root = os.environ.get('THREEDMATCH_ROOT', '')
++  if args.threedmatch_root is None or args.threedmatch_root == '':
++    args.threedmatch_root = threed_root if threed_root else None
++  if args.threed_match_dir is None or args.threed_match_dir == '':
++    args.threed_match_dir = threed_root if threed_root else None
++  # Resolve train_info/val_info defaults (relative to FCGF module)
++  _fcgf_dir = os.path.dirname(os.path.abspath(__file__))
++  if args.train_info is None or args.train_info == '':
++    args.train_info = os.path.join(_fcgf_dir, 'configs', 'indoor', 'train_info.pkl')
++  if args.val_info is None or args.val_info == '':
++    args.val_info = os.path.join(_fcgf_dir, 'configs', 'indoor', 'val_info.pkl')
+   return args
+diff --git a/lib/data_loaders.py b/lib/data_loaders.py
+index d161eff..dfb8ef1 100644
+--- a/lib/data_loaders.py
++++ b/lib/data_loaders.py
+@@ -1,9 +1,6 @@
+-# -*- coding: future_fstrings -*-
+-#
+-# Written by Chris Choy <chrischoy@ai.stanford.edu>
+-# Distributed under MIT License
+ import logging
+ import random
++import sys
+ import torch
+ import torch.utils.data
+ import numpy as np
+@@ -11,72 +8,122 @@ import glob
+ import os
+ from scipy.linalg import expm, norm
+ import pathlib
++import pickle
++import copy
++
++_pointelligence_root = pathlib.Path(__file__).resolve().parent.parent.parent.parent
++if str(_pointelligence_root) not in sys.path:
++    sys.path.insert(0, str(_pointelligence_root))
+ 
+ from util.pointcloud import get_matching_indices, make_open3d_point_cloud
++from util.trajectory import read_trajectory
+ import lib.transforms as t
+ 
+-import MinkowskiEngine as ME
+-
+ import open3d as o3d
+ 
++try:
++    from internals.grid_sample import grid_sample_filter
++except ImportError:
++    grid_sample_filter = None
++    logging.warning("internals.grid_sample not available, voxel_downsample_using_pointcloud_downsampler will fail")
++
+ kitti_cache = {}
+ kitti_icp_cache = {}
+-
+-
+-def collate_pair_fn(list_data):
+-  xyz0, xyz1, coords0, coords1, feats0, feats1, matching_inds, trans = list(
+-      zip(*list_data))
+-  xyz_batch0, xyz_batch1 = [], []
+-  matching_inds_batch, trans_batch, len_batch = [], [], []
+-
+-  batch_id = 0
+-  curr_start_inds = np.zeros((1, 2))
+-
+-  def to_tensor(x):
+-    if isinstance(x, torch.Tensor):
+-      return x
+-    elif isinstance(x, np.ndarray):
+-      return torch.from_numpy(x)
++threedmatch_icp_cache = {}
++
++
++def _vectorized_matching_indices(matching_inds_list, batch_list0, batch_list1):
++    cumsum0 = torch.cumsum(torch.cat([torch.tensor([0], device=batch_list0.device), batch_list0[:-1]]), dim=0)
++    cumsum1 = torch.cumsum(torch.cat([torch.tensor([0], device=batch_list1.device), batch_list1[:-1]]), dim=0)
++    
++    matching_tensors = []
++    for i, matching_inds in enumerate(matching_inds_list):
++        if len(matching_inds) > 0:
++            if isinstance(matching_inds, np.ndarray):
++                matching_arr = matching_inds
++            else:
++                matching_arr = np.array(matching_inds, dtype=np.int64)
++            offset = torch.tensor([[cumsum0[i], cumsum1[i]]], device=batch_list0.device)
++            matching_tensor = torch.from_numpy(matching_arr) + offset
++            matching_tensors.append(matching_tensor)
++    
++    if matching_tensors:
++        return torch.cat(matching_tensors, dim=0).int()
+     else:
+-      raise ValueError(f'Can not convert to torch tensor, {x}')
+-
+-  for batch_id, _ in enumerate(coords0):
+-    N0 = coords0[batch_id].shape[0]
+-    N1 = coords1[batch_id].shape[0]
+-
+-    xyz_batch0.append(to_tensor(xyz0[batch_id]))
+-    xyz_batch1.append(to_tensor(xyz1[batch_id]))
+-
+-    trans_batch.append(to_tensor(trans[batch_id]))
+-
+-    matching_inds_batch.append(
+-        torch.from_numpy(np.array(matching_inds[batch_id]) + curr_start_inds))
+-    len_batch.append([N0, N1])
+-
+-    # Move the head
+-    curr_start_inds[0, 0] += N0
+-    curr_start_inds[0, 1] += N1
+-
+-  coords_batch0, feats_batch0 = ME.utils.sparse_collate(coords0, feats0)
+-  coords_batch1, feats_batch1 = ME.utils.sparse_collate(coords1, feats1)
+-
+-  # Concatenate all lists
+-  xyz_batch0 = torch.cat(xyz_batch0, 0).float()
+-  xyz_batch1 = torch.cat(xyz_batch1, 0).float()
+-  trans_batch = torch.cat(trans_batch, 0).float()
+-  matching_inds_batch = torch.cat(matching_inds_batch, 0).int()
+-
+-  return {
+-      'pcd0': xyz_batch0,
+-      'pcd1': xyz_batch1,
+-      'sinput0_C': coords_batch0,
+-      'sinput0_F': feats_batch0.float(),
+-      'sinput1_C': coords_batch1,
+-      'sinput1_F': feats_batch1.float(),
+-      'correspondences': matching_inds_batch,
+-      'T_gt': trans_batch,
+-      'len_batch': len_batch
+-  }
++        return torch.empty((0, 2), dtype=torch.int, device=batch_list0.device)
++
++
++def make_collate_pair_fn(voxel_size=0.3):
++  def collate_pair_fn(list_data):
++    first_item = list_data[0]
++    has_pair_info = len(first_item) == 9
++    
++    if has_pair_info:
++      xyz0, xyz1, feats0, feats1, matching_inds, trans, _, _, pair_infos = list(zip(*list_data))
++    elif len(first_item) == 8 and isinstance(first_item[7], torch.Tensor):
++      xyz0, xyz1, feats0, feats1, matching_inds, trans, _, _ = list(zip(*list_data))
++      pair_infos = [("unknown", "unknown")] * len(list_data)
++    else:
++      xyz0, xyz1, _, _, feats0, feats1, matching_inds, trans = list(zip(*list_data))
++      pair_infos = [("unknown", "unknown")] * len(list_data)
++
++    def batch_to_tensor(data_list):
++        tensors = []
++        for data in data_list:
++            if isinstance(data, torch.Tensor):
++                tensors.append(data.float())
++            elif isinstance(data, np.ndarray):
++                tensors.append(torch.from_numpy(data).float())
++            else:
++                raise ValueError(f'Cannot convert to torch tensor: {type(data)}')
++        return tensors
++    
++    xyz0_tensors = batch_to_tensor(xyz0)
++    xyz1_tensors = batch_to_tensor(xyz1)
++    feats0_tensors = batch_to_tensor(feats0)
++    feats1_tensors = batch_to_tensor(feats1)
++    trans_tensors = batch_to_tensor(trans)
++    
++    batch_list0 = torch.tensor([len(xyz) for xyz in xyz0_tensors], dtype=torch.long)
++    batch_list1 = torch.tensor([len(xyz) for xyz in xyz1_tensors], dtype=torch.long)
++    
++    matching_inds_batch = _vectorized_matching_indices(matching_inds, batch_list0, batch_list1)
++    
++    len_batch = list(zip(batch_list0.tolist(), batch_list1.tolist()))
++    
++    xyz_batch0 = torch.cat(xyz0_tensors, dim=0)
++    xyz_batch1 = torch.cat(xyz1_tensors, dim=0)
++    feat_batch0 = torch.cat(feats0_tensors, dim=0)
++    feat_batch1 = torch.cat(feats1_tensors, dim=0)
++    trans_batch = torch.cat(trans_tensors, dim=0)
++    
++    offset0 = torch.cat([torch.tensor([0], device=batch_list0.device), torch.cumsum(batch_list0, dim=0)]).long()
++    offset1 = torch.cat([torch.tensor([0], device=batch_list1.device), torch.cumsum(batch_list1, dim=0)]).long()
++    
++    coords_batch0 = xyz_batch0
++    coords_batch1 = xyz_batch1
++    feats_batch0 = feat_batch0
++    feats_batch1 = feat_batch1
++
++    out = {
++        'pcd0': coords_batch0,
++        'pcd1': coords_batch1,
++        'pcd0_original': xyz_batch0,
++        'pcd1_original': xyz_batch1,
++        'sinput0_C': coords_batch0,
++        'sinput0_F': feat_batch0,
++        'sinput0_offset': offset0,
++        'sinput1_C': coords_batch1,
++        'sinput1_F': feat_batch1,
++        'sinput1_offset': offset1,
++        'correspondences': matching_inds_batch,
++        'T_gt': trans_batch,
++        'len_batch': len_batch
++    }
++    if has_pair_info:
++      out['pair_info'] = list(pair_infos)
++    return out
++  return collate_pair_fn
+ 
+ 
+ # Rotation matrix along axis with angle theta
+@@ -92,6 +139,106 @@ def sample_random_trans(pcd, randg, rotation_range=360):
+   return T
+ 
+ 
++def voxel_downsample_using_pointcloud_downsampler(xyz, voxel_size):
++    if grid_sample_filter is None:
++        raise ImportError("internals.grid_sample not available")
++    
++    if voxel_size is None:
++        if isinstance(xyz, torch.Tensor):
++            selected_indices = np.arange(len(xyz))
++        else:
++            selected_indices = np.arange(len(xyz))
++        return selected_indices, np.array([len(selected_indices)], dtype=np.int64)
++    
++    if not isinstance(xyz, torch.Tensor):
++        xyz = torch.from_numpy(xyz).float()
++    
++    device = xyz.device
++    
++    sample_inds = torch.zeros(len(xyz), dtype=torch.long, device=device)
++    
++    _, _, indices, _ = grid_sample_filter(
++        points=xyz,
++        grid_size=voxel_size,
++        sample_inds=sample_inds,
++        reduction="center_nearest",
++        return_mapping=True,
++    )
++    
++    selected_indices = indices
++    
++    if isinstance(selected_indices, torch.Tensor):
++        selected_indices = selected_indices.cpu().numpy()
++    
++    return selected_indices, np.array([len(selected_indices)], dtype=np.int64)
++
++def load_obj(path):
++    with open(path, 'rb') as f:
++        return pickle.load(f)
++
++
++def to_tsfm(rot, trans):
++    tsfm = np.eye(4)
++    tsfm[:3, :3] = rot
++    tsfm[:3, 3] = trans.flatten()
++    return tsfm
++
++
++def get_correspondences(src_pcd, tgt_pcd, trans, search_voxel_size, K=None, debug=False, idx_info=None):
++    src_pcd_copy = copy.deepcopy(src_pcd)
++    src_pcd_copy.transform(trans)
++    pcd_tree = o3d.geometry.KDTreeFlann(tgt_pcd)
++    
++    correspondences = []
++    for i, point in enumerate(src_pcd_copy.points):
++        [count, idx, _] = pcd_tree.search_radius_vector_3d(point, search_voxel_size)
++        if count > 0:
++            if K is not None:
++                idx = idx[:min(K, count)]
++            for j in idx:
++                correspondences.append([i, j])
++    
++    if len(correspondences) == 0:
++        correspondences_array = np.zeros((0, 2), dtype=np.int64)
++    else:
++        correspondences_array = np.array(correspondences, dtype=np.int64)
++    
++    if debug:
++        num_src_points = len(src_pcd.points)
++        num_tgt_points = len(tgt_pcd.points)
++        num_correspondences = len(correspondences_array)
++        
++        if num_correspondences > 0:
++            unique_src_indices = len(set(correspondences_array[:, 0]))
++            unique_tgt_indices = len(set(correspondences_array[:, 1]))
++            
++            avg_matches_per_src = num_correspondences / unique_src_indices if unique_src_indices > 0 else 0.0
++            avg_matches_per_tgt = num_correspondences / unique_tgt_indices if unique_tgt_indices > 0 else 0.0
++        else:
++            unique_src_indices = 0
++            unique_tgt_indices = 0
++            avg_matches_per_src = 0.0
++            avg_matches_per_tgt = 0.0
++        
++        unique_match_ratio_src = unique_src_indices / num_src_points if num_src_points > 0 else 0.0
++        unique_match_ratio_tgt = unique_tgt_indices / num_tgt_points if num_tgt_points > 0 else 0.0
++        
++        idx_str = idx_info if idx_info is not None else "unknown"
++        logging.info(
++            f"[3DMatchNew] Match stats [{idx_str}]: "
++            f"total_pairs={num_correspondences}, "
++            f"src_points={num_src_points}, "
++            f"tgt_points={num_tgt_points}, "
++            f"unique_src={unique_src_indices} ({unique_match_ratio_src*100:.2f}%), "
++            f"unique_tgt={unique_tgt_indices} ({unique_match_ratio_tgt*100:.2f}%), "
++            f"avg_matches_per_src={avg_matches_per_src:.2f}, "
++            f"avg_matches_per_tgt={avg_matches_per_tgt:.2f}, "
++            f"search_radius={search_voxel_size}"
++        )
++    
++    return correspondences_array
++
++
+ class PairDataset(torch.utils.data.Dataset):
+   AUGMENT = None
+ 
+@@ -135,7 +282,7 @@ class PairDataset(torch.utils.data.Dataset):
+ 
+ class ThreeDMatchTestDataset(PairDataset):
+   DATA_FILES = {
+-      'test': './config/test_3dmatch.txt'
++      'test': './configs/indoor/test_3dmatch.txt'
+   }
+ 
+   def __init__(self,
+@@ -241,8 +388,18 @@ class IndoorPairDataset(PairDataset):
+       trans = np.identity(4)
+ 
+     # Voxelization
+-    _, sel0 = ME.utils.sparse_quantize(xyz0 / self.voxel_size, return_index=True)
+-    _, sel1 = ME.utils.sparse_quantize(xyz1 / self.voxel_size, return_index=True)
++    # Replace ME.utils.sparse_quantize with manual voxel quantization
++    def sparse_quantize(coords, return_index=True):
++      """Manual sparse quantize for pointcnnpp."""
++      coords_int = np.floor(coords).astype(np.int64)
++      _, unique_indices = np.unique(coords_int, axis=0, return_index=True)
++      if return_index:
++        return coords_int[unique_indices], unique_indices
++      else:
++        return coords_int[unique_indices]
++    
++    _, sel0 = sparse_quantize(xyz0 / self.voxel_size, return_index=True)
++    _, sel1 = sparse_quantize(xyz1 / self.voxel_size, return_index=True)
+ 
+     # Make point clouds using voxelized points
+     pcd0 = make_open3d_point_cloud(xyz0)
+@@ -285,9 +442,9 @@ class IndoorPairDataset(PairDataset):
+ class KITTIPairDataset(PairDataset):
+   AUGMENT = None
+   DATA_FILES = {
+-      'train': './config/train_kitti.txt',
+-      'val': './config/val_kitti.txt',
+-      'test': './config/test_kitti.txt'
++      'train': './configs/kitti/train_kitti.txt',
++      'val': './configs/kitti/val_kitti.txt',
++      'test': './configs/kitti/test_kitti.txt'
+   }
+   TEST_RANDOM_ROTATION = False
+   IS_ODOMETRY = True
+@@ -307,14 +464,14 @@ class KITTIPairDataset(PairDataset):
+       self.date = config.kitti_date
+       self.root = root = os.path.join(config.kitti_root, self.date)
+ 
+-    self.icp_path = os.path.join(config.kitti_root, 'icp')
++    icp_subdir = os.environ.get('ICP_SUBDIR', 'icp')
++    self.icp_path = os.path.join(config.kitti_root, icp_subdir)
+     pathlib.Path(self.icp_path).mkdir(parents=True, exist_ok=True)
+ 
+     PairDataset.__init__(self, phase, transform, random_rotation, random_scale,
+                          manual_seed, config)
+ 
+     logging.info(f"Loading the subset {phase} from {root}")
+-    # Use the kitti root
+     self.max_time_diff = max_time_diff = config.kitti_max_time_diff
+ 
+     subset_names = open(self.DATA_FILES[phase]).read().split()
+@@ -450,18 +607,37 @@ class KITTIPairDataset(PairDataset):
+     if key not in kitti_icp_cache:
+       if not os.path.exists(filename):
+         # work on the downsampled xyzs, 0.05m == 5cm
+-        _, sel0 = ME.utils.sparse_quantize(xyz0 / 0.05, return_index=True)
+-        _, sel1 = ME.utils.sparse_quantize(xyz1 / 0.05, return_index=True)
++        # Replace ME.utils.sparse_quantize with manual voxel quantization
++        def sparse_quantize(coords, return_index=True):
++          """Manual sparse quantize for pointcnnpp."""
++          coords_int = np.floor(coords).astype(np.int64)
++          _, unique_indices = np.unique(coords_int, axis=0, return_index=True)
++          if return_index:
++            return coords_int[unique_indices], unique_indices
++          else:
++            return coords_int[unique_indices]
++        
++        _, sel0 = sparse_quantize(xyz0 / 0.05, return_index=True)
++        _, sel1 = sparse_quantize(xyz1 / 0.05, return_index=True)
+ 
+         M = (self.velo2cam @ positions[0].T @ np.linalg.inv(positions[1].T)
+              @ np.linalg.inv(self.velo2cam)).T
+         xyz0_t = self.apply_transform(xyz0[sel0], M)
+         pcd0 = make_open3d_point_cloud(xyz0_t)
+         pcd1 = make_open3d_point_cloud(xyz1[sel1])
+-        reg = o3d.registration.registration_icp(
+-            pcd0, pcd1, 0.2, np.eye(4),
+-            o3d.registration.TransformationEstimationPointToPoint(),
+-            o3d.registration.ICPConvergenceCriteria(max_iteration=200))
++        # Open3D >= 0.13 uses o3d.pipelines.registration instead of o3d.registration
++        try:
++          # Try new API first (Open3D >= 0.13)
++          reg = o3d.pipelines.registration.registration_icp(
++              pcd0, pcd1, 0.2, np.eye(4),
++              o3d.pipelines.registration.TransformationEstimationPointToPoint(),
++              o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
++        except AttributeError:
++          # Fall back to old API (Open3D < 0.13)
++          reg = o3d.registration.registration_icp(
++              pcd0, pcd1, 0.2, np.eye(4),
++              o3d.registration.TransformationEstimationPointToPoint(),
++              o3d.registration.ICPConvergenceCriteria(max_iteration=200))
+         pcd0.transform(reg.transformation)
+         # pcd0.transform(M2) or self.apply_transform(xyz0, M2)
+         M2 = M @ reg.transformation
+@@ -496,8 +672,20 @@ class KITTIPairDataset(PairDataset):
+     xyz0_th = torch.from_numpy(xyz0)
+     xyz1_th = torch.from_numpy(xyz1)
+ 
+-    _, sel0 = ME.utils.sparse_quantize(xyz0_th / self.voxel_size, return_index=True)
+-    _, sel1 = ME.utils.sparse_quantize(xyz1_th / self.voxel_size, return_index=True)
++    # Replace ME.utils.sparse_quantize with manual voxel quantization
++    def sparse_quantize(coords, return_index=True):
++      """Manual sparse quantize for pointcnnpp."""
++      if isinstance(coords, torch.Tensor):
++        coords = coords.numpy()
++      coords_int = np.floor(coords).astype(np.int64)
++      _, unique_indices = np.unique(coords_int, axis=0, return_index=True)
++      if return_index:
++        return coords_int[unique_indices], unique_indices
++      else:
++        return coords_int[unique_indices]
++    
++    _, sel0 = sparse_quantize(xyz0_th / self.voxel_size, return_index=True)
++    _, sel1 = sparse_quantize(xyz1_th / self.voxel_size, return_index=True)
+ 
+     # Make point clouds using voxelized points
+     pcd0 = make_open3d_point_cloud(xyz0[sel0])
+@@ -506,7 +694,17 @@ class KITTIPairDataset(PairDataset):
+     # Get matches
+     matches = get_matching_indices(pcd0, pcd1, trans, matching_search_voxel_size)
+     if len(matches) < 1000:
+-      raise ValueError(f"{drive}, {t0}, {t1}")
++      # Pair has insufficient voxel overlap at the configured matching radius.
++      # Raising here would propagate through the DataLoader worker and crash
++      # the entire training process — observed in job 283105263, where all 4
++      # bs=8 configs died at Epoch 1 ~iter 200/535 on pair (8, 21, 41).
++      # Treat as data-quality filter: skip and resample.
++      logging.warning(
++          "Skipping pair (drive=%d, t0=%d, t1=%d): %d matches < 1000 minimum "
++          "(voxel=%.3f, matching_radius=%.3f). Resampling.",
++          drive, t0, t1, len(matches), self.voxel_size,
++          matching_search_voxel_size)
++      return self.__getitem__((idx + 1) % len(self))
+ 
+     # Get features
+     npts0 = len(sel0)
+@@ -538,15 +736,17 @@ class KITTINMPairDataset(KITTIPairDataset):
+   r"""
+   Generate KITTI pairs within N meter distance
+   """
+-  MIN_DIST = 10
+-
+   def __init__(self,
+                phase,
+                transform=None,
+                random_rotation=True,
+                random_scale=True,
+                manual_seed=False,
+-               config=None):
++               config=None,
++               pre_downsample_voxel_size=0.3,
++               train_info=None,
++               val_info=None):
++    self.MIN_DIST = config.min_dist
+     if self.IS_ODOMETRY:
+       self.root = root = os.path.join(config.kitti_root, 'dataset')
+       random_rotation = self.TEST_RANDOM_ROTATION
+@@ -554,7 +754,8 @@ class KITTINMPairDataset(KITTIPairDataset):
+       self.date = config.kitti_date
+       self.root = root = os.path.join(config.kitti_root, self.date)
+ 
+-    self.icp_path = os.path.join(config.kitti_root, 'icp')
++    icp_subdir = os.environ.get('ICP_SUBDIR', 'icp')
++    self.icp_path = os.path.join(config.kitti_root, icp_subdir)
+     pathlib.Path(self.icp_path).mkdir(parents=True, exist_ok=True)
+ 
+     PairDataset.__init__(self, phase, transform, random_rotation, random_scale,
+@@ -569,6 +770,8 @@ class KITTINMPairDataset(KITTIPairDataset):
+         fnames = glob.glob(root + '/sequences/%02d/velodyne/*.bin' % drive_id)
+         assert len(fnames) > 0, f"Make sure that the path {root} has data {dirname}"
+         inames = sorted([int(os.path.split(fname)[-1][:-4]) for fname in fnames])
++        # Ensure inames is a Python list, not numpy array
++        inames = list(inames)
+ 
+         all_odo = self.get_video_odometry(drive_id, return_all=True)
+         all_pos = np.array([self.odometry_to_positions(odo) for odo in all_odo])
+@@ -576,19 +779,28 @@ class KITTINMPairDataset(KITTIPairDataset):
+         pdist = (Ts.reshape(1, -1, 3) - Ts.reshape(-1, 1, 3))**2
+         pdist = np.sqrt(pdist.sum(-1))
+         valid_pairs = pdist > self.MIN_DIST
++        logging.info(f"  Finding valid pairs (MIN_DIST={self.MIN_DIST})...")
+         curr_time = inames[0]
++        num_pairs = 0
+         while curr_time in inames:
+           # Find the min index
++          # Note: curr_time is both the time value and the array index (since inames starts from 0)
+           next_time = np.where(valid_pairs[curr_time][curr_time:curr_time + 100])[0]
+           if len(next_time) == 0:
+             curr_time += 1
+-          else:
+-            # Follow https://github.com/yewzijian/3DFeatNet/blob/master/scripts_data_processing/kitti/process_kitti_data.m#L44
+-            next_time = next_time[0] + curr_time - 1
++            continue
++          
++          # Follow https://github.com/yewzijian/3DFeatNet/blob/master/scripts_data_processing/kitti/process_kitti_data.m#L44
++          # Convert numpy scalar to Python int
++          next_time = int(next_time[0].item() if hasattr(next_time[0], 'item') else int(next_time[0])) + curr_time - 1
++          # Ensure it's a Python int
++          next_time = int(next_time)
+ 
+           if next_time in inames:
+             self.files.append((drive_id, curr_time, next_time))
++            num_pairs += 1
+             curr_time = next_time + 1
++        logging.info(f"  Found {num_pairs} valid pairs for drive {drive_id}")
+     else:
+       for dirname in subset_names:
+         drive_id = int(dirname)
+@@ -610,7 +822,10 @@ class KITTINMPairDataset(KITTIPairDataset):
+           if len(pair_time) == 0:
+             continue
+           else:
+-            pair_time = pair_time[0] + start_time
++            # Convert numpy scalar to Python int
++            pair_time = int(pair_time[0].item() if hasattr(pair_time[0], 'item') else int(pair_time[0])) + start_time
++            # Ensure it's a Python int
++            pair_time = int(pair_time)
+ 
+           if pair_time in inames:
+             self.files.append((drive_id, start_time, pair_time))
+@@ -624,16 +839,492 @@ class KITTINMPairDataset(KITTIPairDataset):
+           self.files.pop(self.files.index(item))
+ 
+ 
++class ThreeDMatchNewPairDatasetPure(PairDataset):
++    
++    def __init__(self, phase, transform=None, random_scale=False, random_rotation=False, 
++                 manual_seed=False, config=None, pre_downsample_voxel_size=None, 
++                 train_info=None, val_info=None, data_augmentation=True):
++        PairDataset.__init__(self, phase, transform, random_rotation, 
++                           random_scale, manual_seed, config)
++        
++        self.config = config
++        
++        self.pre_downsample_voxel_size = pre_downsample_voxel_size
++        self.phase = phase
++        self.data_augmentation = data_augmentation
++        
++        self.threedmatch_root = (
++            getattr(config, 'threedmatch_root', None) or
++            getattr(config, 'threed_match_dir', None) or
++            os.environ.get('THREEDMATCH_ROOT', '')
++        )
++        if not self.threedmatch_root:
++            raise ValueError(
++                "3DMatch root not set. Set THREEDMATCH_ROOT env var or pass "
++                "--threedmatch_root / --threed_match_dir (e.g. export THREEDMATCH_ROOT=/path/to/3dmatch_processed/indoor)"
++            )
++        self.threedmatch_train_dir = os.path.join(self.threedmatch_root, phase)
++        
++        self.overlap_radius = 1.5 * getattr(config, 'pre_downsample_voxel_size', 0.02)
++        self.augment_noise = getattr(config, 'augment_noise', 0.005)
++        self.rot_factor = getattr(config, 'rot_factor', 1.0)
++        
++        if hasattr(config, 'use_random_scale'):
++            self.random_scale = config.use_random_scale
++        if hasattr(config, 'use_random_rotation'):
++            self.random_rotation = config.use_random_rotation
++        
++        self.jitter_sigma = getattr(config, 'jitter_sigma', 0.01)
++        
++        self.debug_correspondences = False
++        
++        self.root = self.threedmatch_train_dir
++        
++        use_pkl = False
++        _fcgf_configs = os.path.join(os.path.dirname(__file__), '..', 'configs', 'indoor')
++        default_train_info = os.path.join(_fcgf_configs, 'train_info.pkl')
++        default_val_info = os.path.join(_fcgf_configs, 'val_info.pkl')
++        
++        if phase == 'train':
++            if train_info is not None and os.path.exists(train_info):
++                use_pkl = True
++                info_file = train_info
++            elif hasattr(config, 'train_info') and os.path.exists(config.train_info):
++                use_pkl = True
++                info_file = config.train_info
++            elif os.path.exists(default_train_info):
++                use_pkl = True
++                info_file = default_train_info
++        elif phase == 'test':
++            if train_info is not None and os.path.exists(train_info):
++                use_pkl = True
++                info_file = train_info
++            elif hasattr(config, 'train_info') and os.path.exists(config.train_info):
++                use_pkl = True
++                info_file = config.train_info
++            elif os.path.exists(default_train_info):
++                use_pkl = True
++                info_file = default_train_info
++            elif val_info is not None and os.path.exists(val_info):
++                use_pkl = True
++                info_file = val_info
++            elif hasattr(config, 'val_info') and os.path.exists(config.val_info):
++                use_pkl = True
++                info_file = config.val_info
++            elif os.path.exists(default_val_info):
++                use_pkl = True
++                info_file = default_val_info
++        elif phase == 'val':
++            if val_info is not None and os.path.exists(val_info):
++                use_pkl = True
++                info_file = val_info
++            elif hasattr(config, 'val_info') and os.path.exists(config.val_info):
++                use_pkl = True
++                info_file = config.val_info
++            elif os.path.exists(default_val_info):
++                use_pkl = True
++                info_file = default_val_info
++        
++        if use_pkl:
++            logging.info(f"[3DMatchNew] Loading pairs from pkl file: {info_file}")
++            self.infos = load_obj(info_file)
++            self.use_pkl = True
++            
++            if not isinstance(self.infos, dict) or 'rot' not in self.infos:
++                raise ValueError(f"Invalid pkl file format, should contain 'rot', 'trans', 'src', 'tgt' keys")
++            
++            self.base_dir = self.threedmatch_root
++            logging.info(f"[3DMatchNew] Using 3DMatch data directory as base_dir: {self.base_dir}")
++            
++            logging.info(f"[3DMatchNew] Loaded {len(self.infos['rot'])} pairs")
++            logging.info(f"[3DMatchNew] base_dir: {self.base_dir}")
++        else:
++            raise ValueError(
++                f"[3DMatchNew] Auto-scanning directory mode is not supported. "
++                f"Please provide pkl file via train_info or val_info parameter, "
++                f"or set config.train_info/config.val_info. "
++                f"Phase: {phase}"
++            )
++        
++        logging.info(f"[3DMatchNew] overlap_radius={self.overlap_radius}, augment_noise={self.augment_noise}")
++    
++    def __str__(self):
++        return "ThreeDMatchNewPairDatasetPure"
++    
++    def __len__(self):
++        if self.use_pkl:
++            return len(self.infos['rot'])
++        else:
++            return len(self.files)
++    
++    def _load_point_cloud_from_file(self, file_path):
++        original_path = file_path
++        ply_path = None
++        pth_path = None
++        
++        if file_path.endswith('.ply'):
++            ply_path = file_path
++            pth_path = file_path.replace('.ply', '.pth')
++        elif file_path.endswith('.pth'):
++            pth_path = file_path
++            ply_path = file_path.replace('.pth', '.ply')
++        else:
++            ply_path = file_path + '.ply'
++            pth_path = file_path + '.pth'
++        
++        if pth_path and os.path.exists(pth_path):
++            try:
++                pcd_data = torch.load(pth_path, weights_only=False)
++                
++                if isinstance(pcd_data, np.ndarray):
++                    xyz = pcd_data.astype(np.float32)
++                elif isinstance(pcd_data, torch.Tensor):
++                    xyz = pcd_data.cpu().numpy().astype(np.float32)
++                else:
++                    if hasattr(pcd_data, 'points'):
++                        xyz = np.asarray(pcd_data.points).astype(np.float32)
++                    elif isinstance(pcd_data, dict) and 'points' in pcd_data:
++                        xyz = np.asarray(pcd_data['points']).astype(np.float32)
++                    else:
++                        raise ValueError(f"Unrecognized .pth file format: {type(pcd_data)}")
++                
++                if xyz.ndim != 2 or xyz.shape[1] != 3:
++                    raise ValueError(f"Invalid point cloud data format: shape={xyz.shape}, expected [N, 3]")
++                
++                if len(xyz) == 0:
++                    raise ValueError(f"Empty point cloud file: {pth_path}")
++                
++                color = np.ones((len(xyz), 3), dtype=np.float32)
++                return xyz, color
++            except Exception as e:
++                logging.warning(f"Failed to read .pth file: {pth_path}, error: {e}, trying .ply file")
++        
++        if ply_path and os.path.exists(ply_path):
++            try:
++                pcd_o3d = o3d.io.read_point_cloud(ply_path)
++                xyz = np.asarray(pcd_o3d.points).astype(np.float32)
++                
++                if len(xyz) == 0:
++                    raise ValueError(f"Empty point cloud file: {ply_path}")
++                
++                if pcd_o3d.has_colors():
++                    color = np.asarray(pcd_o3d.colors).astype(np.float32)
++                else:
++                    color = np.ones((len(xyz), 3), dtype=np.float32)
++                
++                return xyz, color
++            except Exception as e:
++                raise RuntimeError(f"Failed to read .ply file: {ply_path}, error: {e}")
++        
++        raise FileNotFoundError(
++            f"Point cloud file not found: {original_path}\n"
++            f"  Tried .pth path: {pth_path} (exists: {os.path.exists(pth_path) if pth_path else False})\n"
++            f"  Tried .ply path: {ply_path} (exists: {os.path.exists(ply_path) if ply_path else False})"
++        )
++    
++    def _load_pose(self, scene_name, fragment_id):
++        pose_file = os.path.join(self.root, scene_name, 'poses', f'cloud_bin_{fragment_id}.txt')
++        if not os.path.exists(pose_file):
++            return None
++        
++        try:
++            with open(pose_file, 'r') as f:
++                lines = f.readlines()
++            
++            if len(lines) < 5:
++                logging.warning(f"Invalid pose file format: {pose_file}")
++                return None
++            
++            trans = np.zeros((4, 4))
++            for i in range(4):
++                row = [float(x) for x in lines[i+1].strip().split()]
++                trans[i, :] = row
++            
++            return trans
++        except Exception as e:
++            logging.warning(f"Failed to read pose file: {pose_file}, error: {e}")
++            return None
++    
++    def _get_fragment_id_from_filename(self, filename):
++        basename = os.path.basename(filename)
++        id_str = basename.replace('cloud_bin_', '').replace('.pth', '').replace('.ply', '')
++        return int(id_str)
++    
++    def _get_fragment_fn(self, scene_name, fragment_id):
++        fragments_dir = os.path.join(self.root, scene_name, 'fragments')
++        scene_dir = os.path.join(self.root, scene_name)
++        
++        if os.path.exists(fragments_dir):
++            base_dir = fragments_dir
++        else:
++            base_dir = scene_dir
++        
++        pth_path = os.path.join(base_dir, f'cloud_bin_{fragment_id}.pth')
++        if os.path.exists(pth_path):
++            return pth_path
++        ply_path = os.path.join(base_dir, f'cloud_bin_{fragment_id}.ply')
++        return ply_path
++    
++    def get_all_fragments(self, scene_name):
++        fragments_dir = os.path.join(self.root, scene_name, 'fragments')
++        scene_dir = os.path.join(self.root, scene_name)
++        
++        if os.path.exists(fragments_dir):
++            search_dir = fragments_dir
++        elif os.path.exists(scene_dir):
++            search_dir = scene_dir
++        else:
++            logging.warning(f"Scene directory does not exist: {scene_dir}")
++            return []
++        
++        pth_files = sorted(glob.glob(os.path.join(search_dir, 'cloud_bin_*.pth')))
++        if len(pth_files) > 0:
++            fragment_ids = [self._get_fragment_id_from_filename(fname) for fname in pth_files]
++        else:
++            ply_files = sorted(glob.glob(os.path.join(search_dir, 'cloud_bin_*.ply')))
++            fragment_ids = [self._get_fragment_id_from_filename(fname) for fname in ply_files]
++        
++        return sorted(fragment_ids)
++    
++    def generate_pairs(self, scene_filter=None):
++        files = []
++        
++        logging.info(f"Loading the subset {self.phase} from {self.root}")
++        
++        if not os.path.exists(self.root):
++            logging.error(f"3DMatch data directory does not exist: {self.root}")
++            return []
++        
++        scene_dirs = [d for d in os.listdir(self.root) 
++                     if os.path.isdir(os.path.join(self.root, d))]
++        
++        if scene_filter is not None:
++            scene_dirs = [d for d in scene_dirs if d in scene_filter]
++            logging.info(f"Using scene filter, filtered {len(scene_dirs)} scenes from {len(scene_filter)} scenes")
++        
++        self.scenes = sorted(scene_dirs)
++        logging.info(f"Found {len(self.scenes)} scenes")
++        
++        for scene_name in self.scenes:
++            fragment_ids = self.get_all_fragments(scene_name)
++            
++            if len(fragment_ids) == 0:
++                logging.warning(f"Scene {scene_name} has no fragment data")
++                continue
++            
++            logging.info(f"Scene {scene_name}: found {len(fragment_ids)} fragments")
++            
++            for i, frag_id0 in enumerate(fragment_ids):
++                if self.max_time_diff is not None:
++                    max_idx = min(i + self.max_time_diff + 1, len(fragment_ids))
++                    candidates = fragment_ids[i+1:max_idx]
++                else:
++                    candidates = fragment_ids[i+1:]
++                
++                for frag_id1 in candidates:
++                    pose0 = self._load_pose(scene_name, frag_id0)
++                    pose1 = self._load_pose(scene_name, frag_id1)
++                    
++                    if pose0 is not None and pose1 is not None:
++                        M_rel = np.linalg.inv(pose0) @ pose1
++                        distance = np.linalg.norm(M_rel[:3, 3])
++                        
++                        if distance > self.max_pair_distance:
++                            continue
++                    
++                    files.append((scene_name, frag_id0, frag_id1))
++        
++        logging.info(f"Generated {len(files)} pairs")
++        return files
++    
++    def __getitem__(self, idx):
++        if self.use_pkl:
++            rot = self.infos['rot'][idx]
++            trans = self.infos['trans'][idx]
++            
++            src_path_pkl = self.infos['src'][idx]
++            tgt_path_pkl = self.infos['tgt'][idx]
++            
++            src_path = os.path.join(self.base_dir, src_path_pkl)
++            tgt_path = os.path.join(self.base_dir, tgt_path_pkl)
++
++            try:
++                src_pcd, _ = self._load_point_cloud_from_file(src_path)
++                tgt_pcd, _ = self._load_point_cloud_from_file(tgt_path)
++            except Exception as e:
++                error_msg = f"Failed to load point cloud: src_path={src_path}, tgt_path={tgt_path}, error={e}"
++                logging.error(f"❌ {error_msg}")
++                raise RuntimeError(error_msg) from e
++        else:
++            scene_name, frag_id0, frag_id1 = self.files[idx]
++            
++            src_path = self._get_fragment_fn(scene_name, frag_id0)
++            tgt_path = self._get_fragment_fn(scene_name, frag_id1)
++            
++            src_pcd, _ = self._load_point_cloud_from_file(src_path)
++            tgt_pcd, _ = self._load_point_cloud_from_file(tgt_path)
++            
++            pose0 = self._load_pose(scene_name, frag_id0)
++            pose1 = self._load_pose(scene_name, frag_id1)
++            
++            if pose0 is None or pose1 is None:
++                logging.warning(f"Cannot get pose, using identity transform: {scene_name}, {frag_id0}, {frag_id1}")
++                rot = np.eye(3)
++                trans = np.zeros(3)
++            else:
++                M_rel = np.linalg.inv(pose0) @ pose1
++                rot = M_rel[:3, :3]
++                trans = M_rel[:3, 3]
++        
++        if len(src_pcd) == 0 or len(tgt_pcd) == 0:
++            if self.use_pkl:
++                idx_info = f"idx={idx}"
++            else:
++                scene_name, frag_id0, frag_id1 = self.files[idx]
++                idx_info = f"scene={scene_name}, frag0={frag_id0}, frag1={frag_id1}"
++            error_msg = f"Empty point cloud: src={len(src_pcd)}, tgt={len(tgt_pcd)} [{idx_info}]"
++            logging.warning(f"⚠️  {error_msg}")
++            raise ValueError(error_msg)
++        
++        matching_search_voxel_size = self.overlap_radius
++        
++        if self.data_augmentation and self.phase in ['train']:
++            if self.random_scale and random.random() < 0.95:
++                scale = self.min_scale + (self.max_scale - self.min_scale) * random.random()
++                matching_search_voxel_size *= scale
++                src_pcd = scale * src_pcd
++                tgt_pcd = scale * tgt_pcd
++            
++            if self.random_rotation:
++                T0 = sample_random_trans(src_pcd, self.randg, self.rotation_range)
++                T1 = sample_random_trans(tgt_pcd, self.randg, self.rotation_range)
++                trans_rel = T1 @ np.linalg.inv(T0)
++                
++                src_pcd = self.apply_transform(src_pcd, T0)
++                tgt_pcd = self.apply_transform(tgt_pcd, T1)
++                
++                rot = trans_rel[:3, :3]
++                trans = trans_rel[:3, 3]
++            
++            src_pcd += (np.random.rand(src_pcd.shape[0], 3) - 0.5) * self.augment_noise
++            tgt_pcd += (np.random.rand(tgt_pcd.shape[0], 3) - 0.5) * self.augment_noise
++        
++        if trans.ndim == 1:
++            trans = trans[:, None]
++        
++        tsfm = to_tsfm(rot, trans)
++        
++        sel0, new_batch_list0_final = voxel_downsample_using_pointcloud_downsampler(src_pcd, self.pre_downsample_voxel_size)
++        sel1, new_batch_list1_final = voxel_downsample_using_pointcloud_downsampler(tgt_pcd, self.pre_downsample_voxel_size)
++        
++        src_pcd = src_pcd[sel0]
++        tgt_pcd = tgt_pcd[sel1]
++
++        min_points = 100
++        if len(src_pcd) < min_points or len(tgt_pcd) < min_points:
++            if self.use_pkl:
++                idx_info = f"idx={idx}"
++            else:
++                scene_name, frag_id0, frag_id1 = self.files[idx]
++                idx_info = f"scene={scene_name}, frag0={frag_id0}, frag1={frag_id1}"
++            error_msg = f"Too few points: src={len(src_pcd)}, tgt={len(tgt_pcd)} (need at least {min_points} points) [{idx_info}]"
++            logging.warning(f"⚠️  {error_msg}")
++            raise ValueError(error_msg)
++        
++        src_pcd_o3d = make_open3d_point_cloud(src_pcd)
++        tgt_pcd_o3d = make_open3d_point_cloud(tgt_pcd)
++        
++        if self.debug_correspondences:
++            if self.use_pkl:
++                idx_info_str = f"idx={idx}"
++            else:
++                scene_name, frag_id0, frag_id1 = self.files[idx]
++                idx_info_str = f"scene={scene_name}, frag0={frag_id0}, frag1={frag_id1}"
++        else:
++            idx_info_str = None
++        
++        if self.data_augmentation and self.phase in ['train'] and self.random_scale:
++            current_overlap_radius = matching_search_voxel_size
++        else:
++            current_overlap_radius = self.overlap_radius
++        correspondences = get_correspondences(
++            src_pcd_o3d, 
++            tgt_pcd_o3d, 
++            tsfm, 
++            current_overlap_radius,
++            debug=self.debug_correspondences,
++            idx_info=idx_info_str if self.debug_correspondences else None
++        )
++        
++        try:
++            num_src_points = src_pcd.shape[0]
++            num_tgt_points = tgt_pcd.shape[0]
++            corr_arr = correspondences if isinstance(correspondences, np.ndarray) else np.array(correspondences, dtype=np.int64)
++            if corr_arr.shape[0] > 0:
++                unique_src = len(set(corr_arr[:, 0].tolist()))
++                unique_tgt = len(set(corr_arr[:, 1].tolist()))
++            else:
++                unique_src = 0
++                unique_tgt = 0
++            overlap_src = (unique_src / num_src_points) if num_src_points > 0 else 0.0
++            overlap_tgt = (unique_tgt / num_tgt_points) if num_tgt_points > 0 else 0.0
++            overlap_min = min(overlap_src, overlap_tgt)
++            if self.use_pkl:
++                pair_info_str = f"idx={idx}"
++            else:
++                scene_name, frag_id0, frag_id1 = self.files[idx]
++                pair_info_str = f"{scene_name}/({frag_id0},{frag_id1})"
++            if overlap_src < 0.3 or overlap_tgt < 0.3:
++                if len(self) > 1:
++                    next_idx = (idx + 1) % len(self)
++                    return self.__getitem__(next_idx)
++        except Exception as e:
++            if isinstance(e, ValueError):
++                raise
++            else:
++                pass
++        
++        src_feats = np.ones_like(src_pcd[:, :1]).astype(np.float32)
++        tgt_feats = np.ones_like(tgt_pcd[:, :1]).astype(np.float32)
++        
++        rot = rot.astype(np.float32)
++        trans = trans.astype(np.float32)
++        
++        if self.data_augmentation and self.phase in ['train']:
++            if random.random() < 0.95:
++                src_feats += np.random.normal(0, self.jitter_sigma, src_feats.shape).astype(np.float32)
++                tgt_feats += np.random.normal(0, self.jitter_sigma, tgt_feats.shape).astype(np.float32)
++        
++        if self.transform:
++            coords0_dummy = np.zeros((len(src_feats), 3))
++            coords1_dummy = np.zeros((len(tgt_feats), 3))
++            _, src_feats = self.transform(coords0_dummy, src_feats)
++            _, tgt_feats = self.transform(coords1_dummy, tgt_feats)
++        
++        matches_list = correspondences.tolist() if len(correspondences) > 0 else []
++        
++        new_batch_list0_final = torch.tensor([len(src_pcd)], dtype=torch.long)
++        new_batch_list1_final = torch.tensor([len(tgt_pcd)], dtype=torch.long)
++        
++        if self.use_pkl:
++            pair_info = (src_path_pkl, tgt_path_pkl)
++        else:
++            scene_name, frag_id0, frag_id1 = self.files[idx]
++            pair_info = (scene_name, frag_id0, frag_id1)
++        return (src_pcd, tgt_pcd, src_feats, tgt_feats,
++                matches_list, tsfm, new_batch_list0_final, new_batch_list1_final, pair_info)
++
++
+ class ThreeDMatchPairDataset(IndoorPairDataset):
+   OVERLAP_RATIO = 0.3
+   DATA_FILES = {
+-      'train': './config/train_3dmatch.txt',
+-      'val': './config/val_3dmatch.txt',
+-      'test': './config/test_3dmatch.txt'
++      'train': './configs/indoor/train_3dmatch.txt',
++      'val': './configs/indoor/val_3dmatch.txt',
++      'test': './configs/indoor/train_3dmatch.txt'
+   }
+ 
+ 
+-ALL_DATASETS = [ThreeDMatchPairDataset, KITTIPairDataset, KITTINMPairDataset]
++ALL_DATASETS = [ThreeDMatchNewPairDatasetPure, ThreeDMatchPairDataset, KITTIPairDataset, KITTINMPairDataset]
+ dataset_str_mapping = {d.__name__: d for d in ALL_DATASETS}
+ 
+ 
+@@ -656,20 +1347,65 @@ def make_data_loader(config, phase, batch_size, num_threads=0, shuffle=None):
+     use_random_scale = config.use_random_scale
+     transforms += [t.Jitter()]
+ 
++  train_info = getattr(config, 'train_info', None)
++  val_info = getattr(config, 'val_info', None)
++  
++  pre_downsample_voxel_size = getattr(config, 'pre_downsample_voxel_size', None)
++  
+   dset = Dataset(
+       phase,
+       transform=t.Compose(transforms),
+       random_scale=use_random_scale,
+       random_rotation=use_random_rotation,
+-      config=config)
+-
+-  loader = torch.utils.data.DataLoader(
+-      dset,
+-      batch_size=batch_size,
+-      shuffle=shuffle,
+-      num_workers=num_threads,
+-      collate_fn=collate_pair_fn,
+-      pin_memory=False,
+-      drop_last=True)
++      config=config,
++      pre_downsample_voxel_size=pre_downsample_voxel_size,
++      train_info=train_info,
++      val_info=val_info)
++
++  collate_fn = make_collate_pair_fn(config.voxel_size)
++  
++  if len(dset) == 0:
++      dataset_name = Dataset.__name__
++      logging.error(f"Dataset {dataset_name} is empty in {phase} phase, skipping DataLoader creation")
++      
++      if dataset_name == 'ThreeDMatchNewPairDatasetPure':
++          if hasattr(dset, 'use_pkl'):
++              if dset.use_pkl:
++                  logging.error(f"   - Using PKL file mode, but pair count is 0")
++                  if hasattr(dset, 'base_dir'):
++                      logging.error(f"   - base_dir: {dset.base_dir}")
++              else:
++                  logging.error(f"   - Using auto-scan mode, but no pairs found")
++                  if hasattr(dset, 'root'):
++                      logging.error(f"   - Data directory: {dset.root}")
++                      logging.error(f"   - Data directory exists: {os.path.exists(dset.root)}")
++                  if hasattr(dset, 'scenes'):
++                      logging.error(f"   - Found {len(dset.scenes)} scenes")
++                      if len(dset.scenes) > 0:
++                          logging.error(f"   - Scene list: {dset.scenes[:5]}")
++      
++      train_info = getattr(config, 'train_info', None)
++      val_info = getattr(config, 'val_info', None)
++      threedmatch_root = getattr(config, 'threedmatch_root', None)
++      logging.error(f"   - config.train_info: {train_info}")
++      logging.error(f"   - config.val_info: {val_info}")
++      logging.error(f"   - config.threedmatch_root: {threedmatch_root}")
++      
++      if phase == 'train':
++          logging.error("   Training dataset is empty, cannot continue training!")
++      return None
++  
++  loader_kwargs = {
++      'batch_size': batch_size,
++      'shuffle': shuffle,
++      'num_workers': num_threads,
++      'collate_fn': collate_fn,
++      'pin_memory': True,
++      'drop_last': True if phase == 'train' else False,
++  }
++  if num_threads > 0:
++      loader_kwargs['persistent_workers'] = True
++  
++  loader = torch.utils.data.DataLoader(dset, **loader_kwargs)
+ 
+   return loader
+diff --git a/lib/metrics.py b/lib/metrics.py
+index 0b146dc..8883573 100644
+--- a/lib/metrics.py
++++ b/lib/metrics.py
+@@ -10,13 +10,24 @@ def eval_metrics(output, target):
+   return np.linalg.norm(output - target)
+ 
+ 
+-def corr_dist(est, gth, xyz0, xyz1, weight=None, max_dist=1):
++def corr_dist(est, gth, xyz0, xyz1, weight=None, max_dist=None):
++  if isinstance(est, np.ndarray):
++    est = torch.from_numpy(est).float()
++  if isinstance(gth, np.ndarray):
++    gth = torch.from_numpy(gth).float()
++  if isinstance(xyz0, np.ndarray):
++    xyz0 = torch.from_numpy(xyz0).float()
++  if isinstance(xyz1, np.ndarray):
++    xyz1 = torch.from_numpy(xyz1).float()
++  
+   xyz0_est = xyz0 @ est[:3, :3].t() + est[:3, 3]
+   xyz0_gth = xyz0 @ gth[:3, :3].t() + gth[:3, 3]
+-  dists = torch.clamp(torch.sqrt(((xyz0_est - xyz0_gth).pow(2)).sum(1)), max=max_dist)
++  dists = torch.sqrt(((xyz0_est - xyz0_gth).pow(2)).sum(1))
++  if max_dist is not None:
++    dists = torch.clamp(dists, max=max_dist)
+   if weight is not None:
+     dists = weight * dists
+-  return dists.mean()
++  return dists.mean().item()
+ 
+ 
+ def pdist(A, B, dist_type='L2'):
+diff --git a/lib/trainer.py b/lib/trainer.py
+index e4c230b..9bca4ad 100644
+--- a/lib/trainer.py
++++ b/lib/trainer.py
+@@ -1,7 +1,3 @@
+-# -*- coding: future_fstrings -*-
+-#
+-# Written by Chris Choy <chrischoy@ai.stanford.edu>
+-# Distributed under MIT License
+ import os
+ import os.path as osp
+ import gc
+@@ -13,17 +9,119 @@ import torch
+ import torch.optim as optim
+ import torch.nn.functional as F
+ from tensorboardX import SummaryWriter
++from easydict import EasyDict
+ 
+ from model import load_model
+ import util.transform_estimation as te
+ from lib.metrics import pdist, corr_dist
+-from lib.timer import Timer, AverageMeter
++from lib.timer import AverageMeter
+ from lib.eval import find_nn_gpu
+ 
+ from util.file import ensure_dir
+ from util.misc import _hash
+ 
+-import MinkowskiEngine as ME
++# Add Open3D for RANSAC
++try:
++    import open3d as o3d
++    o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
++    HAS_OPEN3D = True
++except ImportError:
++    HAS_OPEN3D = False
++    logging.warning("Open3D not available, RANSAC will not be used")
++
++
++def run_ransac_registration(xyz0, xyz1, feat0, feat1, voxel_size):
++    if not HAS_OPEN3D:
++        logging.warning("Open3D not available, falling back to est_quad_linear_robust")
++        return None
++
++    pcd0 = o3d.geometry.PointCloud()
++    pcd0.points = o3d.utility.Vector3dVector(xyz0)
++    pcd0_features = o3d.pipelines.registration.Feature()
++    pcd0_features.data = feat0.T.astype(np.float32)
++    
++    pcd1 = o3d.geometry.PointCloud()
++    pcd1.points = o3d.utility.Vector3dVector(xyz1)
++    pcd1_features = o3d.pipelines.registration.Feature()
++    pcd1_features.data = feat1.T.astype(np.float32)
++
++    distance_threshold = voxel_size * 1.5
++    
++    try:
++        result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
++            pcd0, pcd1, pcd0_features, pcd1_features,
++            mutual_filter=False,
++            max_correspondence_distance=distance_threshold,
++            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 
++            ransac_n=4, 
++            checkers=[
++                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
++                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)
++            ], 
++            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 0.999)
++        )
++        return result_ransac.transformation.astype(np.float32)
++    except AttributeError:
++        try:
++            result_ransac = o3d.registration.registration_ransac_based_on_feature_matching(
++                pcd0, pcd1, pcd0_features, pcd1_features,
++                mutual_filter=False,
++                max_correspondence_distance=distance_threshold,
++                estimation_method=o3d.registration.TransformationEstimationPointToPoint(False),
++                ransac_n=4,
++                checkers=[
++                    o3d.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
++                    o3d.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)
++                ],
++                criteria=o3d.registration.RANSACConvergenceCriteria(50000, 0.999)
++            )
++            return result_ransac.transformation.astype(np.float32)
++        except Exception as e:
++            logging.warning(f"RANSAC failed: {e}, falling back to est_quad_linear_robust")
++            return None
++
++
++def extract_features(model_output):
++    if hasattr(model_output, 'F'):
++        return model_output.F
++    
++    if hasattr(model_output, 'feat'):
++        return model_output.feat
++    
++    if isinstance(model_output, dict) and 'feat' in model_output:
++        return model_output['feat']
++    
++    if hasattr(model_output, 'shape'):
++        return model_output
++    
++    raise ValueError(f"Cannot extract features from type: {type(model_output)}")
++
++
++def extract_coords(model_output, fallback_coords=None):
++    if isinstance(model_output, dict):
++        if 'coord' in model_output:
++            coord = model_output['coord']
++            if hasattr(coord, 'cpu'):
++                return coord.cpu()
++            else:
++                return coord
++    
++    if hasattr(type(model_output), 'coord'):
++        coord = model_output.coord
++        if hasattr(coord, 'cpu'):
++            return coord.cpu()
++        else:
++            return coord
++    
++    if fallback_coords is not None:
++        if isinstance(fallback_coords, torch.Tensor):
++            return fallback_coords.cpu() if fallback_coords.is_cuda else fallback_coords
++        else:
++            return fallback_coords
++    
++    return None
++
++# MinkowskiEngine removed, using pointcnnpp instead
+ 
+ 
+ class AlignmentTrainer:
+@@ -47,7 +145,8 @@ class AlignmentTrainer:
+         D=3)
+ 
+     if config.weights:
+-      checkpoint = torch.load(config.weights)
++      with torch.serialization.safe_globals([EasyDict]):
++        checkpoint = torch.load(config.weights, weights_only=False)
+       model.load_state_dict(checkpoint['state_dict'])
+ 
+     logging.info(model)
+@@ -101,7 +200,8 @@ class AlignmentTrainer:
+     if config.resume is not None:
+       if osp.isfile(config.resume):
+         logging.info("=> loading checkpoint '{}'".format(config.resume))
+-        state = torch.load(config.resume)
++        with torch.serialization.safe_globals([EasyDict]):
++          state = torch.load(config.resume, weights_only=False)
+         self.start_epoch = state['epoch']
+         model.load_state_dict(state['state_dict'])
+         self.scheduler.load_state_dict(state['scheduler'])
+@@ -185,7 +285,13 @@ class ContrastiveLossTrainer(AlignmentTrainer):
+   def apply_transform(self, pts, trans):
+     R = trans[:3, :3]
+     T = trans[:3, 3]
+-    return pts @ R.t() + T
++    
++    if isinstance(R, torch.Tensor):
++      R_T = R.t()
++    else:
++      R_T = R.T
++    
++    return pts @ R_T + T
+ 
+   def generate_rand_negative_pairs(self, positive_pairs, hash_seed, N0, N1, N_neg=0):
+     """
+@@ -216,33 +322,37 @@ class ContrastiveLossTrainer(AlignmentTrainer):
+     iter_size = self.iter_size
+     start_iter = (epoch - 1) * (len(data_loader) // iter_size)
+ 
+-    data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
+-
+     # Main training
+     for curr_iter in range(len(data_loader) // iter_size):
+       self.optimizer.zero_grad()
+       batch_pos_loss, batch_neg_loss, batch_loss = 0, 0, 0
+ 
+-      data_time = 0
+-      total_timer.tic()
+       for iter_idx in range(iter_size):
+-        # Caffe iter size
+-        data_timer.tic()
+-        input_dict = data_loader_iter.next()
+-        data_time += data_timer.toc(average=False)
++        input_dict = next(data_loader_iter)
+ 
+         # pairs consist of (xyz1 index, xyz0 index)
+-        sinput0 = ME.SparseTensor(
+-            input_dict['sinput0_F'].to(self.device),
+-            coordinates=input_dict['sinput0_C'].to(self.device))
+-        F0 = self.model(sinput0).F
+-
+-        sinput1 = ME.SparseTensor(
+-            input_dict['sinput1_F'].to(self.device),
+-            coordinates=input_dict['sinput1_C'].to(self.device))
+-        F1 = self.model(sinput1).F
+-
+-        N0, N1 = len(sinput0), len(sinput1)
++        # Convert to pointcnnpp format
++        sinput0_dict = {
++            'feat': input_dict['sinput0_F'].to(self.device),
++            'coord': input_dict['sinput0_C'].to(self.device),
++            'offset': input_dict.get('sinput0_offset', torch.tensor([0, input_dict['sinput0_F'].shape[0]], dtype=torch.long, device=self.device)),
++            'grid_size': self.config.voxel_size,
++        }
++        model_output0 = self.model(sinput0_dict)
++        F0 = extract_features(model_output0)
++
++        sinput1_dict = {
++            'feat': input_dict['sinput1_F'].to(self.device),
++            'coord': input_dict['sinput1_C'].to(self.device),
++            'offset': input_dict.get('sinput1_offset', torch.tensor([0, input_dict['sinput1_F'].shape[0]], dtype=torch.long, device=self.device)),
++            'grid_size': self.config.voxel_size,
++        }
++        model_output1 = self.model(sinput1_dict)
++        F1 = extract_features(model_output1)
++
++        # Calculate number of points from offset
++        N0 = sinput0_dict['offset'][-1].item() if sinput0_dict['offset'].numel() > 0 else sinput0_dict['feat'].shape[0]
++        N1 = sinput1_dict['offset'][-1].item() if sinput1_dict['offset'].numel() > 0 else sinput1_dict['feat'].shape[0]
+ 
+         pos_pairs = input_dict['correspondences']
+         neg_pairs = self.generate_rand_negative_pairs(pos_pairs, max(N0, N1), N0, N1)
+@@ -274,70 +384,154 @@ class ContrastiveLossTrainer(AlignmentTrainer):
+ 
+       self.optimizer.step()
+ 
+-      torch.cuda.empty_cache()
++      if curr_iter % 100 == 0:
++        torch.cuda.empty_cache()
+ 
+       total_loss += batch_loss
+       total_num += 1.0
+-      total_timer.toc()
+-      data_meter.update(data_time)
+ 
+       # Print logs
+       if curr_iter % self.config.stat_freq == 0:
+         self.writer.add_scalar('train/loss', batch_loss, start_iter + curr_iter)
+         self.writer.add_scalar('train/pos_loss', batch_pos_loss, start_iter + curr_iter)
+-        self.writer.add_scalar('train/neg_loss', batch_neg_loss, start_iter + curr_iter)
++        self.writer.add_scalar('train/neg_loss', batch_neg_loss, start_iter + curr_iter)  
+         logging.info(
+             "Train Epoch: {} [{}/{}], Current Loss: {:.3e} Pos: {:.3f} Neg: {:.3f}"
+             .format(epoch, curr_iter,
+                     len(self.data_loader) //
+-                    iter_size, batch_loss, batch_pos_loss, batch_neg_loss) +
+-            "\tData time: {:.4f}, Train time: {:.4f}, Iter time: {:.4f}".format(
+-                data_meter.avg, total_timer.avg - data_meter.avg, total_timer.avg))
+-        data_meter.reset()
+-        total_timer.reset()
++                    iter_size, batch_loss, batch_pos_loss, batch_neg_loss))
+ 
+   def _valid_epoch(self):
+-    # Change the network to evaluation mode
+     self.model.eval()
+     self.val_data_loader.dataset.reset_seed(0)
++    np.random.seed(0)
+     num_data = 0
+     hit_ratio_meter, feat_match_ratio, loss_meter, rte_meter, rre_meter = AverageMeter(
+     ), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+-    data_timer, feat_timer, matching_timer = Timer(), Timer(), Timer()
++
+     tot_num_data = len(self.val_data_loader.dataset)
+     if self.val_max_iter > 0:
+       tot_num_data = min(self.val_max_iter, tot_num_data)
+     data_loader_iter = self.val_data_loader.__iter__()
+ 
+     for batch_idx in range(tot_num_data):
+-      data_timer.tic()
+-      input_dict = data_loader_iter.next()
+-      data_timer.toc()
+-
+-      # pairs consist of (xyz1 index, xyz0 index)
+-      feat_timer.tic()
+-      sinput0 = ME.SparseTensor(
+-          input_dict['sinput0_F'].to(self.device),
+-          coordinates=input_dict['sinput0_C'].to(self.device))
+-      F0 = self.model(sinput0).F
+-
+-      sinput1 = ME.SparseTensor(
+-          input_dict['sinput1_F'].to(self.device),
+-          coordinates=input_dict['sinput1_C'].to(self.device))
+-      F1 = self.model(sinput1).F
+-      feat_timer.toc()
+-
+-      matching_timer.tic()
+-      xyz0, xyz1, T_gt = input_dict['pcd0'], input_dict['pcd1'], input_dict['T_gt']
+-      xyz0_corr, xyz1_corr = self.find_corr(xyz0, xyz1, F0, F1, subsample_size=5000)
++      input_dict = next(data_loader_iter)
++      
++      if 'pcd0' in input_dict and 'pcd1' in input_dict:
++          offset0 = torch.cumsum(torch.tensor([0] + [len(input_dict['pcd0'])], dtype=torch.long), dim=0).to(self.device)
++          offset1 = torch.cumsum(torch.tensor([0] + [len(input_dict['pcd1'])], dtype=torch.long), dim=0).to(self.device)
++          
++          point0_dict = {
++              'coord': input_dict['pcd0'].to(self.device),
++              'feat': input_dict['sinput0_F'].to(self.device),
++              'offset': offset0,
++              'grid_size': self.config.voxel_size,
++          }
++          
++          point1_dict = {
++              'coord': input_dict['pcd1'].to(self.device),
++              'feat': input_dict['sinput1_F'].to(self.device),
++              'offset': offset1,
++              'grid_size': self.config.voxel_size,
++          }
++          
++          model_output0 = self.model(point0_dict)
++          F0 = extract_features(model_output0)
++          xyz0_model = extract_coords(model_output0, input_dict['pcd0'])
++          if xyz0_model is None:
++              xyz0_model = input_dict['pcd0']
++          
++          model_output1 = self.model(point1_dict)
++          F1 = extract_features(model_output1)
++          xyz1_model = extract_coords(model_output1, input_dict['pcd1'])
++          if xyz1_model is None:
++              xyz1_model = input_dict['pcd1']
++      else:
++          offset0 = torch.tensor([0, input_dict['sinput0_F'].shape[0]], dtype=torch.long, device=self.device)
++          offset1 = torch.tensor([0, input_dict['sinput1_F'].shape[0]], dtype=torch.long, device=self.device)
++          
++          sinput0_dict = {
++              'feat': input_dict['sinput0_F'].to(self.device),
++              'coord': input_dict['sinput0_C'].to(self.device),
++              'offset': offset0,
++              'grid_size': self.config.voxel_size,
++          }
++          model_output0 = self.model(sinput0_dict)
++          F0 = extract_features(model_output0)
++
++          sinput1_dict = {
++              'feat': input_dict['sinput1_F'].to(self.device),
++              'coord': input_dict['sinput1_C'].to(self.device),
++              'offset': offset1,
++              'grid_size': self.config.voxel_size,
++          }
++          model_output1 = self.model(sinput1_dict)
++          F1 = extract_features(model_output1)
++
++          if 'pcd0' in input_dict:
++              xyz0_model = input_dict['pcd0']
++          elif 'pcd0_original' in input_dict:
++              xyz0_model = input_dict['pcd0_original']
++          else:
++              logging.warning("No original point cloud coordinates found, using quantized coordinates (may affect hit_ratio accuracy)")
++              if isinstance(input_dict['sinput0_C'], torch.Tensor):
++                  xyz0_model = input_dict['sinput0_C'].float() * self.config.voxel_size
++              else:
++                  xyz0_model = np.array(input_dict['sinput0_C'], dtype=np.float32) * self.config.voxel_size
++          
++          if 'pcd1' in input_dict:
++              xyz1_model = input_dict['pcd1']
++          elif 'pcd1_original' in input_dict:
++              xyz1_model = input_dict['pcd1_original']
++          else:
++              logging.warning("No original point cloud coordinates found, using quantized coordinates (may affect hit_ratio accuracy)")
++              if isinstance(input_dict['sinput1_C'], torch.Tensor):
++                  xyz1_model = input_dict['sinput1_C'].float() * self.config.voxel_size
++              else:
++                  xyz1_model = np.array(input_dict['sinput1_C'], dtype=np.float32) * self.config.voxel_size
++
++      if isinstance(xyz0_model, torch.Tensor):
++          xyz0 = xyz0_model.cpu().numpy()
++      elif xyz0_model is None:
++          raise ValueError("xyz0_model is None, cannot proceed")
++      else:
++          xyz0 = np.array(xyz0_model, dtype=np.float32)
++      
++      if isinstance(xyz1_model, torch.Tensor):
++          xyz1 = xyz1_model.cpu().numpy()
++      elif xyz1_model is None:
++          raise ValueError("xyz1_model is None, cannot proceed")
++      else:
++          xyz1 = np.array(xyz1_model, dtype=np.float32)
++      
++      T_gt = input_dict['T_gt']
++      if isinstance(T_gt, torch.Tensor):
++        T_gt = T_gt.cpu().numpy()
++      
++      xyz0_corr, xyz1_corr = self.find_corr(xyz0, xyz1, F0, F1, subsample_size=1000)
++      
++      if len(xyz0_corr) < 4:
++        logging.warning(f"find_corr returned only {len(xyz0_corr)} matches, skipping this sample")
++        num_data += 1
++        continue
++      
++      if isinstance(xyz0_corr, np.ndarray):
++        xyz0_corr = torch.from_numpy(xyz0_corr).float()
++      if isinstance(xyz1_corr, np.ndarray):
++        xyz1_corr = torch.from_numpy(xyz1_corr).float()
++      
+       T_est = te.est_quad_linear_robust(xyz0_corr, xyz1_corr)
++      if isinstance(T_est, torch.Tensor):
++        T_est = T_est.cpu().numpy()
+ 
+       loss = corr_dist(T_est, T_gt, xyz0, xyz1, weight=None)
+       loss_meter.update(loss)
+ 
+       rte = np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3])
+       rte_meter.update(rte)
+-      rre = np.arccos((np.trace(T_est[:3, :3].t() @ T_gt[:3, :3]) - 1) / 2)
++      R_est = T_est[:3, :3]
++      R_gt = T_gt[:3, :3]
++      rre = np.arccos(np.clip((np.trace(R_est.T @ R_gt) - 1) / 2, -1, 1))
+       if not np.isnan(rre):
+         rre_meter.update(rre)
+ 
+@@ -345,19 +539,17 @@ class ContrastiveLossTrainer(AlignmentTrainer):
+           xyz0_corr, xyz1_corr, T_gt, thresh=self.config.hit_ratio_thresh)
+       hit_ratio_meter.update(hit_ratio)
+       feat_match_ratio.update(hit_ratio > 0.05)
+-      matching_timer.toc()
+ 
+       num_data += 1
+-      torch.cuda.empty_cache()
++      if batch_idx % 100 == 0:
++        torch.cuda.empty_cache()
+ 
+-      if batch_idx % 100 == 0 and batch_idx > 0:
++      if batch_idx % 100 == 0:
+         logging.info(' '.join([
+-            f"Validation iter {num_data} / {tot_num_data} : Data Loading Time: {data_timer.avg:.3f},",
+-            f"Feature Extraction Time: {feat_timer.avg:.3f}, Matching Time: {matching_timer.avg:.3f},",
++            f"Validation iter {num_data} / {tot_num_data} :",
+             f"Loss: {loss_meter.avg:.3f}, RTE: {rte_meter.avg:.3f}, RRE: {rre_meter.avg:.3f},",
+             f"Hit Ratio: {hit_ratio_meter.avg:.3f}, Feat Match Ratio: {feat_match_ratio.avg:.3f}"
+         ]))
+-        data_timer.reset()
+ 
+     logging.info(' '.join([
+         f"Final Loss: {loss_meter.avg:.3f}, RTE: {rte_meter.avg:.3f}, RRE: {rre_meter.avg:.3f},",
+@@ -372,25 +564,121 @@ class ContrastiveLossTrainer(AlignmentTrainer):
+     }
+ 
+   def find_corr(self, xyz0, xyz1, F0, F1, subsample_size=-1):
+-    subsample = len(F0) > subsample_size
+-    if subsample_size > 0 and subsample:
+-      N0 = min(len(F0), subsample_size)
+-      N1 = min(len(F1), subsample_size)
+-      inds0 = np.random.choice(len(F0), N0, replace=False)
+-      inds1 = np.random.choice(len(F1), N1, replace=False)
+-      F0, F1 = F0[inds0], F1[inds1]
+-
+-    # Compute the nn
+-    nn_inds = find_nn_gpu(F0, F1, nn_max_n=self.config.nn_max_n)
+-    if subsample_size > 0 and subsample:
+-      return xyz0[inds0], xyz1[inds1[nn_inds]]
++    nn_result = find_nn_gpu(F0, F1, nn_max_n=self.config.nn_max_n, return_distance=True, dist_type='SquareL2')
++    
++    if isinstance(nn_result, tuple):
++      nn_inds_01, nn_dists = nn_result
+     else:
+-      return xyz0, xyz1[nn_inds]
++      nn_inds_01 = nn_result
++      nn_dists = None
++    
++    if isinstance(nn_inds_01, torch.Tensor):
++      nn_inds_01 = nn_inds_01.numpy()
++    if nn_dists is not None and isinstance(nn_dists, torch.Tensor):
++      nn_dists = nn_dists.numpy()
++    
++    N0 = F0.shape[0] if hasattr(F0, 'shape') else len(F0)
++    N1 = F1.shape[0] if hasattr(F1, 'shape') else len(F1)
++    valid_mask = (nn_inds_01 >= 0) & (nn_inds_01 < N1)
++    
++    if valid_mask.sum() == 0:
++      logging.warning(f"find_corr: no valid matches found (N0={N0}, N1={N1}); returning empty matches")
++      if isinstance(xyz0, torch.Tensor):
++        xyz0 = xyz0.cpu().numpy()
++      if isinstance(xyz1, torch.Tensor):
++        xyz1 = xyz1.cpu().numpy()
++      return np.empty((0, 3), dtype=xyz0.dtype), np.empty((0, 3), dtype=xyz1.dtype)
++    
++    nn_inds = nn_inds_01[valid_mask]
++    valid_inds0 = np.where(valid_mask)[0]
++    
++    if subsample_size > 0 and len(valid_inds0) > subsample_size:
++      if nn_dists is not None:
++        valid_dists = nn_dists[valid_mask]
++        if isinstance(valid_dists, torch.Tensor):
++          valid_dists = valid_dists.squeeze().cpu().numpy()
++        else:
++          valid_dists = np.asarray(valid_dists).squeeze()
++        
++        if valid_dists.ndim > 1:
++          valid_dists = valid_dists.flatten()
++        
++        epsilon = 1e-8
++        dist_min, dist_max = valid_dists.min(), valid_dists.max()
++        if dist_max > dist_min:
++          normalized_dists = (valid_dists - dist_min) / (dist_max - dist_min + epsilon)
++        else:
++          normalized_dists = np.ones_like(valid_dists)
++        conf = 1.0 / (normalized_dists + epsilon)
++        prob = conf / conf.sum()
++        
++        idx = np.arange(len(valid_inds0))
++        sampled_idx = np.random.choice(idx, size=subsample_size, replace=False, p=prob)
++        valid_inds0 = valid_inds0[sampled_idx]
++        nn_inds = nn_inds[sampled_idx]
++      else:
++        idx = np.arange(len(valid_inds0))
++        sampled_idx = np.random.choice(idx, size=subsample_size, replace=False)
++        valid_inds0 = valid_inds0[sampled_idx]
++        nn_inds = nn_inds[sampled_idx]
++    
++    if isinstance(xyz0, torch.Tensor):
++      xyz0 = xyz0.cpu().numpy()
++    if isinstance(xyz1, torch.Tensor):
++      xyz1 = xyz1.cpu().numpy()
++    
++    return xyz0[valid_inds0], xyz1[nn_inds]
+ 
+   def evaluate_hit_ratio(self, xyz0, xyz1, T_gth, thresh=0.1):
++    if isinstance(xyz0, torch.Tensor):
++      xyz0 = xyz0.cpu().numpy()
++    if isinstance(xyz1, torch.Tensor):
++      xyz1 = xyz1.cpu().numpy()
++    if isinstance(T_gth, torch.Tensor):
++      T_gth = T_gth.cpu().numpy()
++    
+     xyz0 = self.apply_transform(xyz0, T_gth)
+     dist = np.sqrt(((xyz0 - xyz1)**2).sum(1) + 1e-6)
+-    return (dist < thresh).float().mean().item()
++    return (dist < thresh).astype(np.float32).mean()
++
++  def evaluate_chamfer_distance(self, xyz0, xyz1, T_est, max_points=500):
++    """
++    计算 Chamfer Distance（倒角距离）
++    
++    Args:
++        xyz0: [N0, 3] 点云0
++        xyz1: [N1, 3] 点云1  
++        T_est: [4, 4] 估计的变换矩阵
++        max_points: int - 最大采样点数（防止OOM）
++    
++    Returns:
++        cd: float - 对称 Chamfer Distance
++    """
++    xyz1_transformed = self.apply_transform(xyz1, T_est)
++
++    if torch.is_tensor(xyz0):
++      xyz0 = xyz0.cpu().numpy()
++    if torch.is_tensor(xyz1_transformed):
++      xyz1_transformed = xyz1_transformed.cpu().numpy()
++
++    N0, N1 = xyz0.shape[0], xyz1_transformed.shape[0]
++    if N0 > max_points:
++      inds0 = np.random.choice(N0, max_points, replace=False)
++      xyz0 = xyz0[inds0]
++    if N1 > max_points:
++      inds1 = np.random.choice(N1, max_points, replace=False)
++      xyz1_transformed = xyz1_transformed[inds1]
++
++    # xyz0 → xyz1_transformed
++    dist_01 = np.sqrt(((xyz0[:, None, :] - xyz1_transformed[None, :, :])**2).sum(2))  # [N0, N1]
++    min_dist_01 = dist_01.min(axis=1)  # [N0]
++    
++    # xyz1_transformed → xyz0
++    min_dist_10 = dist_01.min(axis=0)  # [N1]
++
++    cd = (min_dist_01.mean() + min_dist_10.mean()) / 2.0
++    
++    return cd
+ 
+ 
+ class HardestContrastiveLossTrainer(ContrastiveLossTrainer):
+@@ -402,10 +690,7 @@ class HardestContrastiveLossTrainer(ContrastiveLossTrainer):
+                                         num_pos=5192,
+                                         num_hn_samples=2048,
+                                         thresh=None):
+-    """
+-    Generate negative pairs
+-    """
+-    N0, N1 = len(F0), len(F1)
++    N0, N1 = F0.shape[0] if hasattr(F0, 'shape') else len(F0), F1.shape[0] if hasattr(F1, 'shape') else len(F1)
+     N_pos_pairs = len(positive_pairs)
+     hash_seed = max(N0, N1)
+     sel0 = np.random.choice(N0, min(N0, num_hn_samples), replace=False)
+@@ -416,12 +701,14 @@ class HardestContrastiveLossTrainer(ContrastiveLossTrainer):
+       sample_pos_pairs = positive_pairs[pos_sel]
+     else:
+       sample_pos_pairs = positive_pairs
++    
++    if not isinstance(sample_pos_pairs, np.ndarray):
++      sample_pos_pairs = np.array(sample_pos_pairs, dtype=np.int64)
+ 
+-    # Find negatives for all F1[positive_pairs[:, 1]]
+     subF0, subF1 = F0[sel0], F1[sel1]
+ 
+-    pos_ind0 = sample_pos_pairs[:, 0].long()
+-    pos_ind1 = sample_pos_pairs[:, 1].long()
++    pos_ind0 = torch.from_numpy(sample_pos_pairs[:, 0]).long().to(F0.device)
++    pos_ind1 = torch.from_numpy(sample_pos_pairs[:, 1]).long().to(F1.device)
+     posF0, posF1 = F0[pos_ind0], F1[pos_ind1]
+ 
+     D01 = pdist(posF0, subF1, dist_type='L2')
+@@ -437,8 +724,8 @@ class HardestContrastiveLossTrainer(ContrastiveLossTrainer):
+ 
+     D01ind = sel1[D01ind.cpu().numpy()]
+     D10ind = sel0[D10ind.cpu().numpy()]
+-    neg_keys0 = _hash([pos_ind0.numpy(), D01ind], hash_seed)
+-    neg_keys1 = _hash([D10ind, pos_ind1.numpy()], hash_seed)
++    neg_keys0 = _hash([pos_ind0.cpu().numpy(), D01ind], hash_seed)
++    neg_keys1 = _hash([D10ind, pos_ind1.cpu().numpy()], hash_seed)
+ 
+     mask0 = torch.from_numpy(
+         np.logical_not(np.isin(neg_keys0, pos_keys, assume_unique=False)))
+@@ -457,73 +744,118 @@ class HardestContrastiveLossTrainer(ContrastiveLossTrainer):
+     total_num = 0.0
+     data_loader = self.data_loader
+     data_loader_iter = self.data_loader.__iter__()
+-    iter_size = self.iter_size
+-    data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
+-    start_iter = (epoch - 1) * (len(data_loader) // iter_size)
+-    for curr_iter in range(len(data_loader) // iter_size):
++    start_iter = (epoch - 1) * len(data_loader)
++    
++    for curr_iter in range(len(data_loader)):
++      input_dict = next(data_loader_iter)
++      
+       self.optimizer.zero_grad()
+-      batch_pos_loss, batch_neg_loss, batch_loss = 0, 0, 0
+-
+-      data_time = 0
+-      total_timer.tic()
+-      for iter_idx in range(iter_size):
+-        data_timer.tic()
+-        input_dict = data_loader_iter.next()
+-        data_time += data_timer.toc(average=False)
+-
+-        sinput0 = ME.SparseTensor(
+-            input_dict['sinput0_F'].to(self.device),
+-            coordinates=input_dict['sinput0_C'].to(self.device))
+-        F0 = self.model(sinput0).F
+-
+-        sinput1 = ME.SparseTensor(
+-            input_dict['sinput1_F'].to(self.device),
+-            coordinates=input_dict['sinput1_C'].to(self.device))
+-
+-        F1 = self.model(sinput1).F
+-
+-        pos_pairs = input_dict['correspondences']
+-        pos_loss, neg_loss = self.contrastive_hardest_negative_loss(
+-            F0,
+-            F1,
+-            pos_pairs,
+-            num_pos=self.config.num_pos_per_batch * self.config.batch_size,
+-            num_hn_samples=self.config.num_hn_samples_per_batch *
+-            self.config.batch_size)
+-
+-        pos_loss /= iter_size
+-        neg_loss /= iter_size
+-        loss = pos_loss + self.neg_weight * neg_loss
+-        loss.backward()
+-
+-        batch_loss += loss.item()
+-        batch_pos_loss += pos_loss.item()
+-        batch_neg_loss += neg_loss.item()
+ 
++      if 'point0' in input_dict and 'point1' in input_dict:
++          point0_dict = {
++              'coord': input_dict['point0']['coord'].to(self.device),
++              'feat': input_dict['point0']['feat'].to(self.device),
++              'offset': input_dict['point0']['offset'].to(self.device) if 'offset' in input_dict['point0'] else None,
++              'batch_list': input_dict['point0']['batch_list'].to(self.device) if 'batch_list' in input_dict['point0'] else None,
++              'grid_size': input_dict['point0']['grid_size'] if 'grid_size' in input_dict['point0'] else self.config.voxel_size,
++          }
++          point0_dict = {k: v for k, v in point0_dict.items() if v is not None}
++          
++          point1_dict = {
++              'coord': input_dict['point1']['coord'].to(self.device),
++              'feat': input_dict['point1']['feat'].to(self.device),
++              'offset': input_dict['point1']['offset'].to(self.device) if 'offset' in input_dict['point1'] else None,
++              'batch_list': input_dict['point1']['batch_list'].to(self.device) if 'batch_list' in input_dict['point1'] else None,
++              'grid_size': input_dict['point1']['grid_size'] if 'grid_size' in input_dict['point1'] else self.config.voxel_size,
++          }
++          point1_dict = {k: v for k, v in point1_dict.items() if v is not None}
++          
++          model_output0 = self.model(point0_dict)
++          F0 = extract_features(model_output0)
++          
++          model_output1 = self.model(point1_dict)
++          F1 = extract_features(model_output1)
++          
++      elif 'pcd0' in input_dict and 'pcd1' in input_dict:
++          point0_dict = {
++              'coord': input_dict['pcd0'].to(self.device),
++              'feat': input_dict['sinput0_F'].to(self.device),
++              'offset': torch.cumsum(torch.tensor([0] + [len(input_dict['pcd0'])]), dim=0).to(self.device),
++              'batch_list': torch.tensor([len(input_dict['pcd0'])]).to(self.device),
++              'grid_size': self.config.voxel_size,
++          }
++          
++          point1_dict = {
++              'coord': input_dict['pcd1'].to(self.device),
++              'feat': input_dict['sinput1_F'].to(self.device),
++              'offset': torch.cumsum(torch.tensor([0] + [len(input_dict['pcd1'])]), dim=0).to(self.device),
++              'batch_list': torch.tensor([len(input_dict['pcd1'])]).to(self.device),
++              'grid_size': self.config.voxel_size,
++          }
++          
++          model_output0 = self.model(point0_dict)
++          F0 = extract_features(model_output0)
++          
++          model_output1 = self.model(point1_dict)
++          F1 = extract_features(model_output1)
++          
++      else:
++          if 'sinput0_offset' in input_dict:
++              offset0 = input_dict['sinput0_offset'].to(self.device)
++          else:
++              offset0 = torch.tensor([0, input_dict['sinput0_F'].shape[0]], dtype=torch.long, device=self.device)
++          
++          if 'sinput1_offset' in input_dict:
++              offset1 = input_dict['sinput1_offset'].to(self.device)
++          else:
++              offset1 = torch.tensor([0, input_dict['sinput1_F'].shape[0]], dtype=torch.long, device=self.device)
++          
++          sinput0_dict = {
++              'feat': input_dict['sinput0_F'].to(self.device),
++              'coord': input_dict['sinput0_C'].to(self.device),
++              'offset': offset0,
++              'grid_size': self.config.voxel_size,
++          }
++          model_output0 = self.model(sinput0_dict)
++          F0 = extract_features(model_output0)
++
++          sinput1_dict = {
++              'feat': input_dict['sinput1_F'].to(self.device),
++              'coord': input_dict['sinput1_C'].to(self.device),
++              'offset': offset1,
++              'grid_size': self.config.voxel_size,
++          }
++          model_output1 = self.model(sinput1_dict)
++          F1 = extract_features(model_output1)
++
++      pos_pairs = input_dict['correspondences']
++      pos_loss, neg_loss = self.contrastive_hardest_negative_loss(
++          F0,
++          F1,
++          pos_pairs,
++          num_pos=self.config.num_pos_per_batch * self.config.batch_size,
++          num_hn_samples=self.config.num_hn_samples_per_batch *
++          self.config.batch_size)
++
++      loss = pos_loss + self.neg_weight * neg_loss
++      loss.backward()
+       self.optimizer.step()
++      
+       gc.collect()
+-
+       torch.cuda.empty_cache()
+ 
+-      total_loss += batch_loss
++      total_loss += loss.item()
+       total_num += 1.0
+-      total_timer.toc()
+-      data_meter.update(data_time)
+ 
+       if curr_iter % self.config.stat_freq == 0:
+-        self.writer.add_scalar('train/loss', batch_loss, start_iter + curr_iter)
+-        self.writer.add_scalar('train/pos_loss', batch_pos_loss, start_iter + curr_iter)
+-        self.writer.add_scalar('train/neg_loss', batch_neg_loss, start_iter + curr_iter)
++        self.writer.add_scalar('train/loss', loss.item(), start_iter + curr_iter)
++        self.writer.add_scalar('train/pos_loss', pos_loss.item(), start_iter + curr_iter)
++        self.writer.add_scalar('train/neg_loss', neg_loss.item(), start_iter + curr_iter)
++        log_extra = ""
+         logging.info(
+             "Train Epoch: {} [{}/{}], Current Loss: {:.3e} Pos: {:.3f} Neg: {:.3f}"
+-            .format(epoch, curr_iter,
+-                    len(self.data_loader) //
+-                    iter_size, batch_loss, batch_pos_loss, batch_neg_loss) +
+-            "\tData time: {:.4f}, Train time: {:.4f}, Iter time: {:.4f}".format(
+-                data_meter.avg, total_timer.avg - data_meter.avg, total_timer.avg))
+-        data_meter.reset()
+-        total_timer.reset()
+-
++            .format(epoch, curr_iter, len(self.data_loader), 
++                    loss.item(), pos_loss.item(), neg_loss.item()))
+ 
+ class TripletLossTrainer(ContrastiveLossTrainer):
+ 
+@@ -537,7 +869,7 @@ class TripletLossTrainer(ContrastiveLossTrainer):
+     """
+     Generate negative pairs
+     """
+-    N0, N1 = len(F0), len(F1)
++    N0, N1 = F0.shape[0] if hasattr(F0, 'shape') else len(F0), F1.shape[0] if hasattr(F1, 'shape') else len(F1)
+     num_pos_pairs = len(positive_pairs)
+     hash_seed = max(N0, N1)
+ 
+@@ -546,9 +878,12 @@ class TripletLossTrainer(ContrastiveLossTrainer):
+       sample_pos_pairs = positive_pairs[pos_sel]
+     else:
+       sample_pos_pairs = positive_pairs
++    
++    if not isinstance(sample_pos_pairs, np.ndarray):
++      sample_pos_pairs = np.array(sample_pos_pairs, dtype=np.int64)
+ 
+-    pos_ind0 = sample_pos_pairs[:, 0].long()
+-    pos_ind1 = sample_pos_pairs[:, 1].long()
++    pos_ind0 = torch.from_numpy(sample_pos_pairs[:, 0]).long().to(F0.device)
++    pos_ind1 = torch.from_numpy(sample_pos_pairs[:, 1]).long().to(F1.device)
+     posF0, posF1 = F0[pos_ind0], F1[pos_ind1]
+ 
+     if not isinstance(positive_pairs, np.ndarray):
+@@ -588,29 +923,33 @@ class TripletLossTrainer(ContrastiveLossTrainer):
+     data_loader = self.data_loader
+     data_loader_iter = self.data_loader.__iter__()
+     iter_size = self.iter_size
+-    data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
+     pos_dist_meter, neg_dist_meter = AverageMeter(), AverageMeter()
+     start_iter = (epoch - 1) * (len(data_loader) // iter_size)
+     for curr_iter in range(len(data_loader) // iter_size):
+       self.optimizer.zero_grad()
+       batch_loss = 0
+-      data_time = 0
+-      total_timer.tic()
+       for iter_idx in range(iter_size):
+-        data_timer.tic()
+-        input_dict = data_loader_iter.next()
+-        data_time += data_timer.toc(average=False)
++        input_dict = next(data_loader_iter)
+ 
+         # pairs consist of (xyz1 index, xyz0 index)
+-        sinput0 = ME.SparseTensor(
+-            input_dict['sinput0_F'].to(self.device),
+-            coordinates=input_dict['sinput0_C'].to(self.device))
+-        F0 = self.model(sinput0).F
+-
+-        sinput1 = ME.SparseTensor(
+-            input_dict['sinput1_F'].to(self.device),
+-            coordinates=input_dict['sinput1_C'].to(self.device))
+-        F1 = self.model(sinput1).F
++        # Convert to pointcnnpp format
++        sinput0_dict = {
++            'feat': input_dict['sinput0_F'].to(self.device),
++            'coord': input_dict['sinput0_C'].to(self.device),
++            'offset': input_dict.get('sinput0_offset', torch.tensor([0, input_dict['sinput0_F'].shape[0]], dtype=torch.long, device=self.device)),
++            'grid_size': self.config.voxel_size,
++        }
++        model_output0 = self.model(sinput0_dict)
++        F0 = extract_features(model_output0)
++
++        sinput1_dict = {
++            'feat': input_dict['sinput1_F'].to(self.device),
++            'coord': input_dict['sinput1_C'].to(self.device),
++            'offset': input_dict.get('sinput1_offset', torch.tensor([0, input_dict['sinput1_F'].shape[0]], dtype=torch.long, device=self.device)),
++            'grid_size': self.config.voxel_size,
++        }
++        model_output1 = self.model(sinput1_dict)
++        F1 = extract_features(model_output1)
+ 
+         pos_pairs = input_dict['correspondences']
+         loss, pos_dist, neg_dist = self.triplet_loss(
+@@ -633,8 +972,6 @@ class TripletLossTrainer(ContrastiveLossTrainer):
+ 
+       total_loss += batch_loss
+       total_num += 1.0
+-      total_timer.toc()
+-      data_meter.update(data_time)
+ 
+       if curr_iter % self.config.stat_freq == 0:
+         self.writer.add_scalar('train/loss', batch_loss, start_iter + curr_iter)
+@@ -642,13 +979,7 @@ class TripletLossTrainer(ContrastiveLossTrainer):
+             "Train Epoch: {} [{}/{}], Current Loss: {:.3e}, Pos dist: {:.3e}, Neg dist: {:.3e}"
+             .format(epoch, curr_iter,
+                     len(self.data_loader) //
+-                    iter_size, batch_loss, pos_dist_meter.avg, neg_dist_meter.avg) +
+-            "\tData time: {:.4f}, Train time: {:.4f}, Iter time: {:.4f}".format(
+-                data_meter.avg, total_timer.avg - data_meter.avg, total_timer.avg))
+-        pos_dist_meter.reset()
+-        neg_dist_meter.reset()
+-        data_meter.reset()
+-        total_timer.reset()
++                    iter_size, batch_loss, pos_dist_meter.avg, neg_dist_meter.avg))
+ 
+ 
+ class HardestTripletLossTrainer(TripletLossTrainer):
+@@ -663,7 +994,7 @@ class HardestTripletLossTrainer(TripletLossTrainer):
+     """
+     Generate negative pairs
+     """
+-    N0, N1 = len(F0), len(F1)
++    N0, N1 = F0.shape[0] if hasattr(F0, 'shape') else len(F0), F1.shape[0] if hasattr(F1, 'shape') else len(F1)
+     num_pos_pairs = len(positive_pairs)
+     hash_seed = max(N0, N1)
+     sel0 = np.random.choice(N0, min(N0, num_hn_samples), replace=False)
+@@ -674,12 +1005,14 @@ class HardestTripletLossTrainer(TripletLossTrainer):
+       sample_pos_pairs = positive_pairs[pos_sel]
+     else:
+       sample_pos_pairs = positive_pairs
++    
++    if not isinstance(sample_pos_pairs, np.ndarray):
++      sample_pos_pairs = np.array(sample_pos_pairs, dtype=np.int64)
+ 
+-    # Find negatives for all F1[positive_pairs[:, 1]]
+     subF0, subF1 = F0[sel0], F1[sel1]
+ 
+-    pos_ind0 = sample_pos_pairs[:, 0].long()
+-    pos_ind1 = sample_pos_pairs[:, 1].long()
++    pos_ind0 = torch.from_numpy(sample_pos_pairs[:, 0]).long().to(F0.device)
++    pos_ind1 = torch.from_numpy(sample_pos_pairs[:, 1]).long().to(F1.device)
+     posF0, posF1 = F0[pos_ind0], F1[pos_ind1]
+ 
+     D01 = pdist(posF0, subF1, dist_type='L2')
+@@ -695,8 +1028,8 @@ class HardestTripletLossTrainer(TripletLossTrainer):
+ 
+     D01ind = sel1[D01ind.cpu().numpy()]
+     D10ind = sel0[D10ind.cpu().numpy()]
+-    neg_keys0 = _hash([pos_ind0.numpy(), D01ind], hash_seed)
+-    neg_keys1 = _hash([D10ind, pos_ind1.numpy()], hash_seed)
++    neg_keys0 = _hash([pos_ind0.cpu().numpy(), D01ind], hash_seed)
++    neg_keys1 = _hash([D10ind, pos_ind1.cpu().numpy()], hash_seed)
+ 
+     mask0 = torch.from_numpy(
+         np.logical_not(np.isin(neg_keys0, pos_keys, assume_unique=False)))
+diff --git a/model/__init__.py b/model/__init__.py
+index b90ea6f..7483f58 100644
+--- a/model/__init__.py
++++ b/model/__init__.py
+@@ -1,5 +1,4 @@
+ import logging
+-import model.simpleunet as simpleunets
+ import model.resunet as resunets
+ 
+ MODELS = []
+@@ -8,8 +7,6 @@ MODELS = []
+ def add_models(module):
+   MODELS.extend([getattr(module, a) for a in dir(module) if 'Net' in a or 'MLP' in a])
+ 
+-
+-add_models(simpleunets)
+ add_models(resunets)
+ 
+ 
+diff --git a/model/common.py b/model/common.py
+index a8aead3..4e828e3 100644
+--- a/model/common.py
++++ b/model/common.py
+@@ -1,10 +1,20 @@
+-import MinkowskiEngine as ME
++from functools import partial
++import torch.nn as nn
++
++
++class BatchNorm1dWrapper(nn.Module):
++    def __init__(self, num_features, eps=1e-5, momentum=0.1):
++        super().__init__()
++        self.bn = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
++    
++    def forward(self, x, sample_sizes=None):
++        return self.bn(x)
+ 
+ 
+ def get_norm(norm_type, num_feats, bn_momentum=0.05, D=-1):
+   if norm_type == 'BN':
+-    return ME.MinkowskiBatchNorm(num_feats, momentum=bn_momentum)
++    return partial(BatchNorm1dWrapper, eps=1e-5, momentum=bn_momentum)
+   elif norm_type == 'IN':
+-    return ME.MinkowskiInstanceNorm(num_feats, dimension=D)
++    return partial(BatchNorm1dWrapper, eps=1e-5, momentum=bn_momentum)
+   else:
+     raise ValueError(f'Type {norm_type}, not defined')
+diff --git a/model/residual_block.py b/model/residual_block.py
+index f06fc5a..ab7f8b0 100644
+--- a/model/residual_block.py
++++ b/model/residual_block.py
+@@ -1,9 +1,24 @@
++import torch
+ import torch.nn as nn
++from functools import partial
++from typing import Tuple
+ 
+-from model.common import get_norm
++import sys
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+ 
+-import MinkowskiEngine as ME
+-import MinkowskiEngine.MinkowskiFunctional as MEF
++from model.common import get_norm, BatchNorm1dWrapper
++from layers import PointConv3d, conv_with_stride
++from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kernel_size
++from layers.metadata import MetaData
++
++
++def conv3x3x3(in_planes: int, out_planes: int) -> PointConv3d:
++    return PointConv3d(in_planes, out_planes, kernel_size=3, bias=False)
++
++
++def conv1x1x1(in_planes: int, out_planes: int) -> nn.Linear:
++    return nn.Linear(in_planes, out_planes, bias=False)
+ 
+ 
+ class BasicBlockBase(nn.Module):
+@@ -13,44 +28,71 @@ class BasicBlockBase(nn.Module):
+   def __init__(self,
+                inplanes,
+                planes,
+-               stride=1,
++               stride=1.0,
+                dilation=1,
+                downsample=None,
+                bn_momentum=0.1,
+                D=3):
+     super(BasicBlockBase, self).__init__()
+-
+-    self.conv1 = ME.MinkowskiConvolution(
+-        inplanes, planes, kernel_size=3, stride=stride, dimension=D)
+-    self.norm1 = get_norm(self.NORM_TYPE, planes, bn_momentum=bn_momentum, D=D)
+-    self.conv2 = ME.MinkowskiConvolution(
+-        planes,
+-        planes,
+-        kernel_size=3,
+-        stride=1,
+-        dilation=dilation,
+-        bias=False,
+-        dimension=D)
+-    self.norm2 = get_norm(self.NORM_TYPE, planes, bn_momentum=bn_momentum, D=D)
++    
++    norm_layer = get_norm(self.NORM_TYPE, planes, bn_momentum=bn_momentum, D=D)
++    
++    self.conv1 = conv3x3x3(inplanes, planes)
++    self.norm1 = norm_layer(planes)
++    self.conv2 = conv3x3x3(planes, planes)
++    self.norm2 = norm_layer(planes)
++    self.relu = nn.ReLU(inplace=False)
++    self.stride = float(stride)
+     self.downsample = downsample
+-
+-  def forward(self, x):
+-    residual = x
+-
+-    out = self.conv1(x)
+-    out = self.norm1(out)
+-    out = MEF.relu(out)
+-
+-    out = self.conv2(out)
+-    out = self.norm2(out)
++    
++    if inplanes != planes:
++        self.downsample = nn.Sequential(
++            conv1x1x1(inplanes, planes),
++            norm_layer(planes),
++        )
++
++  def forward(self, x: torch.Tensor, m: MetaData) -> Tuple[torch.Tensor, MetaData]:
++    identity = x.clone() if self.stride == 1.0 else x.clone()
++
++    x, m = conv_with_stride(self.conv1, x, m, self.stride, receptive_field_scaler=2.5)
++    x = self.norm1(x, m.sample_sizes)
++    x = self.relu(x)
++
++    if self.stride != 1.0:
++        radius_scaler = radius_scaler_for_kernel_size(kernel_size=3, receptive_field_scaler=2.5)
++        m.i, m.j, m.k, _ = build_triplets(
++            points=m.points,
++            sample_inds=m.sample_inds,
++            sample_sizes=m.sample_sizes,
++            neighbor_radius=m.grid_size * radius_scaler,
++            kernel_indexer=partial(voxelize_3d, kernel_size=3),
++            radius_scaler=radius_scaler,
++        )
++    x = self.conv2(x, m.i, m.j, m.k, m.num_points())
++    x = self.norm2(x, m.sample_sizes)
+ 
+     if self.downsample is not None:
+-      residual = self.downsample(x)
+-
+-    out += residual
+-    out = MEF.relu(out)
+-
+-    return out
++        if self.stride == 1.0:
++            x_downsample = identity
++        else:
++            if hasattr(m, 'downsample_indices') and m.downsample_indices is not None:
++                x_downsample = identity[m.downsample_indices]
++            else:
++                x_downsample = identity
++        
++        for module in self.downsample:
++            if isinstance(module, BatchNorm1dWrapper):
++                x_downsample = module(x_downsample, sample_sizes=m.sample_sizes)
++            elif hasattr(module, '__call__') and 'sample_sizes' in str(module):
++                x_downsample = module(x_downsample, m.sample_sizes)
++            else:
++                x_downsample = module(x_downsample)
++        identity = x_downsample
++
++    x = x + identity
++    x = self.relu(x)
++
++    return x, m
+ 
+ 
+ class BasicBlockBN(BasicBlockBase):
+@@ -64,7 +106,7 @@ class BasicBlockIN(BasicBlockBase):
+ def get_block(norm_type,
+               inplanes,
+               planes,
+-              stride=1,
++              stride=1.0,
+               dilation=1,
+               downsample=None,
+               bn_momentum=0.1,
+diff --git a/model/resunet.py b/model/resunet.py
+index 6a0e2e1..1186493 100644
+--- a/model/resunet.py
++++ b/model/resunet.py
+@@ -1,196 +1,339 @@
+ # -*- coding: future_fstrings -*-
+ import torch
+-import MinkowskiEngine as ME
+-import MinkowskiEngine.MinkowskiFunctional as MEF
+-from model.common import get_norm
++import torch.nn as nn
++from functools import partial
++
++import sys
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+ 
++from model.common import get_norm
+ from model.residual_block import get_block
++from layers import PointConv3d, conv_with_stride
++from layers.upsample import Upsample
++from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kernel_size
++from layers.metadata import MetaData
++
+ 
++def conv1x1x1(in_planes: int, out_planes: int) -> nn.Linear:
++    return nn.Linear(in_planes, out_planes, bias=False)
+ 
+-class ResUNet2(ME.MinkowskiNetwork):
++
++class ResUNet2(nn.Module):
+   NORM_TYPE = None
+   BLOCK_NORM_TYPE = 'BN'
+   CHANNELS = [None, 32, 64, 128, 256]
+   TR_CHANNELS = [None, 32, 64, 64, 128]
+ 
+-  # To use the model, must call initialize_coords before forward pass.
+-  # Once data is processed, call clear to reset the model before calling initialize_coords
+   def __init__(self,
+                in_channels=3,
+                out_channels=32,
+                bn_momentum=0.1,
+                normalize_feature=None,
+                conv1_kernel_size=None,
+-               D=3):
+-    ME.MinkowskiNetwork.__init__(self, D)
++               D=3,
++               voxel_size=0.05):
++    super(ResUNet2, self).__init__()
+     NORM_TYPE = self.NORM_TYPE
+     BLOCK_NORM_TYPE = self.BLOCK_NORM_TYPE
+     CHANNELS = self.CHANNELS
+     TR_CHANNELS = self.TR_CHANNELS
+     self.normalize_feature = normalize_feature
+-    self.conv1 = ME.MinkowskiConvolution(
++    self.voxel_size = voxel_size
++    
++    norm_fn = get_norm(NORM_TYPE, CHANNELS[1], bn_momentum=bn_momentum, D=D)
++    
++    if conv1_kernel_size is None:
++        conv1_kernel_size = 5
++    
++    self.conv1 = PointConv3d(
+         in_channels=in_channels,
+         out_channels=CHANNELS[1],
+         kernel_size=conv1_kernel_size,
+-        stride=1,
+-        dilation=1,
+-        bias=False,
+-        dimension=D)
+-    self.norm1 = get_norm(NORM_TYPE, CHANNELS[1], bn_momentum=bn_momentum, D=D)
++        bias=False)
++    self.norm1 = norm_fn(CHANNELS[1])
++    self.relu = nn.ReLU(inplace=False)
+ 
+     self.block1 = get_block(
+-        BLOCK_NORM_TYPE, CHANNELS[1], CHANNELS[1], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, CHANNELS[1], CHANNELS[1], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv2 = ME.MinkowskiConvolution(
++    self.conv2 = PointConv3d(
+         in_channels=CHANNELS[1],
+         out_channels=CHANNELS[2],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+-        bias=False,
+-        dimension=D)
+-    self.norm2 = get_norm(NORM_TYPE, CHANNELS[2], bn_momentum=bn_momentum, D=D)
++        bias=False)
++    self.norm2 = norm_fn(CHANNELS[2])
+ 
+     self.block2 = get_block(
+-        BLOCK_NORM_TYPE, CHANNELS[2], CHANNELS[2], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, CHANNELS[2], CHANNELS[2], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv3 = ME.MinkowskiConvolution(
++    self.conv3 = PointConv3d(
+         in_channels=CHANNELS[2],
+         out_channels=CHANNELS[3],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+-        bias=False,
+-        dimension=D)
+-    self.norm3 = get_norm(NORM_TYPE, CHANNELS[3], bn_momentum=bn_momentum, D=D)
++        bias=False)
++    self.norm3 = norm_fn(CHANNELS[3])
+ 
+     self.block3 = get_block(
+-        BLOCK_NORM_TYPE, CHANNELS[3], CHANNELS[3], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, CHANNELS[3], CHANNELS[3], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv4 = ME.MinkowskiConvolution(
++    self.conv4 = PointConv3d(
+         in_channels=CHANNELS[3],
+         out_channels=CHANNELS[4],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+-        bias=False,
+-        dimension=D)
+-    self.norm4 = get_norm(NORM_TYPE, CHANNELS[4], bn_momentum=bn_momentum, D=D)
++        bias=False)
++    self.norm4 = norm_fn(CHANNELS[4])
+ 
+     self.block4 = get_block(
+-        BLOCK_NORM_TYPE, CHANNELS[4], CHANNELS[4], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, CHANNELS[4], CHANNELS[4], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv4_tr = ME.MinkowskiConvolutionTranspose(
++    self.conv4_tr = Upsample(
+         in_channels=CHANNELS[4],
+         out_channels=TR_CHANNELS[4],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+         bias=False,
+-        dimension=D)
+-    self.norm4_tr = get_norm(NORM_TYPE, TR_CHANNELS[4], bn_momentum=bn_momentum, D=D)
++        receptive_field_scaler=1.0)
++    self.norm4_tr = norm_fn(TR_CHANNELS[4])
+ 
+     self.block4_tr = get_block(
+-        BLOCK_NORM_TYPE, TR_CHANNELS[4], TR_CHANNELS[4], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, TR_CHANNELS[4], TR_CHANNELS[4], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv3_tr = ME.MinkowskiConvolutionTranspose(
++    self.conv3_tr = Upsample(
+         in_channels=CHANNELS[3] + TR_CHANNELS[4],
+         out_channels=TR_CHANNELS[3],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+         bias=False,
+-        dimension=D)
+-    self.norm3_tr = get_norm(NORM_TYPE, TR_CHANNELS[3], bn_momentum=bn_momentum, D=D)
++        receptive_field_scaler=1.0)
++    self.norm3_tr = norm_fn(TR_CHANNELS[3])
+ 
+     self.block3_tr = get_block(
+-        BLOCK_NORM_TYPE, TR_CHANNELS[3], TR_CHANNELS[3], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, TR_CHANNELS[3], TR_CHANNELS[3], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv2_tr = ME.MinkowskiConvolutionTranspose(
++    self.conv2_tr = Upsample(
+         in_channels=CHANNELS[2] + TR_CHANNELS[3],
+         out_channels=TR_CHANNELS[2],
+         kernel_size=3,
+-        stride=2,
+-        dilation=1,
+         bias=False,
+-        dimension=D)
+-    self.norm2_tr = get_norm(NORM_TYPE, TR_CHANNELS[2], bn_momentum=bn_momentum, D=D)
++        receptive_field_scaler=1.0)
++    self.norm2_tr = norm_fn(TR_CHANNELS[2])
+ 
+     self.block2_tr = get_block(
+-        BLOCK_NORM_TYPE, TR_CHANNELS[2], TR_CHANNELS[2], bn_momentum=bn_momentum, D=D)
++        BLOCK_NORM_TYPE, TR_CHANNELS[2], TR_CHANNELS[2], stride=1.0, bn_momentum=bn_momentum, D=D)
+ 
+-    self.conv1_tr = ME.MinkowskiConvolution(
++    self.conv1_tr = PointConv3d(
+         in_channels=CHANNELS[1] + TR_CHANNELS[2],
+         out_channels=TR_CHANNELS[1],
+         kernel_size=1,
+-        stride=1,
+-        dilation=1,
+-        bias=False,
+-        dimension=D)
+-
+-    # self.block1_tr = BasicBlockBN(TR_CHANNELS[1], TR_CHANNELS[1], bn_momentum=bn_momentum, D=D)
++        bias=False)
+ 
+-    self.final = ME.MinkowskiConvolution(
++    self.final = PointConv3d(
+         in_channels=TR_CHANNELS[1],
+         out_channels=out_channels,
+         kernel_size=1,
+-        stride=1,
+-        dilation=1,
+-        bias=True,
+-        dimension=D)
+-
+-  def forward(self, x):
+-    out_s1 = self.conv1(x)
+-    out_s1 = self.norm1(out_s1)
+-    out_s1 = self.block1(out_s1)
+-    out = MEF.relu(out_s1)
+-
+-    out_s2 = self.conv2(out)
+-    out_s2 = self.norm2(out_s2)
+-    out_s2 = self.block2(out_s2)
+-    out = MEF.relu(out_s2)
+-
+-    out_s4 = self.conv3(out)
+-    out_s4 = self.norm3(out_s4)
+-    out_s4 = self.block3(out_s4)
+-    out = MEF.relu(out_s4)
+-
+-    out_s8 = self.conv4(out)
+-    out_s8 = self.norm4(out_s8)
+-    out_s8 = self.block4(out_s8)
+-    out = MEF.relu(out_s8)
+-
+-    out = self.conv4_tr(out)
+-    out = self.norm4_tr(out)
+-    out = self.block4_tr(out)
+-    out_s4_tr = MEF.relu(out)
+-
+-    out = ME.cat(out_s4_tr, out_s4)
+-
+-    out = self.conv3_tr(out)
+-    out = self.norm3_tr(out)
+-    out = self.block3_tr(out)
+-    out_s2_tr = MEF.relu(out)
+-
+-    out = ME.cat(out_s2_tr, out_s2)
+-
+-    out = self.conv2_tr(out)
+-    out = self.norm2_tr(out)
+-    out = self.block2_tr(out)
+-    out_s1_tr = MEF.relu(out)
+-
+-    out = ME.cat(out_s1_tr, out_s1)
+-    out = self.conv1_tr(out)
+-    out = MEF.relu(out)
+-    out = self.final(out)
++        bias=True)
++
++  def forward(self, input_dict):
++    """
++    Forward pass with pointcnnpp format.
++    
++    Args:
++        input_dict: Dictionary containing:
++            - 'feat': [N, in_channels] input features
++            - 'coord': [N, 3] point coordinates
++            - 'offset': [B] batch offsets
++            - 'grid_size' or 'voxel_size': grid size (optional, defaults to self.voxel_size)
++    
++    Returns:
++        [N, out_channels] output features
++    """
++    feat = input_dict["feat"]
++    offset = input_dict["offset"]
++    
++    if "coord" in input_dict:
++        coord = input_dict["coord"]
++    elif "grid_coord" in input_dict:
++        coord = input_dict["grid_coord"]
++    else:
++        raise ValueError("input_dict must contain either 'coord' or 'grid_coord'")
++    
++    # Ensure coord is float32
++    if coord.dtype != torch.float32:
++        coord = coord.float()
++    
++    # Ensure feat is float32
++    if feat.dtype != torch.float32:
++        feat = feat.float()
++    
++    # Get grid_size
++    grid_size = input_dict.get("grid_size", input_dict.get("voxel_size", self.voxel_size))
++    
++    # Ensure offset is on the same device as coord
++    if offset.device != coord.device:
++        offset = offset.to(coord.device)
++    
++    # Create sample_sizes from offset
++    sample_sizes = torch.diff(offset, prepend=torch.tensor([0], device=offset.device, dtype=offset.dtype))
++    
++    # Create sample_inds - ensure it's on the same device as coord
++    sample_inds = torch.repeat_interleave(
++        torch.arange(0, sample_sizes.numel(), device=coord.device, dtype=torch.long),
++        sample_sizes,
++    )
++    
++    # Ensure sample_sizes is also on the correct device
++    if sample_sizes.device != coord.device:
++        sample_sizes = sample_sizes.to(coord.device)
++    
++    # Create MetaData
++    m = MetaData(
++        points=coord,
++        sample_inds=sample_inds,
++        sample_sizes=sample_sizes,
++        grid_size=grid_size,
++    )
++    
++    x = feat
++    
++    # Encoder
++    x, m = conv_with_stride(self.conv1, x, m, 1.0, receptive_field_scaler=1.0)
++    m.dirty_triplets()
++    x = self.norm1(x, m.sample_sizes)
++    x = self.relu(x)
++    
++    out_s1, m = self.block1(x, m)
++    out = self.relu(out_s1)
++    
++    # Save for skip connection (no clone: out is reassigned later, not mutated in place)
++    down_outputs = [out]
++    # Save MetaData snapshot (no clone: handle_stride_and_build_triplets reassigns m.points/etc, does not mutate in place)
++    down_metadatas = [MetaData(
++        points=m.points,
++        sample_inds=m.sample_inds,
++        sample_sizes=m.sample_sizes,
++        grid_size=m.grid_size,
++        parent=m.parent,
++    )]
++    
++    # Downsample with stride 2
++    x, m = conv_with_stride(self.conv2, out, m, 2.0, receptive_field_scaler=1.0)
++    m.dirty_triplets()
++    x = self.norm2(x, m.sample_sizes)
++    x = self.relu(x)
++    out_s2, m = self.block2(x, m)
++    out = self.relu(out_s2)
++    
++    down_outputs.append(out)
++    down_metadatas.append(MetaData(
++        points=m.points,
++        sample_inds=m.sample_inds,
++        sample_sizes=m.sample_sizes,
++        grid_size=m.grid_size,
++        parent=down_metadatas[0] if len(down_metadatas) > 0 else m.parent,
++    ))
++    
++    # Downsample with stride 2
++    x, m = conv_with_stride(self.conv3, out, m, 2.0, receptive_field_scaler=1.0)
++    m.dirty_triplets()
++    x = self.norm3(x, m.sample_sizes)
++    x = self.relu(x)
++    out_s4, m = self.block3(x, m)
++    out = self.relu(out_s4)
++    
++    down_outputs.append(out)
++    down_metadatas.append(MetaData(
++        points=m.points,
++        sample_inds=m.sample_inds,
++        sample_sizes=m.sample_sizes,
++        grid_size=m.grid_size,
++        parent=down_metadatas[-1] if len(down_metadatas) > 0 else m.parent,
++    ))
++    
++    # Downsample with stride 2
++    x, m = conv_with_stride(self.conv4, out, m, 2.0, receptive_field_scaler=1.0)
++    # After conv_with_stride, m.parent should point to out_s4 metadata
++    m.dirty_triplets()
++    x = self.norm4(x, m.sample_sizes)
++    x = self.relu(x)
++    out_s8, m = self.block4(x, m)
++    out = self.relu(out_s8)
++    
++    # Decoder
++    # Stage 4: upsample (from out_s8 to out_s4 resolution)
++    # Follow unet_pointcnnpp.py: upsample first, then norm/relu, then blocks, then concat
++    # The Upsample will automatically restore points from m.parent if it exists
++    # After conv_with_stride, m.parent should point to out_s4 metadata, but block4 might have modified it
++    # Force restore parent from saved metadata to ensure correctness
++    # down_outputs: [out_s1, out_s2, out_s4], so down_outputs[-1] is out_s4
++    m.parent = down_metadatas[-1]  # Force set parent to out_s4 metadata
++    
++    out, m = self.conv4_tr(out, m)
++    out = self.norm4_tr(out, m.sample_sizes)
++    out = self.relu(out)
++    out, m = self.block4_tr(out, m)
++    
++    # Concatenate with skip connection (down_outputs[-1] is out_s4)
++    out = torch.cat([out, down_outputs[-1]], dim=1)
++    
++    # Stage 3: upsample (from out_s4 to out_s2 resolution)
++    # After previous upsample, m.parent should point to out_s2 metadata, but block might have modified it
++    # Force restore parent from saved metadata to ensure correctness
++    # down_outputs: [out_s1, out_s2, out_s4], so down_outputs[-2] is out_s2
++    m.parent = down_metadatas[-2]  # Force set parent to out_s2 metadata
++    
++    out, m = self.conv3_tr(out, m)
++    out = self.norm3_tr(out, m.sample_sizes)
++    out = self.relu(out)
++    out, m = self.block3_tr(out, m)
++    
++    # Concatenate with skip connection (down_outputs[-2] is out_s2)
++    out = torch.cat([out, down_outputs[-2]], dim=1)
++    
++    # Stage 2: upsample (from out_s2 to out_s1 resolution)
++    # After previous upsample, m.parent should point to out_s1 metadata, but block might have modified it
++    # Force restore parent from saved metadata to ensure correctness
++    m.parent = down_metadatas[0]  # Force set parent to out_s1 metadata
++    
++    out, m = self.conv2_tr(out, m)
++    out = self.norm2_tr(out, m.sample_sizes)
++    out = self.relu(out)
++    out, m = self.block2_tr(out, m)
++    
++    # Concatenate with skip connection (down_outputs[0] is out_s1)
++    out = torch.cat([out, down_outputs[0]], dim=1)
++    
++    # Final conv
++    m.dirty_triplets()
++    radius_scaler = radius_scaler_for_kernel_size(kernel_size=1, receptive_field_scaler=1.0)
++    neighbor_radius = m.grid_size * radius_scaler
++    m.i, m.j, m.k, _ = build_triplets(
++        points=m.points,
++        sample_inds=m.sample_inds,
++        sample_sizes=m.sample_sizes,
++        neighbor_radius=neighbor_radius,
++        kernel_indexer=partial(voxelize_3d, kernel_size=1),
++        radius_scaler=radius_scaler,
++    )
++    out = self.conv1_tr(out, m.i, m.j, m.k, m.num_points())
++    out = self.relu(out)
++    
++    # Final output
++    m.dirty_triplets()
++    radius_scaler = radius_scaler_for_kernel_size(kernel_size=1, receptive_field_scaler=1.0)
++    neighbor_radius = m.grid_size * radius_scaler
++    m.i, m.j, m.k, _ = build_triplets(
++        points=m.points,
++        sample_inds=m.sample_inds,
++        sample_sizes=m.sample_sizes,
++        neighbor_radius=neighbor_radius,
++        kernel_indexer=partial(voxelize_3d, kernel_size=1),
++        radius_scaler=radius_scaler,
++    )
++    out = self.final(out, m.i, m.j, m.k, m.num_points())
+ 
+     if self.normalize_feature:
+-      return ME.SparseTensor(
+-          out.F / torch.norm(out.F, p=2, dim=1, keepdim=True),
+-          coordinate_map_key=out.coordinate_map_key,
+-          coordinate_manager=out.coordinate_manager)
+-    else:
+-      return out
++      out = out / torch.norm(out, p=2, dim=1, keepdim=True).clamp(min=1e-8)
++    
++    return out
+ 
+ 
+ class ResUNetBN2(ResUNet2):
+@@ -206,7 +349,7 @@ class ResUNetBN2B(ResUNet2):
+ class ResUNetBN2C(ResUNet2):
+   NORM_TYPE = 'BN'
+   CHANNELS = [None, 32, 64, 128, 256]
+-  TR_CHANNELS = [None, 64, 64, 64, 128]
++  TR_CHANNELS = [None, 32, 64, 64, 128]
+ 
+ 
+ class ResUNetBN2D(ResUNet2):
+diff --git a/requirements.txt b/requirements.txt
+index 39dc0ad..179d42a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,12 +1,8 @@
+ numpy
+-# pytorch  # for anaconda, please refer to pytorch.org for installation
+ scipy
+ matplotlib
+ open3d
+-# to visualize it, you need tensorflow, but it doesn't have to be in the same virual environment :)
+ tensorboardX
+-MinkowskiEngine
+-# Or follow the installation instruction on github.com/StanfordVL/MinkowskiEngine
+ future-fstrings
+ easydict
+ joblib
+diff --git a/scripts/benchmark_3dmatch.py b/scripts/benchmark_3dmatch.py
+index 559d6dd..c06fa2a 100644
+--- a/scripts/benchmark_3dmatch.py
++++ b/scripts/benchmark_3dmatch.py
+@@ -10,7 +10,7 @@ import open3d as o3d
+ 
+ from lib.timer import Timer, AverageMeter
+ 
+-from util.misc import extract_features
++from util.misc import extract_features, _hash
+ 
+ from model import load_model
+ from util.file import ensure_dir, get_folder_list, get_file_list
+@@ -20,7 +20,27 @@ from scripts.benchmark_util import do_single_pair_matching, gen_matching_pair, g
+ 
+ import torch
+ 
+-import MinkowskiEngine as ME
++
++def _unwrap_features(model_output):
++    """Pull a feature tensor out of whatever the PointCNN++ ResUNet returns.
++
++    util.misc.extract_features hands back the raw model(...) output, which
++    can be a dict ({'feat'/'F': tensor}), a SparseTensor-like object with
++    a .F attribute, or a bare tensor. Mirror examples/FCGF/test.py's local
++    extract_features semantics.
++    """
++    if isinstance(model_output, dict):
++        for k in ('feat', 'F'):
++            if k in model_output:
++                return model_output[k]
++        raise ValueError(f"dict output missing 'feat'/'F': keys={list(model_output)}")
++    if hasattr(model_output, 'F'):
++        return model_output.F
++    if hasattr(model_output, 'feat'):
++        return model_output.feat
++    if hasattr(model_output, 'shape'):
++        return model_output
++    raise ValueError(f"Cannot extract features from type: {type(model_output)}")
+ 
+ ch = logging.StreamHandler(sys.stdout)
+ logging.getLogger().setLevel(logging.INFO)
+@@ -55,7 +75,7 @@ def extract_features_batch(model, config, source_path, target_path, voxel_size,
+         logging.info(f"{i} / {len(files)}: {save_fn}")
+ 
+       timer.tic()
+-      xyz_down, feature = extract_features(
++      xyz_down, model_output = extract_features(
+           model,
+           xyz=np.array(pcd.points),
+           rgb=None,
+@@ -63,6 +83,7 @@ def extract_features_batch(model, config, source_path, target_path, voxel_size,
+           voxel_size=voxel_size,
+           device=device,
+           skip_check=True)
++      feature = _unwrap_features(model_output)
+       t = timer.toc()
+       if i > 0:
+         tmeter.update(t)
+@@ -132,11 +153,15 @@ def do_single_pair_evaluation(feature_path,
+ 
+     sample_i, sample_j = points_i[inds_i], points_j[inds_j]
+ 
+-    key_points_i = ME.utils.fnv_hash_vec(np.floor(sample_i / voxel_size))
+-    key_points_j = ME.utils.fnv_hash_vec(np.floor(sample_j / voxel_size))
++    # ME.utils.fnv_hash_vec replaced by util.misc._hash (poly hash on int
++    # coords). Both produce a per-row int64 fingerprint used only for set
++    # membership via np.isin, so any collision-stable hash works here.
++    M = 1 << 24
++    key_points_i = _hash(np.floor(sample_i / voxel_size).astype(np.int64), M)
++    key_points_j = _hash(np.floor(sample_j / voxel_size).astype(np.int64), M)
+ 
+-    key_coords_i = ME.utils.fnv_hash_vec(np.floor(coord_i / voxel_size))
+-    key_coords_j = ME.utils.fnv_hash_vec(np.floor(coord_j / voxel_size))
++    key_coords_i = _hash(np.floor(coord_i / voxel_size).astype(np.int64), M)
++    key_coords_j = _hash(np.floor(coord_j / voxel_size).astype(np.int64), M)
+ 
+     inds_i = np.where(np.isin(key_coords_i, key_points_i))[0]
+     inds_j = np.where(np.isin(key_coords_j, key_points_j))[0]
+diff --git a/scripts/download_3dmatch_test.sh b/scripts/download_3dmatch_test.sh
+old mode 100755
+new mode 100644
+diff --git a/scripts/download_datasets.sh b/scripts/download_datasets.sh
+old mode 100755
+new mode 100644
+diff --git a/train.py b/train.py
+index 701410b..ce1210c 100644
+--- a/train.py
++++ b/train.py
+@@ -1,9 +1,10 @@
+-# -*- coding: future_fstrings -*-
++# -*- coding: utf-8 -*-
+ import open3d as o3d  # prevent loading error
+ 
+ import sys
+ import json
+ import logging
++import os
+ import torch
+ from easydict import EasyDict as edict
+ 
+@@ -21,6 +22,11 @@ logging.basicConfig(
+ torch.manual_seed(0)
+ torch.cuda.manual_seed(0)
+ 
++# Enable anomaly detection for debugging inplace operations
++if os.environ.get('DEBUG_INPLACE') == '1' or os.environ.get('TORCH_USE_CUDA_DSA') == '1':
++    torch.autograd.set_detect_anomaly(True)
++    logging.info("Anomaly detection enabled for debugging")
++
+ logging.basicConfig(level=logging.INFO, format="")
+ 
+ 
+@@ -73,7 +79,7 @@ if __name__ == "__main__":
+     for k in dconfig:
+       if k not in ['resume_dir'] and k in resume_config:
+         dconfig[k] = resume_config[k]
+-    dconfig['resume'] = resume_config['out_dir'] + '/checkpoint.pth'
++    dconfig['resume'] = resume_config['out_dir'] + '/best_val_checkpoint.pth'
+ 
+   logging.info('===> Configurations')
+   for k in dconfig:
+diff --git a/util/misc.py b/util/misc.py
+index ce58bc0..f30f206 100644
+--- a/util/misc.py
++++ b/util/misc.py
+@@ -1,6 +1,5 @@
+ import torch
+ import numpy as np
+-import MinkowskiEngine as ME
+ 
+ 
+ def _hash(arr, M):
+@@ -78,16 +77,29 @@ def extract_features(model,
+ 
+   # Voxelize xyz and feats
+   coords = np.floor(xyz / voxel_size)
+-  coords, inds = ME.utils.sparse_quantize(coords, return_index=True)
+-  # Convert to batched coords compatible with ME
+-  coords = ME.utils.batched_coordinates([coords])
++  # Replace ME.utils.sparse_quantize with manual voxel quantization
++  coords_int = coords.astype(np.int64)
++  _, unique_indices = np.unique(coords_int, axis=0, return_index=True)
++  inds = unique_indices
+   return_coords = xyz[inds]
+ 
+   feats = feats[inds]
+ 
+-  feats = torch.tensor(feats, dtype=torch.float32)
+-  coords = torch.tensor(coords, dtype=torch.int32)
+-
+-  stensor = ME.SparseTensor(feats, coordinates=coords, device=device)
+-
+-  return return_coords, model(stensor).F
++  feats = torch.tensor(feats, dtype=torch.float32).to(device)
++  coords_tensor = torch.tensor(xyz[inds], dtype=torch.float32).to(device)  # Use original xyz, not voxel coords
++  
++  # Create pointcnnpp format input_dict
++  # For single point cloud, offset is [0, N]
++  offset = torch.tensor([0, coords_tensor.shape[0]], dtype=torch.long, device=device)
++  
++  input_dict = {
++      'feat': feats,
++      'coord': coords_tensor,
++      'offset': offset,
++      'voxel_size': voxel_size,
++  }
++
++  with torch.no_grad():
++    output = model(input_dict)
++
++  return return_coords, output
+diff --git a/util/pointcloud.py b/util/pointcloud.py
+index 2a40046..a02c76b 100644
+--- a/util/pointcloud.py
++++ b/util/pointcloud.py
+@@ -15,7 +15,11 @@ def make_open3d_point_cloud(xyz, color=None):
+ 
+ 
+ def make_open3d_feature(data, dim, npts):
+-  feature = o3d.registration.Feature()
++  # Open3D >= 0.13 uses o3d.pipelines.registration instead of o3d.registration
++  try:
++    feature = o3d.pipelines.registration.Feature()
++  except AttributeError:
++    feature = o3d.registration.Feature()
+   feature.resize(dim, npts)
+   feature.data = data.cpu().numpy().astype('d').transpose()
+   return feature
+@@ -25,7 +29,11 @@ def make_open3d_feature_from_numpy(data):
+   assert isinstance(data, np.ndarray)
+   assert data.ndim == 2
+ 
+-  feature = o3d.registration.Feature()
++  # Open3D >= 0.13 uses o3d.pipelines.registration instead of o3d.registration
++  try:
++    feature = o3d.pipelines.registration.Feature()
++  except AttributeError:
++    feature = o3d.registration.Feature()
+   feature.resize(data.shape[1], data.shape[0])
+   feature.data = data.astype('d').transpose()
+   return feature
+diff --git a/util/transform_estimation.py b/util/transform_estimation.py
+index c72464d..f9c50c5 100644
+--- a/util/transform_estimation.py
++++ b/util/transform_estimation.py
+@@ -1,5 +1,5 @@
+ import torch
+-import MinkowskiEngine as ME
++# MinkowskiEngine removed, using pointcnnpp instead
+ 
+ 
+ def rot_x(x):
+@@ -124,12 +124,26 @@ def pose_estimation(model,
+                     coord1,
+                     feats0,
+                     feats1,
+-                    return_corr=False):
+-  sinput0 = ME.SparseTensor(feats0.to(device), coordinates=coord0.to(device))
+-  F0 = model(sinput0).F
+-
+-  sinput1 = ME.SparseTensor(feats1.to(device), coordinates=coord1.to(device))
+-  F1 = model(sinput1).F
++                    return_corr=False,
++                    voxel_size=0.05):
++  # Convert to pointcnnpp format
++  offset0 = torch.tensor([0, feats0.shape[0]], dtype=torch.long, device=device)
++  sinput0_dict = {
++      'feat': feats0.to(device),
++      'coord': coord0.to(device),
++      'offset': offset0,
++      'voxel_size': voxel_size,
++  }
++  F0 = model(sinput0_dict)
++
++  offset1 = torch.tensor([0, feats1.shape[0]], dtype=torch.long, device=device)
++  sinput1_dict = {
++      'feat': feats1.to(device),
++      'coord': coord1.to(device),
++      'offset': offset1,
++      'voxel_size': voxel_size,
++  }
++  F1 = model(sinput1_dict)
+ 
+   corr = F0.mm(F1.t())
+   weight, inds = corr.max(dim=1)

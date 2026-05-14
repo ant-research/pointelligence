@@ -1,0 +1,4 @@
+0612340ead256adb5449da8088f506e947e44b4c
+# https://github.com/chrischoy/FCGF.git
+# branch: master (HEAD as of 2026-04-30 — chrischoy/FCGF dormant since v0.5)
+# Verify with: git -C examples/FCGF rev-parse HEAD

@@ -1,0 +1,306 @@
+diff --git a/libs/pointops/setup.py b/libs/pointops/setup.py
+index 0cdf07b..c8bfec1 100644
+--- a/libs/pointops/setup.py
++++ b/libs/pointops/setup.py
+@@ -3,6 +3,28 @@ from setuptools import setup
+ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+ from distutils.sysconfig import get_config_vars
+ 
++# Add Conda CUDA nvvm/bin to PATH if it exists (needed for cicc)
++# Also set CUDA_HOME to help PyTorch find the CUDA toolchain
++if "CONDA_PREFIX" in os.environ:
++    conda_prefix = os.environ["CONDA_PREFIX"]
++    nvvm_bin = os.path.join(conda_prefix, "nvvm", "bin")
++    if os.path.exists(nvvm_bin):
++        current_path = os.environ.get("PATH", "")
++        if nvvm_bin not in current_path:
++            os.environ["PATH"] = f"{nvvm_bin}:{current_path}"
++            print(f"Added {nvvm_bin} to PATH for CUDA toolchain")
++    
++    # Set CUDA_HOME to Conda CUDA if not already set
++    if "CUDA_HOME" not in os.environ:
++        # Check if targets/x86_64-linux exists (Conda CUDA structure)
++        conda_cuda = os.path.join(conda_prefix, "targets", "x86_64-linux")
++        if os.path.exists(conda_cuda):
++            os.environ["CUDA_HOME"] = conda_cuda
++            print(f"Set CUDA_HOME to {conda_cuda}")
++        elif os.path.exists(os.path.join(conda_prefix, "bin", "nvcc")):
++            os.environ["CUDA_HOME"] = conda_prefix
++            print(f"Set CUDA_HOME to {conda_prefix}")
++
+ (opt,) = get_config_vars("OPT")
+ os.environ["OPT"] = " ".join(
+     flag for flag in opt.split() if flag != "-Wstrict-prototypes"
+diff --git a/libs/pointops2/setup.py b/libs/pointops2/setup.py
+index b33cb3b..2915ec8 100644
+--- a/libs/pointops2/setup.py
++++ b/libs/pointops2/setup.py
+@@ -3,6 +3,28 @@ from setuptools import setup
+ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+ from distutils.sysconfig import get_config_vars
+ 
++# Add Conda CUDA nvvm/bin to PATH if it exists (needed for cicc)
++# Also set CUDA_HOME to help PyTorch find the CUDA toolchain
++if "CONDA_PREFIX" in os.environ:
++    conda_prefix = os.environ["CONDA_PREFIX"]
++    nvvm_bin = os.path.join(conda_prefix, "nvvm", "bin")
++    if os.path.exists(nvvm_bin):
++        current_path = os.environ.get("PATH", "")
++        if nvvm_bin not in current_path:
++            os.environ["PATH"] = f"{nvvm_bin}:{current_path}"
++            print(f"Added {nvvm_bin} to PATH for CUDA toolchain")
++    
++    # Set CUDA_HOME to Conda CUDA if not already set
++    if "CUDA_HOME" not in os.environ:
++        # Check if targets/x86_64-linux exists (Conda CUDA structure)
++        conda_cuda = os.path.join(conda_prefix, "targets", "x86_64-linux")
++        if os.path.exists(conda_cuda):
++            os.environ["CUDA_HOME"] = conda_cuda
++            print(f"Set CUDA_HOME to {conda_cuda}")
++        elif os.path.exists(os.path.join(conda_prefix, "bin", "nvcc")):
++            os.environ["CUDA_HOME"] = conda_prefix
++            print(f"Set CUDA_HOME to {conda_prefix}")
++
+ (opt,) = get_config_vars("OPT")
+ os.environ["OPT"] = " ".join(
+     flag for flag in opt.split() if flag != "-Wstrict-prototypes"
+diff --git a/pointcept/models/masked_scene_contrast/masked_scene_contrast_v1m2_csc.py b/pointcept/models/masked_scene_contrast/masked_scene_contrast_v1m2_csc.py
+index 435689e..4a46092 100644
+--- a/pointcept/models/masked_scene_contrast/masked_scene_contrast_v1m2_csc.py
++++ b/pointcept/models/masked_scene_contrast/masked_scene_contrast_v1m2_csc.py
+@@ -14,10 +14,11 @@ import torch.distributed as dist
+ from torch_geometric.nn.pool import voxel_grid
+ 
+ from timm.layers import trunc_normal_
+-import pointops
+ 
+ from pointcept.models.builder import MODELS, build_model
+-from pointcept.models.utils import offset2batch
++from pointcept.models.utils import offset2batch, offset2bincount
++from pointcept.models.pointcloud_operator.radius_search_gpt.radius_search import radius_search
++from pointcept.models.pointcloud_operator.utils.point import bincount2index
+ from pointcept.utils.comm import get_world_size
+ 
+ 
+@@ -33,7 +34,7 @@ class MaskedSceneContrast(nn.Module):
+         view1_mix_prob=0,
+         view2_mix_prob=0,
+         matching_max_k=8,
+-        matching_max_radius=0.03,
++        matching_max_radius=None,  # 如果为 None，自动设置为 mask_grid_size * 2
+         matching_max_pair=8192,
+         nce_t=0.4,
+         contrast_weight=1,
+@@ -51,7 +52,11 @@ class MaskedSceneContrast(nn.Module):
+         self.view1_mix_prob = view1_mix_prob
+         self.view2_mix_prob = view2_mix_prob
+         self.matching_max_k = matching_max_k
+-        self.matching_max_radius = matching_max_radius
++        # 如果 matching_max_radius 未指定，自动设置为 mask_grid_size 的 2 倍
++        if matching_max_radius is None:
++            self.matching_max_radius = mask_grid_size * 2.0
++        else:
++            self.matching_max_radius = matching_max_radius
+         self.matching_max_pair = matching_max_pair
+         self.nce_t = nce_t
+         self.contrast_weight = contrast_weight
+@@ -152,31 +157,36 @@ class MaskedSceneContrast(nn.Module):
+     def match_contrastive_pair(
+         self, view1_coord, view1_offset, view2_coord, view2_offset, max_k, max_radius
+     ):
+-        index, distance = pointops.knn_query(
+-            max_k,
+-            view2_coord.float(),
+-            view2_offset.int(),
+-            view1_coord.float(),
+-            view1_offset.int(),
++        # 使用 radius_search 替换 knn_query，利用原始坐标的精确性进行空间一致性匹配
++        # radius_search 参数：points (被搜索的点集), query_points (查询点集), radius
++        # view1_coord 是 query，view2_coord 是 points（要搜索的点集合）
++        # 将offset转换为bincount，再转换为sample_inds格式（与PointOps一致）
++        view2_bincount = offset2bincount(view2_offset)
++        view1_bincount = offset2bincount(view1_offset)
++        neighbors, num_neighbors = radius_search(
++            points=view2_coord.float(),  # 被搜索的点集（view2）
++            query_points=view1_coord.float(),  # 查询点集（view1）
++            radius=max_radius,  # 直接使用max_radius，更精确的空间一致性约束
++            sample_inds=bincount2index(view2_bincount),  # 转换为sample_inds格式
++            query_sample_inds=bincount2index(view1_bincount),  # 转换为sample_inds格式
++            return_distances=False,
+         )
+-        index = torch.cat(
+-            [
+-                torch.arange(index.shape[0], device=index.device, dtype=torch.long)
+-                .view(-1, 1, 1)
+-                .expand(-1, max_k, 1),
+-                index.view(-1, max_k, 1),
+-            ],
+-            dim=-1,
+-        )[distance.squeeze(-1) < max_radius]
+-        unique, count = index[:, 0].unique(return_counts=True)
+-        select = (
+-            torch.cumsum(count, dim=0)
+-            - torch.randint(count.max(), count.shape, device=count.device) % count
+-            - 1
++        
++        # 构建 query_idx：每个query点的索引需要重复num_neighbors次
++        num_queries = view1_coord.shape[0]
++        query_idx = torch.repeat_interleave(
++            torch.arange(num_queries, device=neighbors.device, dtype=torch.long),
++            num_neighbors.long()
+         )
+-        index = index[select]
++        
++        # 组合成 [query_idx, neighbor_idx] 格式，与原始代码兼容
++        index = torch.stack([query_idx, neighbors.long()], dim=1)  # [total_matches, 2]
++        
++        # radius_search 已经返回了所有在半径内的邻居，不需要 max_k 限制
++        # 如果总数超过 matching_max_pair，进行全局随机采样（更简单高效）
+         if index.shape[0] > self.matching_max_pair:
+-            index = index[torch.randperm(index.shape[0])[: self.matching_max_pair]]
++            index = index[torch.randperm(index.shape[0], device=index.device)[: self.matching_max_pair]]
++        
+         return index
+ 
+     def compute_partitions(self, coord1, coord2):
+@@ -300,7 +310,7 @@ class MaskedSceneContrast(nn.Module):
+             offset=view2_offset,
+         )
+ 
+-        # SparseConv based method need grid coord
++        # SparseConv based method (e.g., MinkUNet) need grid_coord
+         if "view1_grid_coord" in data_dict.keys():
+             view1_data_dict["grid_coord"] = data_dict["view1_grid_coord"]
+         if "view2_grid_coord" in data_dict.keys():
+diff --git a/pointcept/models/modules.py b/pointcept/models/modules.py
+index f4d3230..2869c1b 100644
+--- a/pointcept/models/modules.py
++++ b/pointcept/models/modules.py
+@@ -1,25 +1,32 @@
+ import sys
+ import torch.nn as nn
+-import spconv.pytorch as spconv
+ 
+ try:
+     import ocnn
+ except ImportError:
+     ocnn = None
+ 
++try:
++    import spconv.pytorch as spconv
++except ImportError:
++    spconv = None
++
+ from collections import OrderedDict
+ from pointcept.models.utils.structure import Point
+ from pointcept.engines.hooks import HookBase
+ 
+ 
+ def is_ocnn_module(module):
+-    ocnn_modules = (
+-        ocnn.nn.OctreeConv,
+-        ocnn.nn.OctreeDeconv,
+-        ocnn.nn.OctreeGroupConv,
+-        ocnn.nn.OctreeDWConv,
+-    )
+-    return isinstance(module, ocnn_modules)
++    if ocnn is not None:
++        ocnn_modules = (
++            ocnn.nn.OctreeConv,
++            ocnn.nn.OctreeDeconv,
++            ocnn.nn.OctreeGroupConv,
++            ocnn.nn.OctreeDWConv,
++        )
++        return isinstance(module, ocnn_modules)
++    else:
++        return False
+ 
+ 
+ class PointModule(nn.Module):
+@@ -78,7 +85,7 @@ class PointSequential(PointModule):
+             if isinstance(module, PointModule):
+                 input = module(input)
+             # Spconv module
+-            elif spconv.modules.is_spconv_module(module):
++            elif spconv is not None and spconv.modules.is_spconv_module(module):
+                 if isinstance(input, Point):
+                     input.sparse_conv_feat = module(input.sparse_conv_feat)
+                     input.feat = input.sparse_conv_feat.features
+@@ -100,7 +107,7 @@ class PointSequential(PointModule):
+                         input.sparse_conv_feat = input.sparse_conv_feat.replace_feature(
+                             input.feat
+                         )
+-                elif isinstance(input, spconv.SparseConvTensor):
++                elif spconv is not None and isinstance(input, spconv.SparseConvTensor):
+                     if input.indices.shape[0] != 0:
+                         input = input.replace_feature(module(input.features))
+                 else:
+diff --git a/pointcept/models/point_group/__init__.py b/pointcept/models/point_group/__init__.py
+index 5d9f35f..e473508 100644
+--- a/pointcept/models/point_group/__init__.py
++++ b/pointcept/models/point_group/__init__.py
+@@ -1 +1,2 @@
+-from .point_group_v1m1_base import PointGroup
++from .point_group_v1m1_base import *
++from .point_group_v1m2_custom_criteria import *
+diff --git a/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py b/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
+index 573ae10..a0e91c7 100644
+--- a/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
++++ b/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
+@@ -16,7 +16,10 @@ from timm.layers import DropPath
+ 
+ try:
+     import flash_attn
+-except ImportError:
++except (ImportError, OSError, RuntimeError):
++    # ImportError: 模块未安装
++    # OSError: 符号未定义等系统级错误
++    # RuntimeError: 运行时错误
+     flash_attn = None
+ 
+ from pointcept.models.point_prompt_training import PDNorm
+diff --git a/pointcept/models/utils/structure.py b/pointcept/models/utils/structure.py
+index 1e8e80a..889f0c6 100644
+--- a/pointcept/models/utils/structure.py
++++ b/pointcept/models/utils/structure.py
+@@ -1,5 +1,9 @@
+ import torch
+-import spconv.pytorch as spconv
++
++try:
++    import spconv.pytorch as spconv
++except ImportError:
++    spconv = None
+ 
+ try:
+     import ocnn
+@@ -120,6 +124,7 @@ class Point(Dict):
+ 
+         pad: padding sparse for sparse shape.
+         """
++        assert spconv is not None, "spconv is required for sparsify() method. Please install spconv."
+         assert {"feat", "batch"}.issubset(self.keys())
+         if "grid_coord" not in self.keys():
+             # if you don't want to operate GridSampling in data augmentation,
+diff --git a/pointcept/utils/config.py b/pointcept/utils/config.py
+index 762ebf4..ddeb9a7 100644
+--- a/pointcept/utils/config.py
++++ b/pointcept/utils/config.py
+@@ -493,7 +493,16 @@ class Config:
+             blank_line_before_nested_class_or_def=True,
+             split_before_expression_after_opening_paren=True,
+         )
+-        text, _ = FormatCode(text, style_config=yapf_style)
++        try:
++            text, _ = FormatCode(text, style_config=yapf_style)
++        except Exception:
++            # Repr of values like generators (`<generator object ... at 0x...>`)
++            # or other non-Python-syntax tokens that survive _format_dict make
++            # yapf raise YapfError. Fall back to the unformatted dump — the
++            # logger consumer (train.py / test.py) only prints it informationally,
++            # and a SemSegTester crash on a logging line should not kill an
++            # otherwise-finished training run.
++            pass
+ 
+         return text
+ 

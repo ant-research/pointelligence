@@ -1,0 +1,18 @@
+diff --git a/lib/eval.py b/lib/eval.py
+index 4afa0ef..2f5bc9c 100644
+--- a/lib/eval.py
++++ b/lib/eval.py
+@@ -8,7 +8,12 @@ from scipy.spatial import cKDTree
+ 
+ def find_nn_cpu(feat0, feat1, return_distance=False):
+   feat1tree = cKDTree(feat1)
+-  dists, nn_inds = feat1tree.query(feat0, k=1, n_jobs=-1)
++  # scipy>=1.6 renamed `n_jobs` -> `workers`. Try the modern arg first;
++  # fall back to legacy on older scipy installs.
++  try:
++    dists, nn_inds = feat1tree.query(feat0, k=1, workers=-1)
++  except TypeError:
++    dists, nn_inds = feat1tree.query(feat0, k=1, n_jobs=-1)
+   if return_distance:
+     return nn_inds, dists
+   else:

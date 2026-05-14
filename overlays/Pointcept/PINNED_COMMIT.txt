@@ -1,0 +1,4 @@
+96e109d103418a5daaa375c50e1665b9f04f4a4b
+# https://github.com/Pointcept/Pointcept.git
+# tag: v1.6.0
+# Verify with: git -C examples/Pointcept rev-parse HEAD
