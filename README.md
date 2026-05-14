@@ -101,17 +101,12 @@ git clone --recursive https://github.com/ant-research/pointelligence.git
 cd pointelligence
 ```
 
-For reproducibility, checkout the following commits in the submodules:
+If you cloned without `--recursive`, run `git submodule update --init --recursive` to fetch the submodules. The submodules pin upstream-pristine commits of [chrischoy/FCGF](https://github.com/chrischoy/FCGF) and [Pointcept/Pointcept](https://github.com/Pointcept/Pointcept); PointCNN++-specific adaptations are applied via the overlay system (see [`docs/reproduction/00_setup_overlay.md`](docs/reproduction/00_setup_overlay.md)):
 
 ```shell
-# FCGF (examples/FCGF)
-cd examples/FCGF && git checkout pointcnnpp-version && cd ../..
-
-# Pointcept (examples/Pointcept)
-cd examples/Pointcept && git checkout pointcnnpp-version && cd ../..
+bash overlays/FCGF/apply.sh examples/FCGF
+bash overlays/Pointcept/apply.sh examples/Pointcept
 ```
-
-If you have already cloned without `--recursive`, run `git submodule update --init --recursive` to fetch the submodules.
 
 ## 🛠️ Installation
 
