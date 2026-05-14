@@ -50,7 +50,6 @@ COPY tests/unittest/requirements.txt tests/unittest/requirements.txt
 # Install Python dependencies
 RUN pip install -r requirements.txt
 RUN pip install -r tests/unittest/requirements.txt
-RUN pip install pytest pytest-benchmark
 
 # Triton will be installed via requirements.txt
 
@@ -87,5 +86,5 @@ CMD ["/bin/bash"]
 # Labels for metadata
 LABEL description="Pointelligence: 3D Point Cloud Framework with PointCNN++"
 LABEL version="1.0"
-LABEL cuda_version="12.1"
+LABEL cuda_version="12.6"
 LABEL pytorch_version="2.6.0"

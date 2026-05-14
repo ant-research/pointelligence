@@ -143,7 +143,7 @@ python -m pytest tests/unittest/ -v
 ```
 
 The Docker image includes:
-- CUDA 12.4 + cuDNN + PyTorch 2.6.0+ with GPU support
+- CUDA 12.6 + cuDNN + PyTorch 2.6.0+ with GPU support
 - Pre-built CUDA extensions (`sparse_engines_cuda`)
 - All system dependencies and Python packages
 - Sample data preloaded

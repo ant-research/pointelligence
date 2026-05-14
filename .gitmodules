@@ -1,8 +1,10 @@
 [submodule "examples/Pointcept"]
 	path = examples/Pointcept
-	url = https://github.com/Lihhan/Pointcept.git
-	branch = pointcnnpp-version
+	url = https://github.com/Pointcept/Pointcept.git
+	branch = main
+	ignore = dirty
 [submodule "examples/FCGF"]
 	path = examples/FCGF
-	url = https://github.com/Lihhan/FCGF.git
-	branch = pointcnnpp-version
+	url = https://github.com/chrischoy/FCGF.git
+	branch = master
+	ignore = dirty
