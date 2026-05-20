@@ -87,7 +87,7 @@ Run once after `pip install -e .` succeeds:
 ```bash
 # Pointcept deps
 pip install h5py tensorboard wandb open3d nuscenes-devkit \
-            scipy 'spconv-cu120' torch-geometric \
+            scipy torch-geometric \
             scikit-learn timm addict yapf plyfile ftfy peft \
             torch-scatter torch-cluster
 
@@ -108,8 +108,6 @@ A few notes:
   encoding directive. If you skip it, you'll get
   `SyntaxError: unknown encoding: future_fstrings` on the first FCGF
   import.
-- **`spconv-cu120`**: pin to your CUDA major. spconv has separate
-  wheels per CUDA version.
 - **`scipy>=1.6`**: enables `cKDTree.query(..., workers=-1)` parallelism.
   FCGF's `lib/eval.py` overlay patch handles the older `n_jobs` arg via
   fallback, so older scipy still works — just slower.
@@ -150,7 +148,7 @@ versions against the table at the top of this page.
 
 ## What you should have at this point
 
-- `pip list | grep -E "torch |triton|spconv|open3d|pointelligence"` —
+- `pip list | grep -E "torch |triton|open3d|pointelligence"` —
   all installed.
 - `git -C examples/Pointcept rev-parse HEAD` → `96e109d…`
 - `git -C examples/FCGF rev-parse HEAD` → `0612340…`

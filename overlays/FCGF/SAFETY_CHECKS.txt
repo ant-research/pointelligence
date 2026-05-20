@@ -1,0 +1,25 @@
+# Runtime safety checks for the FCGF overlay.
+#
+# Same format + intent as overlays/Pointcept/SAFETY_CHECKS.txt — single
+# source of truth consumed by both `scripts/validate_overlays.sh` Check 6
+# (local pre-commit/pre-push) and downstream cluster-runtime bootstrap
+# scripts (where applicable). After `bash overlays/FCGF/build.sh` produces
+# build/FCGF/, every line below asserts that a required string is present
+# in a built file.
+#
+# Format: <relative path under build/FCGF/><TAB><grep -E pattern><TAB><reason>
+# Lines starting with '#' are comments. Blank lines OK.
+#
+# When you ADD a check here:
+# 1. Add the line below.
+# 2. Run `bash scripts/validate_overlays.sh` locally to confirm the line passes.
+# 3. Cross-reference the upstream commit / PR / patch that introduced the
+#    requirement in the reason column so a future maintainer can trace
+#    context.
+#
+# When you REMOVE a check, leave a one-line comment explaining why (overlay
+# graduated to upstream, requirement obsolete, etc.) so the deletion is
+# auditable.
+
+config.py	ThreeDMatchNewPairDatasetPure	0001-pointcnnpp PointCNN++ dataset class default — silent drift if the patch fails to land (--dataset arg falls back to upstream FCGF default class, training silently uses wrong dataset)
+lib/eval.py	workers=-1	0002-eval-scipy-workers-compat scipy>=1.6 cKDTree workers arg — loud failure (TypeError) if missing on scipy>=1.6, but declared here for symmetry with Pointcept and to assert the patch landed

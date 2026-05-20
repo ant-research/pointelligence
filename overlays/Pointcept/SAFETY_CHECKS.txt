@@ -1,0 +1,25 @@
+# Runtime safety checks for the Pointcept overlay.
+#
+# After `bash overlays/Pointcept/build.sh` produces build/Pointcept/, every
+# line below asserts that a required string is present in a built file.
+# `scripts/validate_overlays.sh` (local pre-commit/pre-push) reads this
+# file as the source of truth for runtime overlay safety assertions.
+# Downstream cluster-runtime bootstrap scripts (where applicable) can
+# read the same file to keep local validation and cluster-runtime checks
+# in lockstep — so an overlay regression cannot reach a cluster wall
+# undetected.
+#
+# Format: <relative path under build/Pointcept/><TAB><grep -E pattern><TAB><reason>
+# Lines starting with '#' are comments. Blank lines OK.
+#
+# When you ADD a check here:
+# 1. Add the line below.
+# 2. Run `bash scripts/validate_overlays.sh` locally to confirm the line passes.
+# 3. Cross-reference the upstream commit / PR that introduced the requirement
+#    in the reason column so a future maintainer can trace context.
+#
+# When you REMOVE a check, leave a one-line comment explaining why (overlay
+# graduated to upstream, requirement obsolete, etc.) so the deletion is auditable.
+
+pointcept/engines/train.py	zero_coef	PR #34 aux term — every requires_grad param participates in the autograd graph (DDP rank coherence; prevents asymmetric grad-skipping across ranks)
+pointcept/utils/optimizer.py	no_weight_decay	PR #34 timm/OpenMMLab no_weight_decay protocol — required for LayerScale gamma stability under AdamW

@@ -1,0 +1,66 @@
+diff --git a/pointcept/utils/optimizer.py b/pointcept/utils/optimizer.py
+index 355ec89..6a7c12e 100644
+--- a/pointcept/utils/optimizer.py
++++ b/pointcept/utils/optimizer.py
+@@ -18,10 +18,37 @@ OPTIMIZERS.register_module(module=torch.optim.AdamW, name="AdamW")
+ 
+ 
+ def build_optimizer(cfg, model, param_dicts=None):
+-    if param_dicts is None:
++    # Unwrap DDP/DistributedDataParallel to access the user-defined model.
++    raw_model = model.module if hasattr(model, "module") else model
++
++    # Optional `no_weight_decay()` protocol (timm / OpenMMLab convention):
++    # recursively collect suffixes from any submodule that implements the
++    # method. This handles wrapping models (DefaultSegmentorV2) that
++    # contain a backbone with no_weight_decay but don't define it themselves.
++    nwd_suffixes = set()
++    for m in raw_model.modules():
++        if hasattr(m, "no_weight_decay") and callable(m.no_weight_decay):
++            try:
++                nwd_suffixes.update(m.no_weight_decay())
++            except Exception:
++                pass
++
++    def _is_no_wd(name):
++        return any(s in name for s in nwd_suffixes)
++
++    if param_dicts is None and not nwd_suffixes:
+         cfg.params = model.parameters()
+     else:
++        # Group 0: default (cfg.lr, cfg.weight_decay from top-level optimizer cfg).
+         cfg.params = [dict(names=[], params=[], lr=cfg.lr)]
++        # Optional no_wd group: inherits cfg.lr, forces weight_decay=0.0.
++        nwd_group_idx = None
++        if nwd_suffixes:
++            cfg.params.append(dict(names=[], params=[], lr=cfg.lr, weight_decay=0.0))
++            nwd_group_idx = 1
++        # param_dicts groups follow (one per entry).
++        param_dicts = param_dicts or []
++        pd_base = len(cfg.params)
+         for i in range(len(param_dicts)):
+             param_group = dict(names=[], params=[])
+             if "lr" in param_dicts[i].keys():
+@@ -33,13 +60,20 @@ def build_optimizer(cfg, model, param_dicts=None):
+             cfg.params.append(param_group)
+ 
+         for n, p in model.named_parameters():
++            # 1) no_weight_decay takes highest priority.
++            if nwd_group_idx is not None and _is_no_wd(n):
++                cfg.params[nwd_group_idx]["names"].append(n)
++                cfg.params[nwd_group_idx]["params"].append(p)
++                continue
++            # 2) param_dicts keyword first-match-wins.
+             flag = False
+             for i in range(len(param_dicts)):
+                 if param_dicts[i].keyword in n:
+-                    cfg.params[i + 1]["names"].append(n)
+-                    cfg.params[i + 1]["params"].append(p)
++                    cfg.params[pd_base + i]["names"].append(n)
++                    cfg.params[pd_base + i]["params"].append(p)
+                     flag = True
+                     break
++            # 3) default group.
+             if not flag:
+                 cfg.params[0]["names"].append(n)
+                 cfg.params[0]["params"].append(p)
