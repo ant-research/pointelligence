@@ -173,10 +173,10 @@ index 435689e..4a46092 100644
              view1_data_dict["grid_coord"] = data_dict["view1_grid_coord"]
          if "view2_grid_coord" in data_dict.keys():
 diff --git a/pointcept/models/modules.py b/pointcept/models/modules.py
-index f4d3230..2869c1b 100644
+index 0ec8fbd..2869c1b 100644
 --- a/pointcept/models/modules.py
 +++ b/pointcept/models/modules.py
-@@ -1,25 +1,32 @@
+@@ -1,12 +1,16 @@
  import sys
  import torch.nn as nn
 -import spconv.pytorch as spconv
@@ -194,30 +194,7 @@ index f4d3230..2869c1b 100644
  from collections import OrderedDict
  from pointcept.models.utils.structure import Point
  from pointcept.engines.hooks import HookBase
- 
- 
- def is_ocnn_module(module):
--    ocnn_modules = (
--        ocnn.nn.OctreeConv,
--        ocnn.nn.OctreeDeconv,
--        ocnn.nn.OctreeGroupConv,
--        ocnn.nn.OctreeDWConv,
--    )
--    return isinstance(module, ocnn_modules)
-+    if ocnn is not None:
-+        ocnn_modules = (
-+            ocnn.nn.OctreeConv,
-+            ocnn.nn.OctreeDeconv,
-+            ocnn.nn.OctreeGroupConv,
-+            ocnn.nn.OctreeDWConv,
-+        )
-+        return isinstance(module, ocnn_modules)
-+    else:
-+        return False
- 
- 
- class PointModule(nn.Module):
-@@ -78,7 +85,7 @@ class PointSequential(PointModule):
+@@ -81,7 +85,7 @@ class PointSequential(PointModule):
              if isinstance(module, PointModule):
                  input = module(input)
              # Spconv module
@@ -226,7 +203,7 @@ index f4d3230..2869c1b 100644
                  if isinstance(input, Point):
                      input.sparse_conv_feat = module(input.sparse_conv_feat)
                      input.feat = input.sparse_conv_feat.features
-@@ -100,7 +107,7 @@ class PointSequential(PointModule):
+@@ -103,7 +107,7 @@ class PointSequential(PointModule):
                          input.sparse_conv_feat = input.sparse_conv_feat.replace_feature(
                              input.feat
                          )
@@ -235,16 +212,8 @@ index f4d3230..2869c1b 100644
                      if input.indices.shape[0] != 0:
                          input = input.replace_feature(module(input.features))
                  else:
-diff --git a/pointcept/models/point_group/__init__.py b/pointcept/models/point_group/__init__.py
-index 5d9f35f..e473508 100644
---- a/pointcept/models/point_group/__init__.py
-+++ b/pointcept/models/point_group/__init__.py
-@@ -1 +1,2 @@
--from .point_group_v1m1_base import PointGroup
-+from .point_group_v1m1_base import *
-+from .point_group_v1m2_custom_criteria import *
 diff --git a/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py b/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
-index 573ae10..a0e91c7 100644
+index 369c58e..922c2fc 100644
 --- a/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
 +++ b/pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py
 @@ -16,7 +16,10 @@ from timm.layers import DropPath

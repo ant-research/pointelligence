@@ -1,9 +1,9 @@
 diff --git a/pointcept/datasets/__init__.py b/pointcept/datasets/__init__.py
-index 6b2aaaf..84d2a2b 100644
+index a9cb356..fe16c08 100644
 --- a/pointcept/datasets/__init__.py
 +++ b/pointcept/datasets/__init__.py
-@@ -17,8 +17,15 @@ from .nuscenes import NuScenesDataset
- from .waymo import WaymoDataset
+@@ -26,8 +26,16 @@ from .waymo import WaymoDataset
+ from .hk import HKDataset
  
  # object
 -from .modelnet import ModelNetDataset
@@ -17,14 +17,15 @@ index 6b2aaaf..84d2a2b 100644
 +    from .shapenet_part import ShapeNetPartDataset
 +except (ImportError, ModuleNotFoundError):
 +    ShapeNetPartDataset = None
- 
- # dataloader
- from .dataloader import MultiDatasetDataloader
++
+ from .cap3d import Cap3DDataset, Cap3DImagePointDataset
+ from .scanobjectnn import (
+     ScanObjectNNDataset,
 diff --git a/pointcept/datasets/defaults.py b/pointcept/datasets/defaults.py
-index 0a3b4ca..4ed0bf3 100644
+index 07ea2a7..b88b711 100644
 --- a/pointcept/datasets/defaults.py
 +++ b/pointcept/datasets/defaults.py
-@@ -44,8 +44,17 @@ class DefaultDataset(Dataset):
+@@ -52,8 +52,17 @@ class DefaultDataset(Dataset):
          cache=False,
          ignore_index=-1,
          loop=1,
@@ -42,7 +43,7 @@ index 0a3b4ca..4ed0bf3 100644
          self.data_root = data_root
          self.split = split
          self.transform = Compose(transform)
-@@ -53,7 +62,7 @@ class DefaultDataset(Dataset):
+@@ -61,7 +70,7 @@ class DefaultDataset(Dataset):
          self.ignore_index = ignore_index
          self.loop = (
              loop if not test_mode else 1
@@ -50,8 +51,8 @@ index 0a3b4ca..4ed0bf3 100644
 +        )  # force make loop = 1 while in test_mode
          self.test_mode = test_mode
          self.test_cfg = test_cfg if test_mode else None
- 
-@@ -146,7 +155,9 @@ class DefaultDataset(Dataset):
+         if test_mode:
+@@ -153,7 +162,9 @@ class DefaultDataset(Dataset):
      def prepare_train_data(self, idx):
          # load data
          data_dict = self.get_data(idx)
@@ -62,10 +63,10 @@ index 0a3b4ca..4ed0bf3 100644
  
      def prepare_test_data(self, idx):
 diff --git a/pointcept/datasets/nuscenes.py b/pointcept/datasets/nuscenes.py
-index d3ab8f0..5759feb 100644
+index a9625c6..fa185c2 100644
 --- a/pointcept/datasets/nuscenes.py
 +++ b/pointcept/datasets/nuscenes.py
-@@ -55,7 +55,31 @@ class NuScenesDataset(DefaultDataset):
+@@ -60,7 +60,31 @@ class NuScenesDataset(DefaultDataset):
  
      def get_data(self, idx):
          data = self.data_list[idx % len(self.data_list)]
@@ -99,20 +100,20 @@ index d3ab8f0..5759feb 100644
              [-1, 5]
          )
 diff --git a/pointcept/datasets/transform.py b/pointcept/datasets/transform.py
-index 018723b..326eec0 100644
+index 19f8d94..3942f72 100644
 --- a/pointcept/datasets/transform.py
 +++ b/pointcept/datasets/transform.py
-@@ -842,6 +842,7 @@ class GridSample(object):
+@@ -885,6 +885,7 @@ class GridSample(object):
                  mask = np.zeros_like(data_dict["segment"]).astype(bool)
                  mask[data_dict["sampled_index"]] = True
                  data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
 +            
              data_dict = index_operator(data_dict, idx_unique)
-             if self.return_inverse:
-                 data_dict["inverse"] = np.zeros_like(inverse)
-@@ -893,6 +894,23 @@ class GridSample(object):
-         else:
-             raise NotImplementedError
+             if "frame_pcd_offset" in data_dict:
+                 data_dict["frame_pcd_offset"] = self._recompute_offsets(
+@@ -974,6 +975,23 @@ class GridSample(object):
+             new_offset_dict[frame_id - 1] = np.where(frame_assignment == frame_id)[0]
+         return new_offset_dict
  
 +    @staticmethod
 +    def fnv_hash_vec(arr):
@@ -134,7 +135,7 @@ index 018723b..326eec0 100644
      @staticmethod
      def ravel_hash_vec(arr):
          """
-@@ -912,22 +930,85 @@ class GridSample(object):
+@@ -993,22 +1011,85 @@ class GridSample(object):
          keys += arr[:, -1]
          return keys
  
