@@ -1,12 +1,21 @@
 """Correctness tests for the Upsample layer.
 
-Verifies:
+Verifies, under both `straight_recover ∈ {False, True}` unless noted:
 1. Every high-res query point receives a non-zero output (full coverage).
-2. With center-only kernel weights, output ≈ nearest low-res feature (geometric correctness).
-3. straight_recover path also achieves full coverage and non-trivial output.
-4. Gradients flow through to inputs and weights.
+2. With center-only kernel weights, output ≈ nearest low-res feature
+   (geometric correctness; the center kernel cell k=(1,1,1) is sign-symmetric
+   under i↔j swap, so it has the same meaning in both modes).
+3. Gradients flow through to inputs and weights.
+4. Determinism: identical input → near-identical output.
 5. Isolated voxel with corner-clustered points (worst-case radius margin).
+
+Plus (`straight_recover`-specific):
+6. The small-radius warning fires under fresh-search and is skipped under
+   cached-inverse (the cached path does no radius check at upsample time).
+7. Under `straight_recover=True` the Upsample's own `receptive_field_scaler`
+   is unused — two instances with different rfs produce identical output.
 """
+import warnings
 import pytest
 import torch
 
@@ -54,13 +63,16 @@ def _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size, stride
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestUpsample:
-    def test_full_coverage(self):
+    @pytest.mark.parametrize("straight_recover", [False, True])
+    def test_full_coverage(self, straight_recover):
         """Every high-res point must receive a non-zero output."""
         points, sample_inds, sample_sizes, grid_size = _make_point_cloud()
         m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
 
         in_ch, out_ch = 32, 16
-        upsample = Upsample(in_ch, out_ch, kernel_size=3, straight_recover=False).to(DEVICE)
+        upsample = Upsample(
+            in_ch, out_ch, kernel_size=3, straight_recover=straight_recover
+        ).to(DEVICE)
 
         torch.manual_seed(SEED)
         x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
@@ -73,27 +85,30 @@ class TestUpsample:
         zero_rows = (x_high.norm(dim=1) == 0).sum().item()
         assert zero_rows == 0, f"{zero_rows}/{num_high} high-res points got zero output"
 
-    def test_center_kernel_approximates_nearest(self):
+    @pytest.mark.parametrize("straight_recover", [False, True])
+    def test_center_kernel_approximates_nearest(self, straight_recover):
         """With only the center kernel weight active (k=13 for ks=3), the output
         for each high-res point should be close to the feature of its nearest
         low-res neighbor. This validates geometric correctness of the triplet
-        construction."""
+        construction. Center cell k=(1,1,1) is sign-symmetric under (i,j) swap,
+        so the same identity-at-center init has the same meaning in both modes."""
         points, sample_inds, sample_sizes, grid_size = _make_point_cloud(
             num_samples=1, num_points_per_sample=2000
         )
         m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
 
         C = 16
-        upsample = Upsample(C, C, kernel_size=3, bias=False, straight_recover=False).to(DEVICE)
+        upsample = Upsample(
+            C, C, kernel_size=3, bias=False, straight_recover=straight_recover
+        ).to(DEVICE)
 
-        # Set weights: only the center kernel cell (index 13 for 3x3x3) gets identity,
-        # all others get zero. This makes the conv act like nearest-neighbor lookup.
-        # Weight shape: (in_channels=C, out_channels/groups=C, kernel_size=27)
+        # Set weights: only the center kernel cell (k=13 for 3x3x3) gets
+        # identity, all others zero. Weight shape: (K, G, C_in, C_out).
         with torch.no_grad():
             upsample.conv.weight.zero_()
             center_k = 13  # (1,1,1) in 3x3x3
             for c in range(C):
-                upsample.conv.weight[c, c, center_k] = 1.0
+                upsample.conv.weight[center_k, 0, c, c] = 1.0
 
         # Use features = spatial coordinates of low-res points (known ground truth)
         # So we can verify the output is close to the nearest low-res point's coords.
@@ -144,29 +159,8 @@ class TestUpsample:
             f"mean_diff={mean_diff:.4f}, grid_size_low={grid_size_low:.4f}"
         )
 
-    def test_straight_recover_full_coverage(self):
-        """The cached triplet path (straight_recover=True) must also give full
-        coverage — every high-res point receives non-zero output."""
-        points, sample_inds, sample_sizes, grid_size = _make_point_cloud()
-        m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
-
-        in_ch, out_ch = 32, 16
-        upsample = Upsample(
-            in_ch, out_ch, kernel_size=3, straight_recover=True
-        ).to(DEVICE)
-
-        torch.manual_seed(SEED)
-        x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
-
-        with torch.no_grad():
-            x_high, m_high = upsample(x_low, m_low)
-
-        num_high = m_low.parent.points.shape[0]
-        assert x_high.shape == (num_high, out_ch)
-        zero_rows = (x_high.norm(dim=1) == 0).sum().item()
-        assert zero_rows == 0, f"straight_recover: {zero_rows}/{num_high} high-res points got zero output"
-
-    def test_gradient_flow(self):
+    @pytest.mark.parametrize("straight_recover", [False, True])
+    def test_gradient_flow(self, straight_recover):
         """Gradients must flow through upsample back to input features and weights."""
         points, sample_inds, sample_sizes, grid_size = _make_point_cloud(
             num_samples=1, num_points_per_sample=1000
@@ -174,7 +168,9 @@ class TestUpsample:
         m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
 
         in_ch, out_ch = 16, 8
-        upsample = Upsample(in_ch, out_ch, kernel_size=3, straight_recover=False).to(DEVICE)
+        upsample = Upsample(
+            in_ch, out_ch, kernel_size=3, straight_recover=straight_recover
+        ).to(DEVICE)
 
         x_low = torch.randn(
             m_low.points.shape[0], in_ch, device=DEVICE, requires_grad=True
@@ -191,14 +187,17 @@ class TestUpsample:
             assert param.grad is not None, f"No gradient on {name}"
             assert param.grad.abs().sum() > 0, f"Gradient on {name} is all zeros"
 
-    def test_deterministic(self):
+    @pytest.mark.parametrize("straight_recover", [False, True])
+    def test_deterministic(self, straight_recover):
         """Same input must produce identical output across two runs."""
         points, sample_inds, sample_sizes, grid_size = _make_point_cloud()
         m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
 
         in_ch, out_ch = 16, 8
         torch.manual_seed(SEED + 99)
-        upsample = Upsample(in_ch, out_ch, kernel_size=3, straight_recover=False).to(DEVICE)
+        upsample = Upsample(
+            in_ch, out_ch, kernel_size=3, straight_recover=straight_recover
+        ).to(DEVICE)
 
         x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
 
@@ -214,12 +213,15 @@ class TestUpsample:
         )
 
 
-    def test_isolated_voxel_corner_case(self):
+    @pytest.mark.parametrize("straight_recover", [False, True])
+    def test_isolated_voxel_corner_case(self, straight_recover):
         """Worst-case geometry: isolated voxel where center_nearest picks a
         corner point, and a high-res query sits at the opposite corner.
 
-        This tests the tightest radius margin (~7% of grid_size_low).
-        The search radius must still cover the full voxel diagonal."""
+        Fresh-search path: the radius (default rfs=1.0) clears the voxel
+        diagonal by ~7%. Cached-inverse path: coverage is inherited from
+        the downsample step's radius search (same default), so the inverted
+        triplet still includes the opposite-corner HR point."""
         grid_size_high = 0.1
         stride = 2.0
         grid_size_low = grid_size_high * stride  # 0.2
@@ -267,7 +269,7 @@ class TestUpsample:
         # The actual test: upsample must succeed with full coverage
         in_ch, out_ch = 8, 4
         upsample = Upsample(
-            in_ch, out_ch, kernel_size=3, straight_recover=False
+            in_ch, out_ch, kernel_size=3, straight_recover=straight_recover
         ).to(DEVICE)
         x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
 
@@ -300,6 +302,81 @@ class TestUpsample:
         with pytest.warns(UserWarning, match="smaller than the worst-case voxel diagonal"):
             with torch.no_grad():
                 upsample(x_low, m_low)
+
+    def test_straight_recover_skips_radius_warning(self):
+        """The cached-inverse path does no radius check at upsample time —
+        even with rfs well below the 0.81 threshold, the small-radius warning
+        must NOT fire. Pins the `:115-121` branch that the fresh-search
+        path takes but the cached path skips."""
+        points, sample_inds, sample_sizes, grid_size = _make_point_cloud(
+            num_samples=1, num_points_per_sample=500
+        )
+        m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
+
+        in_ch, out_ch = 8, 4
+        upsample = Upsample(
+            in_ch, out_ch, kernel_size=3,
+            receptive_field_scaler=0.5,  # would warn under fresh search
+            straight_recover=True,
+        ).to(DEVICE)
+
+        x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with torch.no_grad():
+                upsample(x_low, m_low)
+
+        offenders = [
+            w for w in caught
+            if "smaller than the worst-case voxel diagonal" in str(w.message)
+        ]
+        assert not offenders, (
+            f"straight_recover=True must not emit the radius warning; "
+            f"got {[str(w.message) for w in offenders]}"
+        )
+
+    def test_straight_recover_ignores_upsample_args(self):
+        """`straight_recover=True` reuses cached triplets — the Upsample's own
+        `receptive_field_scaler` (and `distance_type`) are unused. Two
+        instances with the same kernel_size + identical conv weights but
+        different rfs must produce identical output, because nothing in the
+        forward path consults rfs when the cached fast path is taken."""
+        points, sample_inds, sample_sizes, grid_size = _make_point_cloud()
+        m_low = _downsample_to_metadata(points, sample_inds, sample_sizes, grid_size)
+
+        in_ch, out_ch = 16, 8
+
+        torch.manual_seed(SEED + 7)
+        up_a = Upsample(
+            in_ch, out_ch, kernel_size=3,
+            receptive_field_scaler=0.5,  # below the warn threshold
+            straight_recover=True,
+        ).to(DEVICE)
+        torch.manual_seed(SEED + 7)  # same seed → same init
+        up_b = Upsample(
+            in_ch, out_ch, kernel_size=3,
+            receptive_field_scaler=2.5,  # well above; would search a different radius
+            straight_recover=True,
+        ).to(DEVICE)
+
+        # Sanity: identical conv weights (precondition for the output equality).
+        assert torch.equal(up_a.conv.weight, up_b.conv.weight)
+        assert torch.equal(up_a.conv.bias, up_b.conv.bias)
+
+        torch.manual_seed(SEED)
+        x_low = torch.randn(m_low.points.shape[0], in_ch, device=DEVICE)
+
+        with torch.no_grad():
+            x_a, _ = up_a(x_low, m_low)
+            x_b, _ = up_b(x_low, m_low)
+
+        # Bitwise equality: both paths read the same cached (i, j, k) and call
+        # the same PointConv3d kernel with the same weights/inputs.
+        assert torch.equal(x_a, x_b), (
+            f"straight_recover=True must ignore rfs; max abs diff "
+            f"{(x_a - x_b).abs().max().item():.2e}"
+        )
 
 
 if __name__ == "__main__":

@@ -30,14 +30,28 @@ The `grid_size` parameter is the fundamental spatial unit (analogous to pixel si
 
 Unlike images where target pixel locations are known, point cloud upsampling targets must be specified explicitly. The standard practice is to reuse the pre-downsampled points as targets. The calling pipeline is responsible for retaining these.
 
-**Minimum radius for upsampling:** the `Upsample` layer has each high-res point search for nearby low-res points. The low-res points are spaced at `grid_size_low` (one representative per voxel from center_nearest downsampling). In the worst case, a high-res point sits at the corner of a low-res voxel — distance `sqrt(3)/2 * grid_size_low` (~0.87 * `grid_size_low`) from the nearest low-res point. So the search radius must exceed this:
+The `Upsample` layer supports two modes for choosing which low-res points contribute to each high-res output.
+
+### Fresh search (default)
+
+Each high-res query searches among the low-res sources within a sphere of radius `grid_size_low * radius_scaler`. The low-res points are spaced at `grid_size_low` (one representative per voxel from `center_nearest` downsampling).
+
+**Minimum radius.** `center_nearest` picks an existing point, not the voxel center. In an isolated voxel the representative can sit at one corner while a high-res query sits at the opposite corner — the full voxel diagonal. So the search radius must exceed this:
 
 ```
-radius_min  = grid_size_low * sqrt(3)/2   ≈ 0.87 * grid_size_low
+radius_min  = grid_size_low * sqrt(3)   ≈ 1.73 * grid_size_low
 radius_used = grid_size_low * radius_scaler
 ```
 
-For the default configuration (kernel_size=3, ball mode), `radius_scaler ≈ 1.86` (see the formula below), which comfortably exceeds the minimum.
+For the default configuration (`kernel_size=3`, ball mode), `radius_scaler ≈ 1.86` (see the formula below), which clears the bound by ~7%. `Upsample.forward` emits a `UserWarning` when `receptive_field_scaler < ~0.81` (i.e. `radius_used < radius_min`).
+
+### Cached inverse — `Upsample(straight_recover=True)`
+
+`conv_with_stride` already builds triplets `(i, j, k)` during downsample, where `i` indexes the low-res query and `j` the high-res neighbor (per the `(i, j)` convention above). These are cached on the parent `MetaData` with `i` and `j` swapped — `i_upsample = m.j`, `j_upsample = m.i`, `k_upsample = m.k` — so they read as HR-query / LR-source for the reverse direction. With `straight_recover=True`, `Upsample` reuses these verbatim: no radius search at upsample time, and no warning check.
+
+The cached triplets carry the **downsample step's** `kernel_size`, `receptive_field_scaler`, and `distance_type`. With `straight_recover=True`, the Upsample's own arguments for those are not applied — the neighborhood geometry and the `k`-binning are inherited from the matching downsample. The Upsample's `kernel_size` must therefore match the downsample's, otherwise the convolution weight tensor is shaped for a different `k`-range than the cached indices.
+
+Coverage is inherited too: with the default `radius_scaler ≈ 1.86` on the downsample, the cached path gives the same `sqrt(3)`-clearing coverage as the fresh-search path. Enable `straight_recover=True` when the decoder is structurally symmetric with the encoder (same `kernel_size`, neighborhood radius, and `distance_type`) and the matching downsample triplet lives on `m_low.parent`. Otherwise leave it `False` (the default) and let `Upsample` search independently.
 
 Note: strided **downsampling** does not have this concern — the low-res query points are a subset of the high-res source points, so every query trivially finds at least itself as a neighbor.
 
