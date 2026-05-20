@@ -206,13 +206,20 @@ class ResNet(nn.Module):
         width_per_group: int = 64,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         in_channels: int = 1,
+        width_multiplier: float = 1.0,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(RaggedLayerNorm, reduce_fn=large_segment_reduce)
         self._norm_layer = norm_layer
 
-        self.inplanes = 64
+        # `width_multiplier` scales `inplanes` and the four stage widths
+        # uniformly. `base_width` is left at its original value because in
+        # Bottleneck it computes `width = planes * (base_width / 64)` —
+        # if we scaled both stage widths AND base_width, we'd double-scale
+        # the bottleneck inner width.
+        wm = float(width_multiplier)
+        self.inplanes = max(8, int(round(64 * wm)))
         self.groups = groups
         self.base_width = width_per_group
         # self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, bias=False)
@@ -222,15 +229,21 @@ class ResNet(nn.Module):
 
         # We will use a max_pool3d function for this
         # self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        stage_widths = [
+            max(8, int(round(64 * wm))),
+            max(8, int(round(128 * wm))),
+            max(8, int(round(256 * wm))),
+            max(8, int(round(512 * wm))),
+        ]
+        self.layer1 = self._make_layer(block, stage_widths[0], layers[0])
+        self.layer2 = self._make_layer(block, stage_widths[1], layers[1], stride=2)
+        self.layer3 = self._make_layer(block, stage_widths[2], layers[2], stride=2)
+        self.layer4 = self._make_layer(block, stage_widths[3], layers[3], stride=2)
 
         # self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.avgpool = GlobalPool("mean")
 
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.fc = nn.Linear(stage_widths[3] * block.expansion, num_classes)
 
         for m in self.modules():
             if isinstance(m, nn.Linear) or isinstance(m, PointConv3d):
