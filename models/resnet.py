@@ -88,7 +88,8 @@ class BasicBlock(nn.Module):
     ) -> Tuple[Tensor, MetaData]:
         identity = x
 
-        out, m = conv_with_stride(self.conv1, x, m, self.stride)
+        out, m = conv_with_stride(self.conv1, x, m, self.stride,
+                                  receptive_field_scaler=m.receptive_field_scaler)
         out = self.bn1(out, m.sample_sizes)
         out = self.relu(out)
 
@@ -168,7 +169,8 @@ class Bottleneck(nn.Module):
         out = self.bn1(out, m.sample_sizes)
         out = self.relu(out)
 
-        out, m = conv_with_stride(self.conv2, out, m, self.stride)
+        out, m = conv_with_stride(self.conv2, out, m, self.stride,
+                                  receptive_field_scaler=m.receptive_field_scaler)
 
         if self.stride != 1:
             m.dirty_triplets()
@@ -305,8 +307,9 @@ class ResNet(nn.Module):
 
     def _forward_impl(self, x: Tensor, m: MetaData) -> Tensor:
         # See note [TorchScript super()]
-        
-        x, m = conv_with_stride(self.conv1, x, m, 2)
+        rfs = m.receptive_field_scaler
+
+        x, m = conv_with_stride(self.conv1, x, m, 2, receptive_field_scaler=rfs)
         m.dirty_triplets()
 
         x = self.bn1(x, m.sample_sizes)
@@ -333,6 +336,7 @@ class ResNet(nn.Module):
         points: Tensor,
         sample_sizes: Tensor,
         grid_size: float,
+        receptive_field_scaler: float = 1.0,
     ) -> Tensor:
         sample_inds = torch.repeat_interleave(
             torch.arange(0, sample_sizes.numel(), device=sample_sizes.device),
@@ -343,6 +347,7 @@ class ResNet(nn.Module):
             sample_inds=sample_inds,
             sample_sizes=sample_sizes,
             grid_size=grid_size,
+            receptive_field_scaler=receptive_field_scaler,
         )
 
         return self._forward_impl(x, m)

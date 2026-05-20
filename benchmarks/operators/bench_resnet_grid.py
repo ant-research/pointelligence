@@ -27,7 +27,7 @@ import time
 import warnings
 from pathlib import Path
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -90,14 +90,106 @@ def synthesise_pointcloud(N: int, in_channels: int, dtype, device):
     return points, sample_sizes, grid_size, feat
 
 
-def bench_one_cell(depth_name, factory, scale, dtype, mode_label, mode_arg):
+_SCENE_CACHE: dict = {}
+
+
+def load_real_scene(scene_coord_path: str, in_channels: int, dtype, device,
+                    grid_size: float = 0.02):
+    """Load a real preprocessed point cloud from <scene_coord_path>.
+
+    Expected layout: a directory under Pointcept's per-scene preprocessing
+    (e.g., ScanNet v2 val sceneXXXX_NN/) containing at least `coord.npy`
+    of shape (N, 3) float32 in meters. The reference scene called out in
+    .claude/skills/training-infra/references/local-dataset-mirror.md is
+    `scannet_v2/val/scene0011_00` (237,360 points, ~6×8×3 m bbox,
+    preprocessed at 0.02 m voxel size).
+
+    Reuses Pointcept's `GridSample` transform (the same preprocessing the
+    production train/val data pipeline applies before the model sees a
+    scene) — train-mode, one representative per voxel, seeded for
+    determinism. `grid_size` defaults to 0.02 m to match the preprocessing
+    voxel size; the bench's conv1 stride and per-stage cascade are then
+    consistent with what production training sees.
+    """
+    cache_key = (scene_coord_path, grid_size)
+    if cache_key in _SCENE_CACHE:
+        points, sample_sizes = _SCENE_CACHE[cache_key]
+        N = points.shape[0]
+        # Re-roll the feature for this cell's dtype (kernel binary is the
+        # same; only the dtype-cast feature tensor needs refreshing).
+        torch.manual_seed(0)
+        feat = torch.randn(N, in_channels, device=device, dtype=dtype)
+        return points, sample_sizes, grid_size, feat
+
+    import os, sys
+    if os.path.isdir(scene_coord_path):
+        coord_path = os.path.join(scene_coord_path, "coord.npy")
+    else:
+        coord_path = scene_coord_path
+    if not os.path.isfile(coord_path):
+        raise FileNotFoundError(
+            f"--scene-coord: {coord_path} not found (expected a directory "
+            f"containing coord.npy, or the path to coord.npy itself)"
+        )
+    # Make Pointcept's GridSample importable when bench is run with bare
+    # PYTHONPATH=.; the overlay's build tree is the canonical Pointcept
+    # source for this repo.
+    pointcept_root = os.path.join(REPO, "build", "Pointcept")
+    if pointcept_root not in sys.path:
+        sys.path.insert(0, pointcept_root)
+    import numpy as np
+    from pointcept.datasets.transform import GridSample
+
+    coord_np = np.load(coord_path).astype(np.float32)
+    assert coord_np.ndim == 2 and coord_np.shape[1] == 3, (
+        f"coord.npy must be (N, 3); got {coord_np.shape}"
+    )
+    N_before = coord_np.shape[0]
+
+    # Apply the production GridSample (train mode → 1 rep per voxel,
+    # randomly chosen; we seed numpy so the choice is reproducible).
+    np.random.seed(0)
+    data = {"coord": coord_np, "index_valid_keys": ["coord"]}
+    data = GridSample(grid_size=grid_size, mode="train")(data)
+    coord_np = data["coord"]
+
+    points = torch.from_numpy(coord_np).to(device)
+    N = points.shape[0]
+    sample_sizes = torch.tensor([N], device=device, dtype=torch.long)
+    bbox = (points.max(0).values - points.min(0).values).tolist()
+    print(f"  loaded real scene via GridSample: N={N:,} "
+          f"(pre={N_before:,} at grid_size={grid_size} m), "
+          f"bbox={[round(b,2) for b in bbox]} m, in_channels={in_channels}")
+    _SCENE_CACHE[cache_key] = (points, sample_sizes)
+    # Per-point feature: a single-channel synthetic projection of coord
+    # (cheap, reproducible, and decoupled from per-cell RNG state). Matches
+    # the synthetic path's `in_channels=1` shape so the kernel binary is
+    # identical across the two modes.
+    torch.manual_seed(0)
+    feat = torch.randn(N, in_channels, device=device, dtype=dtype)
+    return points, sample_sizes, grid_size, feat
+
+
+def bench_one_cell(depth_name, factory, scale, dtype, mode_label, mode_arg,
+                   scene_coord=None):
     """One (depth, scale, dtype, mode) cell. Returns (e2e_fwd_ms, e2e_fwdbwd_ms, peak_vram_mb)."""
     in_channels = 1
-    N = 10_000
 
-    points, sample_sizes, grid_size, feat = synthesise_pointcloud(
-        N, in_channels, dtype, device,
-    )
+    if scene_coord is not None:
+        points, sample_sizes, grid_size, feat = load_real_scene(
+            scene_coord, in_channels, dtype, device,
+        )
+        # Real ScanNet scenes have sparse-edge regions where the default
+        # receptive_field_scaler=1.0 yields no neighbors at some stride-2
+        # query points. Production unet_pointcnnpp uses 2.5 — match it so
+        # the bench reflects what a real conv would do on this density.
+        rfs = 2.5
+    else:
+        N = 10_000
+        points, sample_sizes, grid_size, feat = synthesise_pointcloud(
+            N, in_channels, dtype, device,
+        )
+        rfs = 1.0
 
     model = factory(in_channels=in_channels, width_multiplier=scale).to(device).to(dtype)
     target = torch.randint(0, 1000, (1,), device=device)
@@ -105,14 +197,16 @@ def bench_one_cell(depth_name, factory, scale, dtype, mode_label, mode_arg):
     def fwd():
         with torch.no_grad():
             with dispatch_mode(mode_arg):
-                model(feat, points, sample_sizes, grid_size)
+                model(feat, points, sample_sizes, grid_size,
+                      receptive_field_scaler=rfs)
 
     def fwdbwd():
         with dispatch_mode(mode_arg):
             for p in model.parameters():
                 p.grad = None
             x = feat.detach().clone().requires_grad_(True)
-            out = model(x, points, sample_sizes, grid_size)
+            out = model(x, points, sample_sizes, grid_size,
+                        receptive_field_scaler=rfs)
             loss = torch.nn.functional.cross_entropy(out, target)
             loss.backward()
 
@@ -135,8 +229,12 @@ def bench_one_cell(depth_name, factory, scale, dtype, mode_label, mode_arg):
     return fwd_ms, fb_ms, vram_mb
 
 
-def run_grid(depths, scales, dtypes, modes):
+def run_grid(depths, scales, dtypes, modes, scene_coord=None):
     print(f"ResNet end-to-end bench grid — {torch.cuda.get_device_name(0)}")
+    if scene_coord is not None:
+        print(f"Input data: real scene at {scene_coord}")
+    else:
+        print(f"Input data: synthetic (random points in [0,1]^3, N=10,000)")
     print(f"Depths: {[d[0] for d in depths]}, "
           f"scales: {scales}, "
           f"dtypes: {[d[0] for d in dtypes]}, "
@@ -154,6 +252,7 @@ def run_grid(depths, scales, dtypes, modes):
                 for mode_label, mode_arg in modes:
                     fw, fb, vram = bench_one_cell(
                         depth_name, factory, scale, dtype, mode_label, mode_arg,
+                        scene_coord=scene_coord,
                     )
                     if fw is None:
                         print(f"| {scale:.2f}× | {mode_label} | OOM | OOM | OOM |")
@@ -207,6 +306,12 @@ def main():
                          default="fp16")
     parser.add_argument("--depths", default="18,34,50")
     parser.add_argument("--scales", default="0.25,0.5,1.0,2.0")
+    parser.add_argument("--scene-coord", default=None,
+                        help="Path to a real scene's coord.npy (or the scene directory "
+                             "containing coord.npy). When set, replaces the synthetic "
+                             "10K-point random cloud with the real scene. Reference: any "
+                             "Pointcept-preprocessed ScanNet val scene directory containing "
+                             "{coord,color,...}.npy — release benches used scene0011_00.")
     args = parser.parse_args()
 
     if args.dtype == "all":
@@ -224,7 +329,7 @@ def main():
         print(f"Empty selection: depths={depths}, scales={scales}, dtypes={dtypes}")
         sys.exit(1)
 
-    results = run_grid(depths, scales, dtypes, MODES)
+    results = run_grid(depths, scales, dtypes, MODES, scene_coord=args.scene_coord)
     winner_analysis(results)
 
 
