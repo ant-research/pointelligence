@@ -1,0 +1,5 @@
+# Prevent Python build artifacts from being tracked in the overlay tree.
+# See overlays/Pointcept/add/.gitignore for the full rationale.
+__pycache__/
+*.pyc
+*.pyo

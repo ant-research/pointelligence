@@ -115,10 +115,10 @@ diff --git a/pointcept/models/sparse_unet/__init__.py b/pointcept/models/sparse_
 index aafc385..2c904b4 100644
 --- a/pointcept/models/sparse_unet/__init__.py
 +++ b/pointcept/models/sparse_unet/__init__.py
-@@ -2,3 +2,8 @@ from .mink_unet import *
- from .spconv_unet_v1m1_base import *
- from .spconv_unet_v1m2_bn_momentum import *
- from .spconv_unet_v1m3_pdnorm import *
+@@ -2,3 +2,5 @@ from .mink_unet import *
+-from .spconv_unet_v1m1_base import *
+-from .spconv_unet_v1m2_bn_momentum import *
+-from .spconv_unet_v1m3_pdnorm import *
 +try:
 +    from .unet_pointcnnpp import *
 +except (ImportError, ModuleNotFoundError) as e:

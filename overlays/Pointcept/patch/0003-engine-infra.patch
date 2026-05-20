@@ -1,5 +1,5 @@
 diff --git a/configs/_base_/default_runtime.py b/configs/_base_/default_runtime.py
-index 73c6954..b9bf5ad 100644
+index 73c6954..3a3bc0e 100644
 --- a/configs/_base_/default_runtime.py
 +++ b/configs/_base_/default_runtime.py
 @@ -7,6 +7,7 @@ seed = None  # train process will init a random seed and record
@@ -10,18 +10,23 @@ index 73c6954..b9bf5ad 100644
  batch_size_val = None  # auto adapt to bs 1 for each gpu
  batch_size_test = None  # auto adapt to bs 1 for each gpu
  epoch = 100  # total epoch, data loop = epoch // eval_epoch
-@@ -20,6 +21,10 @@ empty_cache = False
+@@ -20,11 +21,15 @@ empty_cache = False
  empty_cache_per_epoch = False
  find_unused_parameters = False
- 
+
 +enable_wandb = True
 +wandb_project = "pointcloud_operator"  # custom your project name e.g. Sonata, PTv3
 +wandb_key = None  # wandb token, default is None. If None, login with `wandb login` in your terminal
 +
  mix_prob = 0
  param_dicts = None  # example: param_dicts = [dict(keyword="block", lr_scale=0.1)]
- 
-@@ -38,4 +43,4 @@ hooks = [
+
+ # hook
+ hooks = [
+     dict(type="CheckpointLoader"),
+     dict(type="ModelHook"),
+     dict(type="IterationTimer", warmup_iter=2),
+@@ -38,4 +48,4 @@ hooks = [
  train = dict(type="DefaultTrainer")
  
  # Tester
@@ -43,7 +48,7 @@ index 6091e70..becc033 100644
  
  
 diff --git a/pointcept/engines/hooks/__init__.py b/pointcept/engines/hooks/__init__.py
-index 41c0320..8ce9855 100644
+index 41c0320..d0c0754 100644
 --- a/pointcept/engines/hooks/__init__.py
 +++ b/pointcept/engines/hooks/__init__.py
 @@ -1,5 +1,28 @@
@@ -443,96 +448,6 @@ index 983657c..b48797a 100644
              pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
              if os.path.isfile(pred_save_path):
                  logger.info(
-diff --git a/pointcept/engines/train.py b/pointcept/engines/train.py
-index baacc76..d102906 100644
---- a/pointcept/engines/train.py
-+++ b/pointcept/engines/train.py
-@@ -8,11 +8,13 @@ Please cite our work if the code is helpful to you.
- import os
- import sys
- import weakref
-+import wandb
- import torch
- import torch.nn as nn
- import torch.utils.data
- from packaging import version
- from functools import partial
-+from pathlib import Path
- 
- if sys.version_info >= (3, 10):
-     from collections.abc import Iterator
-@@ -198,19 +200,41 @@ class Trainer(TrainerBase):
-         self.optimizer.zero_grad()
-         if self.cfg.enable_amp:
-             self.scaler.scale(loss).backward()
--            self.scaler.unscale_(self.optimizer)
--            if self.cfg.clip_grad is not None:
--                torch.nn.utils.clip_grad_norm_(
--                    self.model.parameters(), self.cfg.clip_grad
--                )
--            self.scaler.step(self.optimizer)
--
--            # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
--            # Fix torch warning scheduler step before optimizer step.
--            scaler = self.scaler.get_scale()
--            self.scaler.update()
--            if scaler <= self.scaler.get_scale():
--                self.scheduler.step()
-+
-+            # Guard: skip optimizer step when no param received a gradient.
-+            # This can happen with spconv SparseInverseConv3d on empty
-+            # sparse tensors (e.g., zero-coord tap in DPT heads).
-+            # DDP-coherent: synchronize has_grad across ranks via MIN
-+            # all-reduce so all ranks take the same branch. Without this,
-+            # asymmetric rank paths cause the GradScaler `scale` state to
-+            # drift between ranks across iters -> silent training divergence.
-+            has_grad_local = any(
-+                p.grad is not None for p in self.model.parameters() if p.requires_grad
-+            )
-+            if torch.distributed.is_available() and torch.distributed.is_initialized():
-+                has_grad_t = torch.tensor(
-+                    [1 if has_grad_local else 0], device="cuda"
-+                )
-+                torch.distributed.all_reduce(
-+                    has_grad_t, op=torch.distributed.ReduceOp.MIN
-+                )
-+                has_grad = bool(has_grad_t.item())
-+            else:
-+                has_grad = has_grad_local
-+            if has_grad:
-+                self.scaler.unscale_(self.optimizer)
-+                if self.cfg.clip_grad is not None:
-+                    torch.nn.utils.clip_grad_norm_(
-+                        self.model.parameters(), self.cfg.clip_grad
-+                    )
-+                self.scaler.step(self.optimizer)
-+
-+                scaler = self.scaler.get_scale()
-+                self.scaler.update()
-+                if scaler <= self.scaler.get_scale():
-+                    self.scheduler.step()
-+            else:
-+                self.scaler.update()
-         else:
-             loss.backward()
-             if self.cfg.clip_grad is not None:
-@@ -247,6 +271,16 @@ class Trainer(TrainerBase):
-     def build_writer(self):
-         writer = SummaryWriter(self.cfg.save_path) if comm.is_main_process() else None
-         self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")
-+        if self.cfg.enable_wandb and comm.is_main_process():
-+            tag, name = Path(self.cfg.save_path).parts[-2:]
-+            wandb.init(
-+                project=self.cfg.wandb_project,
-+                name=f"{tag}/{name}",
-+                tags=[tag],
-+                dir=self.cfg.save_path,
-+                settings=wandb.Settings(api_key=self.cfg.wandb_key),
-+                config=self.cfg,
-+            )
-         return writer
- 
-     def build_train_loader(self):
 diff --git a/scripts/build_image.sh b/scripts/build_image.sh
 index 31a6a7f..39c663f 100644
 --- a/scripts/build_image.sh
@@ -569,7 +484,7 @@ index 31a6a7f..39c663f 100644
  RUN export DEBIAN_FRONTEND=noninteractive \
  	&& apt -y update --no-install-recommends \
  	&& apt -y install --no-install-recommends \
-@@ -52,32 +43,20 @@ RUN export DEBIAN_FRONTEND=noninteractive \
+@@ -52,32 +43,19 @@ RUN export DEBIAN_FRONTEND=noninteractive \
  	&& apt autoremove -y \
  	&& apt clean -y \
  	&& export DEBIAN_FRONTEND=dialog
@@ -581,7 +496,7 @@ index 31a6a7f..39c663f 100644
 -
  RUN pip install --upgrade pip
  RUN pip install torch-geometric
- RUN pip install spconv-cu${CUDA_VERSION_NO_DOT}
+-RUN pip install spconv-cu${CUDA_VERSION_NO_DOT}
  RUN pip install open3d
 -
 -# Build MinkowskiEngine

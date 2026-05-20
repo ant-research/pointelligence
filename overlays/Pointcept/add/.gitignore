@@ -1,0 +1,8 @@
+# Prevent Python build artifacts from being tracked in the overlay tree.
+# Importing files from overlays/Pointcept/add/ locally (e.g. when running
+# the auto-discovery validator) creates these next to the .py files. They
+# must not become tracked content — validate_overlays.sh Check 2 fails on
+# any __pycache__ in add/.
+__pycache__/
+*.pyc
+*.pyo

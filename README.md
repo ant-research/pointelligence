@@ -94,25 +94,33 @@ Our custom Triton kernels (MVMR for forward, VVOR for backward) provide exceptio
 
 ## 📥 Clone the Repository
 
-Clone the repository with third-party submodules (FCGF and Pointcept) recursively:
+Clone the repository together with its third-party submodules (FCGF and Pointcept):
 
 ```shell
 git clone --recursive https://github.com/ant-research/pointelligence.git
 cd pointelligence
 ```
 
-If you cloned without `--recursive`, run `git submodule update --init --recursive` to fetch the submodules. The submodules pin upstream-pristine commits of [chrischoy/FCGF](https://github.com/chrischoy/FCGF) and [Pointcept/Pointcept](https://github.com/Pointcept/Pointcept); PointCNN++-specific adaptations are applied via the overlay system (see [`docs/reproduction/00_setup_overlay.md`](docs/reproduction/00_setup_overlay.md)):
+If you already cloned without `--recursive`, fetch the submodules with:
 
 ```shell
-bash overlays/FCGF/apply.sh examples/FCGF
-bash overlays/Pointcept/apply.sh examples/Pointcept
+git submodule update --init --recursive
 ```
+
+The submodules pin **upstream-pristine** commits of [chrischoy/FCGF](https://github.com/chrischoy/FCGF) and [Pointcept/Pointcept](https://github.com/Pointcept/Pointcept) — they are never edited in place. PointCNN++-specific adaptations live under `overlays/` and are applied out-of-tree by each submodule's `build.sh`, which writes a ready-to-use copy under `build/`:
+
+```shell
+bash overlays/FCGF/build.sh
+bash overlays/Pointcept/build.sh
+```
+
+This keeps `examples/FCGF` and `examples/Pointcept` 100% pristine; the build step is idempotent (re-running rebuilds in seconds). See [`overlays/README.md`](overlays/README.md) and [`docs/reproduction/00_setup_overlay.md`](docs/reproduction/00_setup_overlay.md) for how the overlay system works.
 
 ## 🛠️ Installation
 
 ### Option 1: Local Installation
 
-Some operators are implemented with C++/CUDA as PyTorch extensions, which could be built and installed with the following commands:
+Some operators are implemented in C++/CUDA as PyTorch extensions; build and install them with:
 
 ```shell
 conda create -n pointelligence python=3.10 -y
@@ -146,13 +154,17 @@ The Docker image includes:
 
 ## 💡 Basic Usages
 
-### Point Cloud Registration Task
+Both example pipelines run against the **overlay-built** submodule trees, so run `bash overlays/FCGF/build.sh` and `bash overlays/Pointcept/build.sh` first (see [Clone the Repository](#-clone-the-repository) above) — the overlay build is what injects PointCNN++ into the otherwise-pristine upstream code, producing ready-to-run copies under `build/`.
 
-See `examples/FCGF` for a full training pipeline using [Fully Convolutional Geometric Features](https://github.com/chrischoy/FCGF) with PointCNN++ as the backbone.
+For complete, copy-pasteable train → evaluate commands, follow the reproduction guide: [`docs/reproduction/`](docs/reproduction/README.md).
 
-### Point Cloud Segmentation Task
+### Point Cloud Registration — FCGF
 
-See `examples/Pointcept` for semantic segmentation using the [Pointcept](https://github.com/Pointcept/Pointcept) framework with PointCNN++ integration.
+PointCNN++ serves as the backbone of a [Fully Convolutional Geometric Features](https://github.com/chrischoy/FCGF) registration pipeline — it learns per-point descriptors that match corresponding points across two overlapping scans. The reproduction guide covers the 3DMatch (RGB-D) and KITTI (LiDAR) registration benchmarks end to end.
+
+### Point Cloud Segmentation — Pointcept
+
+PointCNN++ plugs into the [Pointcept](https://github.com/Pointcept/Pointcept) framework as a semantic-segmentation backbone, trained with Pointcept's standard `tools/train.py` driver and a PointCNN++ model config. The reproduction guide covers self-supervised pretraining and NuScenes semantic-segmentation fine-tuning.
 
 ## 📚 Citation
 Pointelligence is the repo for the official implementation of:
