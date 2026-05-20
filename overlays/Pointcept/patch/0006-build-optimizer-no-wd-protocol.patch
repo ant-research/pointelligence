@@ -1,12 +1,13 @@
 diff --git a/pointcept/utils/optimizer.py b/pointcept/utils/optimizer.py
-index 355ec89..6a7c12e 100644
+index a2cedea..0c4b1cc 100644
 --- a/pointcept/utils/optimizer.py
 +++ b/pointcept/utils/optimizer.py
-@@ -18,10 +18,37 @@ OPTIMIZERS.register_module(module=torch.optim.AdamW, name="AdamW")
- 
+@@ -22,10 +22,38 @@ OPTIMIZERS.register_module(module=MuonKIMI, name="Muon_KIMI")
  
  def build_optimizer(cfg, model, param_dicts=None):
+     cfg = copy.deepcopy(cfg)
 -    if param_dicts is None:
++
 +    # Unwrap DDP/DistributedDataParallel to access the user-defined model.
 +    raw_model = model.module if hasattr(model, "module") else model
 +
@@ -41,10 +42,10 @@ index 355ec89..6a7c12e 100644
          for i in range(len(param_dicts)):
              param_group = dict(names=[], params=[])
              if "lr" in param_dicts[i].keys():
-@@ -33,13 +60,20 @@ def build_optimizer(cfg, model, param_dicts=None):
-             cfg.params.append(param_group)
- 
+@@ -41,13 +69,20 @@ def build_optimizer(cfg, model, param_dicts=None):
          for n, p in model.named_parameters():
+             if not p.requires_grad:
+                 continue
 +            # 1) no_weight_decay takes highest priority.
 +            if nwd_group_idx is not None and _is_no_wd(n):
 +                cfg.params[nwd_group_idx]["names"].append(n)

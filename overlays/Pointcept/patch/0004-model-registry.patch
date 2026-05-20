@@ -1,8 +1,8 @@
 diff --git a/pointcept/models/__init__.py b/pointcept/models/__init__.py
-index 25b0a1a..d6a146e 100644
+index 2f0e0f3..2f3cc13 100644
 --- a/pointcept/models/__init__.py
 +++ b/pointcept/models/__init__.py
-@@ -2,25 +2,86 @@ from .builder import build_model
+@@ -2,29 +2,107 @@ from .builder import build_model
  from .default import DefaultSegmentor, DefaultClassifier
  from .modules import PointModule, PointModel
  
@@ -15,6 +15,7 @@ index 25b0a1a..d6a146e 100644
 -from .spvcnn import *
 -from .octformer import *
 -from .oacnns import *
+-from .litept import *
 -
 -# from .swin3d import *
 -
@@ -23,11 +24,14 @@ index 25b0a1a..d6a146e 100644
 -
 -# Instance Segmentation
 -from .point_group import *
+-from .sgiformer import *
 -
 -# Pretraining
 -from .masked_scene_contrast import *
 -from .point_prompt_training import *
 -from .sonata import *
+-from .concerto import *
+-from .utonia import *
 +try:
 +    from .sparse_unet import *
 +except (ImportError, ModuleNotFoundError) as e:
@@ -70,12 +74,22 @@ index 25b0a1a..d6a146e 100644
 +    pass
 +
 +try:
++    from .litept import *
++except ImportError:
++    pass
++
++try:
 +    from .context_aware_classifier import *
 +except ImportError:
 +    pass
 +
 +try:
 +    from .point_group import *
++except ImportError:
++    pass
++
++try:
++    from .sgiformer import *
 +except ImportError:
 +    pass
 +
@@ -94,6 +108,16 @@ index 25b0a1a..d6a146e 100644
 +except ImportError:
 +    pass
 +
++try:
++    from .concerto import *
++except ImportError:
++    pass
++
++try:
++    from .utonia import *
++except ImportError:
++    pass
++
 +# --- Overlay model auto-registration ---
 +# New model packages added via overlays/Pointcept/add/ are auto-discovered.
 +# No patching of this file is needed to register new models.
@@ -101,8 +125,9 @@ index 25b0a1a..d6a146e 100644
 +    "builder", "default", "modules", "utils", "losses",
 +    "sparse_unet", "point_transformer", "point_transformer_v2",
 +    "point_transformer_v3", "stratified_transformer", "spvcnn",
-+    "octformer", "oacnns", "context_aware_classifier", "point_group",
-+    "masked_scene_contrast", "point_prompt_training", "sonata",
++    "octformer", "oacnns", "litept", "context_aware_classifier",
++    "point_group", "sgiformer", "masked_scene_contrast",
++    "point_prompt_training", "sonata", "concerto", "utonia",
 +}
 +import importlib, pkgutil
 +for _imp, _name, _ispkg in pkgutil.iter_modules(__path__):
