@@ -66,6 +66,17 @@ def get_extensions():
         ],
         "nvcc": [
             "-O3" if not debug_mode else "-O0",
+            # CUTLASS 3.x / CuTe requires C++17 and relaxed-constexpr.
+            # The host compiler picks up -std=c++17 from torch's own flags,
+            # but nvcc needs it explicit for the device-side templates.
+            "-std=c++17",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            # Suppress noisy CUTLASS-internal warnings ("declared but never
+            # referenced" inside template metaprogramming) so the build log
+            # stays readable.
+            "-Xcompiler=-Wno-unused-but-set-variable",
+            "-Xcompiler=-Wno-unused-variable",
         ],
     }
     if debug_mode:
@@ -80,6 +91,17 @@ def get_extensions():
     extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
     cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "*.cu")))
 
+    # Vendored CUTLASS 4.3.4. Required by cycle-4 §1.11 G14 Tier-2 vvor
+    # CUTLASS kernels (vvor_cutlass_sm80.cu etc.). The repo root is two
+    # levels up from this setup.py (extensions/).
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    cutlass_root = os.path.join(repo_root, "third_party", "cutlass")
+    cutlass_includes = [
+        os.path.join(cutlass_root, "include"),
+        os.path.join(cutlass_root, "tools", "util", "include"),
+        os.path.join(cutlass_root, "examples", "common"),
+    ]
+
     if use_cuda:
         sources += cuda_sources
     else:
@@ -89,6 +111,7 @@ def get_extensions():
         extension(
             f"{library_name}._C",
             sources,
+            include_dirs=cutlass_includes,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             py_limited_api=py_limited_api,
