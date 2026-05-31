@@ -82,7 +82,7 @@ Our custom Triton kernels (MVMR for forward, VVOR for backward) provide exceptio
 </td>
 <td width="50%">
 <p align="center">
-<img src="assets/fig_G.jpeg" alt="Backbone Performance" width="100%"/>
+<img src="assets/fig_G.jpg" alt="Backbone Performance" width="100%"/>
 <br>
 <b>Figure G.</b> End-to-end ResNet-18 backbone performance.
 </p>
