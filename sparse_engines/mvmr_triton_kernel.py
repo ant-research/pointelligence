@@ -13,9 +13,9 @@ import triton.language as tl
 # for PointConv3d k=3, but the kernel supports group conv too).
 #
 # Compute path: cast inputs to fp32 before the multiply so the running
-# `block_o` accumulator is fp32. The previous "Native fp16" version summed
-# in fp16, which loses ~9 bits across the 512-element C-reduction — a
-# correctness liability we observed in the cycle-9 hybrid bench. Forcing
+# `block_o` accumulator is fp32. A native-fp16 accumulator sums in
+# fp16, which loses ~9 bits across the 512-element C-reduction — a
+# correctness liability observed in a hybrid bench. Forcing
 # fp32 accum costs some register pressure but on Ada the fp16/fp32 fma
 # throughput is 1:1 outside tensor cores, so the per-element multiply rate
 # is unchanged.

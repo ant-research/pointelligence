@@ -10,7 +10,7 @@
 
 #include "common.cuh"
 
-// ─── Grouped VVOR kernel with WMMA inner loop (Tier-1.5 / cycle-3 §1) ─────
+// ─── Grouped VVOR kernel with WMMA inner loop ───────────────────────────────
 //
 // VVOR: grad_weight[k][m][c] += grad_out[a_idx[t]][m] * b[b_idx[t]][c]
 //       summed over triplets t in segment k (o_idx-sorted).
@@ -28,9 +28,7 @@
 // Each warp owns one (k, mt, ct) 16x16 tile. Total warps = K * G * (M/16) * (C/16).
 // fp16/bf16 inputs use WMMA atoms; fp32 inputs fall through to the scalar-FMA
 // kernel from sparse_vvor_grouped_mma.cuh (WMMA's TF32 atom has m16n16k8, not
-// m16n16k16, and we don't need fp32 perf for the cycle-3 target).
-//
-// Pre-reg: autoresearch/threads/conv_extreme/0_expectations/cycle3_wmma_direct_vvor.md
+// m16n16k16, and we don't need fp32 perf here).
 
 namespace sparse_engines_cuda {
 

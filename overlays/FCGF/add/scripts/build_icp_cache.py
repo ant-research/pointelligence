@@ -4,7 +4,7 @@
 Replaces precompute_kitti_icp.py. The previous script duplicated the
 pair-generation logic from lib/data_loaders.py and silently drifted out
 of sync, leaving 7+ pairs uncached and causing 8-way ICP races on the
-cluster (jobs 282875826, 282938012). This script eliminates the
+cluster. This script eliminates the
 duplication: it instantiates KITTINMPairDataset and walks every index of
 every phase, forcing the dataloader's own ICP load/compute/save block to
 populate the cache. Pair-set parity is guaranteed by construction.

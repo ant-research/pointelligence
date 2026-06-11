@@ -59,13 +59,18 @@ void sparse_vector_vector_outer_product_reduction_check(at::Tensor a, at::Tensor
     TORCH_CHECK(a.device() == b_idx.device(), "a and b_idx must be on the same device.")
     TORCH_CHECK(a.device() == o_idx.device(), "a and o_idx must be on the same device.")
 
-    TORCH_CHECK(a.dtype() == torch::kFloat32, "a must have dtype torch::kFloat32")
+    // the CUDA kernel now accepts fp32 / fp16 / bf16 (fp32
+    // accumulate via to_float_src); a and b must share the dtype. The CPU
+    // impl below still requires fp32 and guards separately.
+    TORCH_CHECK(a.dtype() == torch::kFloat32 || a.dtype() == torch::kHalf ||
+                a.dtype() == torch::kBFloat16,
+        "a must have dtype float32 / float16 / bfloat16.")
     TORCH_CHECK(a.dim() == 3, "a must be a 3-D tensor.")
 
     TORCH_CHECK(a_idx.dtype() == torch::kInt32, "a_idx must have dtype torch::kInt32.")
     TORCH_CHECK(a_idx.dim() == 1, "a_idx must be a 1-D tensor.")
 
-    TORCH_CHECK(b.dtype() == torch::kFloat32, "b must have dtype torch::kFloat32.")
+    TORCH_CHECK(b.dtype() == a.dtype(), "b must have the same dtype as a.")
     TORCH_CHECK(a.size(1) == b.size(1), "a.size(1) must be equal to b.size(1).")
     TORCH_CHECK(b.dim() == 3, "b must be a 3-D tensor.")
 
@@ -82,6 +87,12 @@ void sparse_vector_vector_outer_product_reduction_check(at::Tensor a, at::Tensor
 at::Tensor
 	sparse_vector_vector_outer_product_reduction(at::Tensor a, at::Tensor a_idx, at::Tensor b, at::Tensor b_idx, at::Tensor o_idx, int64_t n) {
 	sparse_vector_vector_outer_product_reduction_check(a, a_idx, b, b_idx, o_idx);
+
+	// CPU reference impl is fp32-only (reads data_ptr<float>);
+	// fp16/bf16 are CUDA-only. Explicit guard (the shared check now admits them).
+	TORCH_CHECK(a.dtype() == torch::kFloat32,
+		"sparse_vector_vector_outer_product_reduction (CPU): fp32 only; "
+		"fp16/bf16 are supported on CUDA.")
 
 	a = a.contiguous();
 	b = b.contiguous();

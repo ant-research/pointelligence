@@ -1,10 +1,8 @@
-"""Tier-2 CUTLASS skeleton mvmr (G22 plan §4 Task M1).
+"""Tier-2 CUTLASS skeleton mvmr.
 
-This is the *skeleton* path per the G22 plan
-(autoresearch/threads/conv_extreme/3_plans/g22_cutlass_mvmr_closure_plan.md)
-§4 Task-M1 GO/NO-GO — affine CUTLASS layouts only, no IndexedGather, no
-scatter. Structurally mirrors vvor_cutlass.py's Task-1 surface; the only
-semantic change is the contraction axis.
+This is the *skeleton* path — affine CUTLASS layouts only, no
+IndexedGather, no scatter. Structurally mirrors vvor_cutlass.py's
+single-tile surface; the only semantic change is the contraction axis.
 
 mvmr vs vvor (the one structural difference):
   - vvor (the template) contracts over seg_len (K). Both operands gathered.
@@ -12,14 +10,14 @@ mvmr vs vvor (the one structural difference):
     (indexed by segment id k only — NOT gathered). input is gathered by
     b_idx. Output is scatter-accumulated by a_idx.
 
-M1 exercises ONLY the contraction-axis-C GEMM core with a dense-write
-epilogue. The Python wrapper PRE-GATHERS one tile's input rows into a
-contiguous (S_TILE, C_seg) buffer and slices the affine (M_TILE, C_seg)
-weight tile, then calls the single-tile op which performs the inner
-(M_TILE, S_TILE, C_seg) GEMM via
-`CollectiveMma<MainloopSm80CpAsyncUnpredicated>`. M2 replaces the
-explicit input pre-gather with `make_gather_tensor`; M3 adds the outer
-grid + the a_idx scatter-accumulate epilogue.
+The skeleton exercises ONLY the contraction-axis-C GEMM core with a
+dense-write epilogue. The Python wrapper PRE-GATHERS one tile's input
+rows into a contiguous (S_TILE, C_seg) buffer and slices the affine
+(M_TILE, C_seg) weight tile, then calls the single-tile op which
+performs the inner (M_TILE, S_TILE, C_seg) GEMM via
+`CollectiveMma<MainloopSm80CpAsyncUnpredicated>`. The gathered variant
+replaces the explicit input pre-gather with `make_gather_tensor`; the
+full op adds the outer grid + the a_idx scatter-accumulate epilogue.
 
 Public surface:
   mvmr_cutlass_sm80_single_tile_reference(...)
@@ -76,8 +74,8 @@ def stage_one_tile(
       B_seg (S_TILE, C_seg_padded) fp16 row-major contig (C-contiguous),
       C_seg_padded (int).
 
-    seg_len is clamped/padded to exactly S_TILE rows (M1 is a single
-    fixed (M_TILE, S_TILE) tile, mirroring vvor Task-1's single-tile
+    seg_len is clamped/padded to exactly S_TILE rows (the skeleton is a
+    single fixed (M_TILE, S_TILE) tile, mirroring vvor's single-tile
     contract). The contraction axis C is what gets tiled by C_TILE.
     """
     assert weight.dim() == 3 and weight.size(0) == 1
@@ -143,20 +141,19 @@ def mvmr_cutlass_sm80_single_tile_reference(
     return W32 @ B32.transpose(0, 1)
 
 
-# ─── Task M2 — kernel-side IndexedGather on the B (input) operand ─────────────
-#
-# M1 pre-gathers B Python-side (`stage_one_tile` does `input_b[b_idx]`).
-# M2 moves that gather INSIDE the CUTLASS mainloop: the caller hands the
-# kernel the raw `input_b` rows + the b_idx index buffer, and a composed
-# `IndexedGather` custom-stride layout drives the S-axis gather inside the
-# CollectiveMma cp.async loads. The affine W_seg tile is still produced
-# Python-side (W is affine in mvmr — indexed by segment id k only).
-#
-# Unlike vvor Task 2 (which gathered along the contraction axis K and
-# needed a transposing 2nd Config + ldmatrix-T), mvmr gathers along the
-# S/triplet axis while the contraction axis C stays gmem-contiguous, so
-# the M1 Config composes directly. See the .cu header for the full
-# rationale.
+# ─── Kernel-side IndexedGather on the B (input) operand ───────────────────────
+## The skeleton pre-gathers B Python-side (`stage_one_tile` does
+# `input_b[b_idx]`). This variant moves that gather INSIDE the CUTLASS
+# mainloop: the caller hands the kernel the raw `input_b` rows + the
+# b_idx index buffer, and a composed `IndexedGather` custom-stride layout
+# drives the S-axis gather inside the CollectiveMma cp.async loads. The
+# affine W_seg tile is still produced Python-side (W is affine in mvmr —
+# indexed by segment id k only).
+## Unlike vvor's gathered variant (which gathered along the contraction
+# axis K and needed a transposing 2nd Config + ldmatrix-T), mvmr gathers
+# along the S/triplet axis while the contraction axis C stays
+# gmem-contiguous, so the skeleton Config composes directly. See the .cu
+# header for the full rationale.
 
 
 def stage_w_tile(
@@ -164,10 +161,10 @@ def stage_w_tile(
     m_start: int,
     c_start: int,
 ) -> tuple[Tensor, int]:
-    """Slice + pad the affine W[k] tile for the M2 gathered path.
+    """Slice + pad the affine W[k] tile for the gathered path.
 
-    Identical W-side preparation to `stage_one_tile` (M1) — only B's
-    gather is deferred to the kernel for M2, so this returns just the
+    Identical W-side preparation to `stage_one_tile` — only B's gather is
+    deferred to the kernel in the gathered path, so this returns just the
     weight tile + padded C length.
 
     weight:  (G=1, C_full, M_full) fp16 — the W[k] slice for one
@@ -212,7 +209,7 @@ def mvmr_cutlass_sm80_single_tile_gathered(
     c_start: int,
     C_seg_padded: int,
 ) -> Tensor:
-    """Task-M2 entry: composed IndexedGather on B inside the CUTLASS mainloop.
+    """Gathered entry: composed IndexedGather on B inside the CUTLASS mainloop.
 
     W is affine (pre-sliced + padded by `stage_w_tile`); B is read directly
     from `input_b` and gathered along the S axis by `b_idx_seg` inside the
@@ -234,10 +231,10 @@ def mvmr_cutlass_sm80_single_tile_gathered_reference(
     b_idx_seg: Tensor,
     c_start: int,
 ) -> Tensor:
-    """Scalar reference for the Task-M2 entrypoint.
+    """Scalar reference for the gathered entrypoint.
 
     Gathers B Python-side then does the same fp32 `W @ B_gathered^T` the
-    M1 reference does. Mirrors the kernel's index/shape contract:
+    skeleton reference does. Mirrors the kernel's index/shape contract:
     b_idx_seg is int32 of length S_TILE; padded slots gather real input
     rows (handled identically on both sides). Used only by the unit test.
     """
@@ -252,7 +249,7 @@ def mvmr_cutlass_sm80_single_tile_gathered_reference(
     return W32 @ B_gathered.transpose(0, 1)
 
 
-# ─── Task M3 — full mvmr op (outer ragged-K-segment grid + scatter epilogue) ──
+# ─── Full mvmr op (outer ragged-K-segment grid + scatter epilogue) ────────────
 
 
 def sparse_matrix_vector_multiplication_reduction_cutlass(
@@ -262,9 +259,9 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
     b_idx: Tensor,    # (T,) int — input-row idx into b
     o_idx: Tensor,    # (T,) int — output-row idx into o
     n_o: int,         # number of output points (o's leading dim)
-    seg_offs: Tensor | None = None,  # G24-T3: pre-built (K+1,) int64 seg_offs
+    seg_offs: Tensor | None = None,  # pre-built (K+1,) int64 seg_offs
 ) -> Tensor:
-    """Full mvmr forward via the Tier-2 CUTLASS path (G22 plan §4 Task M3).
+    """Full mvmr forward via the Tier-2 CUTLASS path.
 
     Drop-in replacement for the Triton-grouped
     ``sparse_matrix_vector_multiplication_reduction``: same call
@@ -279,20 +276,21 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
     Preconditions (shared with the other grouped paths):
       - a_idx sorted ascending (sort_by="k")
       - G == 1
-      - fp16 inputs (fp32 / bf16 not supported by this Tier-2 path)
+      - fp16 OR bf16 inputs, both operands the same dtype (the
+        SM80_16x8x16_F32BF16BF16F32_TN atom path handles bf16). fp32 NOT
+        supported (no SM80 fp32-input TC atom of this shape); fp32 conv
+        stays on the Triton path.
       - M and C multiples of the kernel tile (TileM=64, TileK=32)
 
-    G24-T3 (S1 + S4 elimination):
-      - S1: the per-call ``a = a.contiguous()`` is removed. The C++ host
-        fn already resolves any input striding via its own
-        ``select(1,0).transpose(1,2).contiguous()`` repack (S2), so the
-        Python pre-contiguous was pure redundancy. On the grad_b second
-        call ``a`` arrives as ``W.transpose(2,3)`` (non-contiguous); the
-        deleted ``.contiguous()`` was a *full transposed-weight
-        materialization* on top of S2's copy — eliminating it removes
-        one of the two per-grad_b full-tensor copies that T1's profile
-        flagged as half the dominant ~170 µs DirectCopy.
-      - S4: ``seg_offs`` may be passed in pre-built (computed once at the
+    Striding + seg_offs handling:
+      - The per-call ``a = a.contiguous()`` is omitted. The C++ host fn
+        already resolves any input striding via its own
+        ``select(1,0).transpose(1,2).contiguous()`` repack, so a Python
+        pre-contiguous would be pure redundancy. On the grad_b second
+        call ``a`` arrives as ``W.transpose(2,3)`` (non-contiguous);
+        avoiding the ``.contiguous()`` here removes a full
+        transposed-weight materialization on top of the host repack.
+      - ``seg_offs`` may be passed in pre-built (computed once at the
         autograd.Function boundary and shared between the fwd and the
         grad_b second call — ``a_idx``/``K_offsets`` are the fixed
         triplet structure, invariant across both). When ``None`` it is
@@ -307,9 +305,9 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
 
     if G != 1:
         raise ValueError("CUTLASS full mvmr requires G == 1")
-    if a.dtype != torch.float16 or b.dtype != torch.float16:
+    if a.dtype != b.dtype or a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
-            "CUTLASS full mvmr is fp16-only "
+            "CUTLASS full mvmr is fp16/bf16-only, both operands same dtype "
             f"(got a={a.dtype}, b={b.dtype})"
         )
     if M % M_TILE != 0 or C % C_TILE != 0:
@@ -328,11 +326,11 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
     o_idx_i32 = o_idx.to(torch.int32)
 
     # Arch dispatch (mirrors vvor_cutlass.py): route Hopper (sm_90+)
-    # hardware to the sm_90-targeted op (G22 plan §4 Task M6 P1). The two
-    # ops are algorithmically identical (same frozen Sm80 cp.async-
-    # Unpredicated + M2 S-gather + scatter-accumulate); the sm_90 symbol
-    # exists so the H200 cell exercises the sm_90 SASS path. On sm_80/89
-    # the sm_80 op stays the path of record.
+    # hardware to the sm_90-targeted op. The two ops are algorithmically
+    # identical (same Sm80 cp.async-Unpredicated + S-gather +
+    # scatter-accumulate); the sm_90 symbol exists so sm_90 hardware
+    # exercises the sm_90 SASS path. On sm_80/89 the sm_80 op stays the
+    # path of record.
     major = torch.cuda.get_device_capability(a.device)[0]
     if major >= 9:
         return torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full(
@@ -344,50 +342,42 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
     )
 
 
-# ─── G26-T2(b) + G25-T2 — Python-only fused PointConv3d autograd.Function ─────
-#
-# Scope (cycle_7_g26_t2_rescope.md option (b); plan §2/§4 Phase-A T2):
-# collapse the eager PointConv3d fwd+bwd composition — 3 @triton_op /
+# ─── Python-only fused PointConv3d autograd.Function ──────────────────────────
+## Collapse the eager PointConv3d fwd+bwd composition — 3 @triton_op /
 # autograd-graph op boundaries + 2 seg_offs builds + the duplicate Python
-# `.contiguous()` calls — into ONE autograd.Function, reusing the frozen
+# `.contiguous()` calls — into ONE autograd.Function, reusing the
 # CUTLASS mvmr/vvor full kernels AS-IS (no .cu/.cuh edit). Wins, all
 # Python/autograd-side:
-#
-#   (1) G25-T2: fwd + grad_b both feed the C++ `_full_prestaged` host
-#       entry (G25-T1, commit 9de9051) with a caller-pre-staged
+##   (1) fwd + grad_b both feed the C++ `_full_prestaged` host
+#       entry with a caller-pre-staged
 #       (n_o_k, M_full, C_full)-C-contiguous buffer, which SKIPS `_full`'s
 #       unconditional internal `a.select(1,0).transpose(1,2).contiguous()`
-#       repack (sm80.cu:543-545 / sm90.cu:216-218). Each side stages its
-#       buffer EXACTLY ONCE:
+#       repack. Each side stages its buffer EXACTLY ONCE:
 #         fwd:    aT_fwd   = weight.select(1,0).transpose(1,2).contiguous()
 #                           → (K, M_w, C_w) C-contig
 #         grad_b: aT_gradb = weight.select(1,0).contiguous()
 #                           → (K, C_w, M_w) C-contig (the `.transpose(1,2)`
-#                             the fwd stage applies is DROPPED — G25-T1
-#                             verified this is byte-equal to `_full`'s
-#                             internal repack of `weight.transpose(2,3)`).
+#                             the fwd stage applies is DROPPED — this is
+#                             byte-equal to `_full`'s internal repack of
+#                             `weight.transpose(2,3)`).
 #       The kernel only ever reads a (K, M_full, C_full)-C-contig buffer;
-#       fwd-vs-grad_b is purely which weight axes the caller maps. This
-#       RETIRES the G26-T2(b) no-op-collapse 4-D-view trick (which fed the
-#       frozen `_full` and relied on `host.contiguous() is host`) AND
-#       eliminates the grad_b-S2 host-repack-inside-`_full` (T2(b)'s
-#       named, un-subsumed residual): the single per-side copy now happens
-#       at the controlled stage, with NO internal `_full` repack on top.
+#       fwd-vs-grad_b is purely which weight axes the caller maps.
+#       `_prestaged` consumes the staged buffer directly, so the per-side
+#       copy happens at the controlled stage with NO internal `_full`
+#       repack on top.
 #   (2) One Function instead of 3 @triton_op/autograd-graph boundaries;
 #       `seg_offs` built ONCE in forward, saved on ctx, reused in backward
 #       (no rebuild); no per-call Python `.contiguous()` on the staged path.
-#
-# grad_a: frozen CUTLASS vvor full, reused exactly as the eager
-#   `_backward_sparse_matrix_vector_multiplication_reduction` does
-#   (UNCHANGED by G25-T2).
-# grad_b: frozen CUTLASS mvmr full via `_full_prestaged` fed
+## grad_a: CUTLASS vvor full, reused exactly as the eager
+#   `_backward_sparse_matrix_vector_multiplication_reduction` does.
+# grad_b: CUTLASS mvmr full via `_full_prestaged` fed
 #   `weight.select(1,0).contiguous()` + the saved `seg_offs` (the
-#   transpose dropped vs fwd; see (1)). The grad_b-S2 host-repack is now
-#   ELIMINATED (was the named, un-subsumed G25/T-S2 residual).
+#   transpose dropped vs fwd; see (1)), so no host repack happens inside
+#   `_full`.
 
 
 class FusedPointConv3d(torch.autograd.Function):
-    """Fused PointConv3d fwd+bwd (G26-T2(b), Python-only).
+    """Fused PointConv3d fwd+bwd (Python-only).
 
     Collapses the eager mvmr-fwd / vvor-grad_a / mvmr-grad_b composition
     into one Function reusing the frozen CUTLASS full kernels. fp16 / G==1
@@ -404,15 +394,14 @@ class FusedPointConv3d(torch.autograd.Function):
     def forward(ctx, weight, a_idx, input_3d, b_idx, o_idx, n_o):
         K_offsets = weight.shape[0]
 
-        # ── G25-T2: single S2 stage, fed straight to `_full_prestaged`.
+        # ── Single weight stage, fed straight to `_full_prestaged`.
         # weight (K,1,C,M) → aT_fwd (K,M,C) C-contiguous — exactly the
         # (n_o_k, M_full, C_full) layout `_full_prestaged` consumes (it
         # skips `_full`'s unconditional internal
         # `select(1,0).transpose(1,2).contiguous()` repack by contract).
         # This stage is THE one weight copy for the fwd side; amortized
-        # over fwd + grad_a. The G26-T2(b) no-op-collapse 4-D-view trick
-        # that fed the frozen `_full` is RETIRED — `_prestaged` consumes
-        # the staged buffer directly (no host-side repack on top of it).
+        # over fwd + grad_a. `_prestaged` consumes the staged buffer
+        # directly (no host-side repack on top of it).
         aT_fwd = weight.select(1, 0).transpose(1, 2).contiguous()
 
         # ── seg_offs built ONCE; reused by fwd host fn and grad_b. a_idx +
@@ -465,24 +454,20 @@ class FusedPointConv3d(torch.autograd.Function):
                 grad_weight = grad_weight.to(weight.dtype)
 
         if ctx.needs_input_grad[2]:
-            # grad_b (grad of input) via the frozen CUTLASS mvmr full
-            # kernel. G25-T2: route through `_full_prestaged` with a
-            # caller-staged buffer instead of through `_full`
+            # grad_b (grad of input) via the CUTLASS mvmr full kernel,
+            # routed through `_full_prestaged` with a caller-staged buffer
+            # instead of through `_full`
             # (`sparse_matrix_vector_multiplication_reduction_cutlass`)
             # fed `weight.transpose(2,3)`. The kernel only ever reads a
             # (n_o_k, M_full, C_full)-C-contiguous buffer; fwd-vs-grad_b
             # is purely which weight axes the caller maps onto M/C. For
             # grad_b that buffer is `weight.select(1,0).contiguous()`
             # ((K,1,C,M) → (K,C,M) C-contig) — the `.transpose(1,2)` the
-            # fwd stage applies is DROPPED (G25-T1 verified this is
-            # byte-equal to `_full`'s internal repack of
-            # `weight.transpose(2,3)`). This ELIMINATES the grad_b-S2
-            # host-repack-inside-`_full`: the single copy now happens at
-            # this controlled stage, with NO internal `_full` repack on
-            # top of it (vs T2(b): a strided transposed-weight view fed
-            # to `_full`, whose unconditional internal
-            # select/transpose/.contiguous() did the repack). seg_offs is
-            # reused (not rebuilt); grad_a (vvor) path unchanged.
+            # fwd stage applies is DROPPED (this is byte-equal to
+            # `_full`'s internal repack of `weight.transpose(2,3)`). The
+            # single copy happens at this controlled stage, with NO
+            # internal `_full` repack on top of it. seg_offs is reused
+            # (not rebuilt); grad_a (vvor) path unchanged.
             aT_gradb = weight.select(1, 0).contiguous()
             b_idx_i32 = b_idx.to(torch.int32)
             o_idx_i32 = o_idx.to(torch.int32)

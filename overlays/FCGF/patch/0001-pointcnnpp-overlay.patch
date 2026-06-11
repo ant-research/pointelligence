@@ -523,8 +523,8 @@ index d161eff..dfb8ef1 100644
 -      raise ValueError(f"{drive}, {t0}, {t1}")
 +      # Pair has insufficient voxel overlap at the configured matching radius.
 +      # Raising here would propagate through the DataLoader worker and crash
-+      # the entire training process — observed in job 283105263, where all 4
-+      # bs=8 configs died at Epoch 1 ~iter 200/535 on pair (8, 21, 41).
++      # the entire training process — observed to kill all bs=8 configs early
++      # in training (Epoch 1, ~iter 200/535) on a low-overlap pair.
 +      # Treat as data-quality filter: skip and resample.
 +      logging.warning(
 +          "Skipping pair (drive=%d, t0=%d, t1=%d): %d matches < 1000 minimum "

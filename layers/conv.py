@@ -28,18 +28,17 @@ from .triplets import (
 )
 
 
-# WS2.1 — perf-optimal auto-router measured boundary (graduation §8 pt-4 +
-# production-drop-in-safety). The fused CUTLASS PointConv3d path is
-# net-positive vs `main`'s Triton-grouped path ONLY in the measured
-# large-C regime; at smaller C it is CATASTROPHICALLY slower. Measured
-# enc4 fp16 H200 (G25-T5 job 295094689 / G26-T5 295041027, dispatcher-
-# reverified, fused PNT f+b ÷ grouped≈main PNT f+b, median-of-3):
+# Perf-optimal auto-router measured boundary. The fused CUTLASS
+# PointConv3d path is net-positive vs the Triton-grouped path ONLY in the
+# measured large-C regime; at smaller C it is CATASTROPHICALLY slower.
+# Measured enc4 fp16 H200 (dispatcher-reverified, fused forward+backward
+# ÷ grouped forward+backward, median-of-3):
 #   enc1 C=64  → 24.7×   enc2 C=128 → 7.4×   enc3 C=256 → 2.1×  (SLOWER)
 #   enc4 C=512 → 0.715×  (net-positive — the ONLY validated win)
 # So under the production "auto" mode, auto-engage the fused path ONLY
 # when C (= weight.shape[2], the conv in/G channel) is at/above the
-# measured-net-positive boundary; default to the Triton path (== `main`,
-# zero-regression by construction) for every unmeasured-or-net-negative
+# measured-net-positive boundary; default to the Triton path
+# (zero-regression by construction) for every unmeasured-or-net-negative
 # shape. 512 is the conservative measured cut (net-positive at 512,
 # net-NEGATIVE 2.1× at 256 → the boundary is in (256, 512]; pick the
 # validated point). Widen ONLY with additional measured net-positive
@@ -89,8 +88,8 @@ class GeneralConv(Module):
         self.kernel_size = kernel_size
         self.groups = groups
 
-        # G13 / cycle-3 §1.9b (Lane Q) weight layout: native (K, G, in/G, out/G).
-        # Eliminates the per-fwd `weight.reshape(...).permute(3,0,1,2)` +
+        # Weight layout: native (K, G, in/G, out/G). Eliminates the
+        # per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (which allocated ~28 MB at enc4
         # per forward call, ~390 μs at sm_89). Backward-compat for legacy
         # (in, out/G, K) checkpoints is handled by _load_from_state_dict below.
@@ -125,11 +124,11 @@ class GeneralConv(Module):
         self, state_dict, prefix, local_metadata, strict,
         missing_keys, unexpected_keys, error_msgs,
     ):
-        # G13 / Lane Q backward-compat: detect legacy (in, out/G, K) weight
+        # Backward-compat: detect legacy (in, out/G, K) weight
         # checkpoints and reshape+permute to the new (K, G, in/G, out/G)
         # layout before assigning. Silent — load proceeds with the converted
-        # tensor, no warning (most legacy checkpoints are pre-Lane-Q and
-        # match the old shape exactly).
+        # tensor, no warning (most legacy checkpoints match the old shape
+        # exactly).
         weight_key = prefix + "weight"
         if weight_key in state_dict:
             w = state_dict[weight_key]
@@ -175,7 +174,7 @@ class GeneralConv(Module):
         weight: Tensor,
         bias: Optional[Tensor],
     ) -> Tensor:
-        # G13 / Lane Q: weight is already in (K, G, in/G, out/G) layout —
+        # weight is already in (K, G, in/G, out/G) layout —
         # the historical per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (~390 μs at sm_89 enc4) is
         # dropped. mvmr's internal `.contiguous()` is now a no-op.
@@ -190,56 +189,55 @@ class GeneralConv(Module):
         else:
             input_3d = input.contiguous()
 
-        # G26-T2(b): under "force_fused_conv" route the whole
+        # Under "force_fused_conv" route the whole
         # mvmr+autograd through the single `FusedPointConv3d` Function
         # (collapses the 3 @triton_op/autograd-graph boundaries + 2
         # seg_offs builds + the duplicate .contiguous() into one Function;
-        # forward S2 zero-copy via the no-op-collapse view; frozen CUTLASS
+        # forward S2 zero-copy via the no-op-collapse view; the CUTLASS
         # mvmr/vvor full kernels reused as-is; grad_b keeps its single
-        # host-repack = the named G25 residual). Intercepted HERE — above
+        # host-repack residual). Intercepted HERE — above
         # the @triton_op — so FusedPointConv3d's autograd is the sole
         # autograd boundary (not nested inside the op's registered
         # autograd). fp16-only; non-fp16 falls through to the unchanged
         # eager op. Every other mode/path is byte-unchanged: this branch
         # fires ONLY on the "force_fused_conv" string.
-        # G26-T3.5: small-C crash-avoidance fallback (Phase-B verdict-cell
-        # unblock + graduation-gate §5 point-4 auto-router seed). The fused
-        # path's CUTLASS mvmr full kernel hard-requires the weight's M and
-        # C to be tile multiples: `sparse_mvmr_cutlass_sm{80,90}_full`
-        # TORCH_CHECKs `M_full % TileM == 0` and `C_full % TileK == 0`
-        # (TileM=64, TileK=32 — `MvmrConfig`/`Sm90MvmrConfig` in
+        #
+        # Small-C crash-avoidance fallback. The fused path's CUTLASS mvmr
+        # full kernel hard-requires the weight's M and C to be tile
+        # multiples: `sparse_mvmr_cutlass_sm{80,90}_full` TORCH_CHECKs
+        # `M_full % TileM == 0` and `C_full % TileK == 0` (TileM=64,
+        # TileK=32 — `MvmrConfig`/`Sm90MvmrConfig` in
         # extensions/sparse_engines_cuda/csrc/cuda/sparse_mvmr_cutlass_sm80.cu
         # lines 526-531, identical in sm90.cu:199-204; the pinned Python
         # mirrors are `M_TILE`/`C_TILE` in sparse_engines/mvmr_cutlass.py).
         # `weight` is (K, G=1, C, M) here, so the kernel's M_full is
         # weight.shape[3] and C_full is weight.shape[2]. At enc0-class
         # depth (C=32, M not a 64-multiple) the kernel raises a C++
-        # RuntimeError; T3 Finding 2 showed that crashes the Phase-B bench
-        # grid before any verdict JSON. So decide BY SHAPE *before*
-        # dispatch (not a fragile try/except around the kernel): when the
-        # tile constraints are unmet, fall through to EXACTLY the
-        # non-fused composition the `else` below takes when the mode is
-        # not "force_fused_conv" — already correct & parity-tested. The
-        # decision is on the forward weight shape, invariant across
-        # fwd/bwd, so the whole step is owned by one path (no fwd/bwd
-        # mix). Constraint-MET shapes still take the fused path
-        # byte-unchanged. This is the crash-avoidance fallback only, NOT
-        # the perf-optimal "engage only where net-positive" router (a
-        # graduation refinement, out of T3.5 scope).
+        # RuntimeError, which crashes the bench grid before any verdict
+        # JSON. So decide BY SHAPE *before* dispatch (not a fragile
+        # try/except around the kernel): when the tile constraints are
+        # unmet, fall through to EXACTLY the non-fused composition the
+        # `else` below takes when the mode is not "force_fused_conv" —
+        # already correct & parity-tested. The decision is on the forward
+        # weight shape, invariant across fwd/bwd, so the whole step is
+        # owned by one path (no fwd/bwd mix). Constraint-MET shapes still
+        # take the fused path byte-unchanged. This is the crash-avoidance
+        # fallback only, NOT the perf-optimal "engage only where
+        # net-positive" router.
         from sparse_engines.mvmr_cutlass import M_TILE, C_TILE
 
         _fused_tiles_ok = (
             weight.shape[3] % M_TILE == 0 and weight.shape[2] % C_TILE == 0
         )
-        # WS2.1 perf-optimal auto-router. `_fused_safe` = the fused
+        # Perf-optimal auto-router. `_fused_safe` = the fused
         # CUTLASS path's hard preconditions (fp16 + tile-multiple M/C —
-        # the small-C crash-avoidance guard, G26-T3.5, unchanged). The
+        # the small-C crash-avoidance guard, unchanged). The
         # routing DECISION on top of it:
         #   • "force_fused_conv" (benches/tests): engage whenever
         #     `_fused_safe` — byte-unchanged explicit override.
         #   • "auto" (production default): engage ONLY in the measured-
         #     net-positive regime (C >= _FUSED_AUTOROUTER_MIN_C); every
-        #     other shape → the Triton path == `main` (zero-regression).
+        #     other shape → the Triton path (zero-regression).
         #   • any other mode: → the eager op (those force_* modes are
         #     dispatched inside `sparse_matrix_vector_multiplication_
         #     reduction`); unchanged.
@@ -327,3 +325,4 @@ def conv_with_stride(
     )
     x = conv_op(x, m.i, m.j, m.k, m.num_points())
     return x, m
+

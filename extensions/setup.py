@@ -91,7 +91,7 @@ def get_extensions():
     extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
     cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "*.cu")))
 
-    # Vendored CUTLASS 4.3.4. Required by cycle-4 §1.11 G14 Tier-2 vvor
+    # Vendored CUTLASS 4.3.4. Required by the Tier-2 vvor
     # CUTLASS kernels (vvor_cutlass_sm80.cu etc.). The repo root is two
     # levels up from this setup.py (extensions/).
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))

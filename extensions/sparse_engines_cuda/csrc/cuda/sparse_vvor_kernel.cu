@@ -40,12 +40,15 @@ at::Tensor sparse_vector_vector_outer_product_reduction_cuda(
 	a = a.contiguous();
 	b = b.contiguous();
 
+	// fp32-accumulate output, cast back to the input dtype.
+	// fp32 input → no-op cast (byte-identical to the prior fp32 path).
+	const auto input_dtype = a.scalar_type();
 	const auto options = at::TensorOptions().dtype(torch::kFloat32).device(a.device());
 	auto o = torch::zeros({n, a.size(1), a.size(2), b.size(2)}, options);
 
 	sparse_vector_vector_outer_product_reduction_impl_cuda(a, a_idx, b, b_idx, o_idx, o);
 
-	return o;
+	return input_dtype == at::kFloat ? o : o.to(input_dtype);
 }
 
 TORCH_LIBRARY_IMPL(sparse_engines_cuda, CUDA, m) {

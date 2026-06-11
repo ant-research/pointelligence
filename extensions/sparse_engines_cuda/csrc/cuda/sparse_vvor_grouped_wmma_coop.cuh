@@ -10,7 +10,7 @@
 
 #include "common.cuh"
 
-// ─── Cooperative-warp split-K WMMA vvor kernel (§1.9a, cycle-3) ─────────────
+// ─── Cooperative-warp split-K WMMA vvor kernel ──────────────────────────────
 //
 // VVOR: grad_weight[k][m][c] += grad_out[a_idx[t]][m] * b[b_idx[t]][c]
 //       summed over triplets t in segment k.
@@ -23,8 +23,6 @@
 //
 // Parallelism gain at small-C stages (enc0: 108 tiles → 864 blocks at W=8).
 // Tradeoff: W× more atomicAdds at segment end (256*W per tile).
-//
-// Pre-reg: autoresearch/threads/conv_extreme/0_expectations/cycle3_g11_7_three_lanes.md §1.9a
 
 namespace sparse_engines_cuda {
 

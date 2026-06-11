@@ -55,7 +55,13 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 	const auto c = ct * Tc;
 	const int l = min(L, T - (n * L));
 
-	T_b b = 0.0f;
+	// accumulate in fp32 regardless of input dtype. `b` is
+	// shuffled across the warp via __shfl_sync, which has no overload for the
+	// 2-byte c10::Half / c10::BFloat16 types — so the register-resident value
+	// is float (upcast on load via to_float_src), exactly as the fp32-accum
+	// invariant the grouped/WMMA paths already use. fp16/bf16 loads upcast;
+	// fp32 is a no-op cast → byte-identical to the prior fp32 path.
+	float b = 0.0f;
 	float o;
 	constexpr auto FULL_MASK = 0xffffffff;
 	const auto m_lt_M_MASK = __ballot_sync(FULL_MASK, m < M);
@@ -74,7 +80,7 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 				if (m < M) {
 #pragma unroll
 					for (int tc = 0; tc < Tc; ++tc) {
-						a[tc] = a_ptr[a_k_i + m + tc * M];
+						a[tc] = to_float_src(a_ptr[a_k_i + m + tc * M]);
 					}
 				}
 				a_k_prev = a_k_i;
@@ -82,7 +88,7 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 
 			if (b_k_i != b_k_prev) {
 				if (thread_id < Tc) {
-					b = b_ptr[b_k_i + thread_id];
+					b = to_float_src(b_ptr[b_k_i + thread_id]);
 				}
 				b_k_prev = b_k_i;
 			}
@@ -112,7 +118,7 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 			if (a_k_i != a_k_prev) {
 				if (m < M) {
 					for (int tc = 0; tc < Tc_max; ++tc) {
-						a[tc] = a_ptr[a_k_i + m + tc * M];
+						a[tc] = to_float_src(a_ptr[a_k_i + m + tc * M]);
 					}
 				}
 				a_k_prev = a_k_i;
@@ -120,7 +126,7 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 
 			if (b_k_i != b_k_prev) {
 				if (thread_id < Tc_max) {
-					b = b_ptr[b_k_i + thread_id];
+					b = to_float_src(b_ptr[b_k_i + thread_id]);
 				}
 				b_k_prev = b_k_i;
 			}
@@ -153,12 +159,10 @@ void sparse_matrix_vector_multiplication_reduction_impl_cuda_ct(
 	const auto C = a.size(2);
 	const auto M = a.size(3);
 
-	const auto a_ptr = a.data_ptr<float>();
 	const auto a_idx_ptr = a_idx.data_ptr<int32_t>();
-	const auto b_ptr = b.data_ptr<float>();
 	const auto b_idx_ptr = b_idx.data_ptr<int32_t>();
 	const auto o_idx_ptr = o_idx.data_ptr<int32_t>();
-	auto o_ptr = o.data_ptr<float>();
+	auto o_ptr = o.data_ptr<float>();   // output accumulator is always fp32
 
 	const auto warp_size = 32;
 	const auto warp_num = 32;
@@ -174,8 +178,19 @@ void sparse_matrix_vector_multiplication_reduction_impl_cuda_ct(
 
 	dim3 grid((N_G_Ct_Mw + warp_num - 1) / warp_num);
 	cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-	sparse_matrix_vector_multiplication_reduction_kernel<float, float, warp_size, Tc>
-		<<<grid, block, 0, stream>>>(a_ptr, a_idx_ptr, b_ptr, b_idx_ptr, o_idx_ptr, T, G, M, C, N, L, o_ptr);
+
+	// dispatch the input element type (fp32 / fp16 / bf16).
+	// The kernel accumulates in fp32 (to_float_src upcasts on load); only the
+	// gmem pointer type is templated. fp32 reproduces the prior
+	// `<float,float>` instantiation byte-for-byte.
+	AT_DISPATCH_FLOATING_TYPES_AND2(
+		at::kHalf, at::kBFloat16, a.scalar_type(),
+		"sparse_matrix_vector_multiplication_reduction_cuda", [&] {
+			const auto a_ptr = a.data_ptr<scalar_t>();
+			const auto b_ptr = b.data_ptr<scalar_t>();
+			sparse_matrix_vector_multiplication_reduction_kernel<scalar_t, scalar_t, warp_size, Tc>
+				<<<grid, block, 0, stream>>>(a_ptr, a_idx_ptr, b_ptr, b_idx_ptr, o_idx_ptr, T, G, M, C, N, L, o_ptr);
+		});
 
 	cudaError_t err{cudaGetLastError()};
 	TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err))

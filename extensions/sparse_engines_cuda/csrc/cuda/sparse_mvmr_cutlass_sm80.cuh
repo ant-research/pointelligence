@@ -1,33 +1,28 @@
 #ifndef SPARSE_ENGINES_CUDA_SPARSE_MVMR_CUTLASS_SM80_CUH
 #define SPARSE_ENGINES_CUDA_SPARSE_MVMR_CUTLASS_SM80_CUH
 
-// ─── G22 Task M1 — Tier-2 CUTLASS skeleton for mvmr (affine) ─────────────────
-//
-// Single-tile (M_TILE, S_TILE, K=C_seg) GEMM via CUTLASS 3.x CuTe +
+// ─── Tier-2 CUTLASS skeleton for mvmr (affine) ──────────────────────────────
+//// Single-tile (M_TILE, S_TILE, K=C_seg) GEMM via CUTLASS 3.x CuTe +
 // CollectiveMma<MainloopSm80CpAsyncUnpredicated<PIPE>, ...>. This is the
-// *skeleton* per the G22 plan §4 Task-M1 GO/NO-GO: affine layouts only,
-// no gather, no scatter. The structure is COPIED from the proven vvor
-// Task-1 template (sparse_vvor_cutlass_sm80.{cuh,cu}); the only semantic
-// change is the contraction axis.
-//
-// ── mvmr vs vvor (the one structural difference, gotten exactly right) ──
-//
-//   vvor (the template) contracts over seg_len (K):
+// *skeleton*: affine layouts only, no gather, no scatter. The structure
+// is COPIED from the proven vvor single-tile template
+// (sparse_vvor_cutlass_sm80.{cuh,cu}); the only semantic change is the
+// contraction axis.
+//// ── mvmr vs vvor (the one structural difference, gotten exactly right) ──
+////   vvor (the template) contracts over seg_len (K):
 //       grad_w[k] (M,C) = Σ_{t∈seg k} gradout[i[t]] (M-vec) ⊗ input[j[t]] (C-vec)
-//
-//   mvmr (this op) contracts over CHANNELS (C):
+////   mvmr (this op) contracts over CHANNELS (C):
 //       o[a_idx[t]] (M-vec) += W[k] (M,C) @ input[b_idx[t]] (C-vec),
 //       summed over triplets t in segment k.
-//
-//   Authoritative reference: sparse_engines/mvmr_triton.py ::
+////   Authoritative reference: sparse_engines/mvmr_triton.py ::
 //   sparse_matrix_vector_multiplication_reduction. The grouped kernel's
 //   core GEMM is  out (L, M) = block_b (L, C) @ block_a (C, M),  i.e. it
 //   contracts over C. W[k] is **affine/dense** (indexed by segment id k
-//   only — NOT gathered). input is gathered by b_idx (M2's problem).
-//   Output is scatter-accumulated by a_idx (M3's problem). M1 exercises
-//   ONLY the contraction-axis-C GEMM core with a dense-write epilogue.
-//
-// M1 single-tile contract (the vvor-Task-1 analog, contraction = C):
+//   only — NOT gathered). input is gathered by b_idx (the gathered op's
+//   problem). Output is scatter-accumulated by a_idx (the full op's
+//   problem). The single-tile op exercises ONLY the contraction-axis-C
+//   GEMM core with a dense-write epilogue.
+//// Single-tile contract (the vvor single-tile analog, contraction = C):
 //   A (weight tile)  : (M_TILE, C_seg) row-major  → strides (C_seg, 1)
 //   B (input tile)   : (S_TILE, C_seg) row-major  → strides (C_seg, 1)
 //   C (output tile)  : (M_TILE, S_TILE) row-major → strides (S_TILE, 1)
@@ -35,9 +30,8 @@
 // Both A and B have C (contraction) as the inner contiguous dim — the
 // host wrapper does `index_select(...).t().contiguous()` to produce
 // this memory layout (single index_select + view, cheap), exactly as
-// the vvor Task-1 wrapper does for its K axis.
-//
-// CRITICAL inherited lesson (the G14 +1,+1-shift bug, ~3h lost in vvor):
+// the vvor single-tile wrapper does for its K axis.
+//// CRITICAL inherited lesson (the +1,+1-shift bug seen in vvor):
 // `GmemTiledCopyA/B` thread×val layout MUST be
 //   Layout<Shape<_32,_4>,Stride<_4,_1>>{} , Layout<Shape<_1,_8>>{}
 // → Tiler_MN = (TileM/2, TileK). The `(_16,_8)×(_1,_8)` form produces
@@ -46,11 +40,13 @@
 // verbatim from the vvor .cuh (see its comment block lines 80–94).
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/copy_atom.hpp>
 
+#include <cutlass/numeric_types.h>   // cutlass::half_t / cutlass::bfloat16_t
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/collective/collective_mma.hpp>
 
@@ -58,27 +54,42 @@ namespace sparse_engines_cuda {
 
 using namespace cute;
 
+// ── element→MMA-atom selector (mvmr TU) ────────────────────
+// Re-declared in this translation unit (the vvor .cuh's `Sm80MmaAtomFor` is
+// not visible here; both compile independently). half_t → fp16 HMMA atom
+// (byte-identical to the prior hardcode), bfloat16_t → bf16 sibling
+// (same tile shape / fp32 accumulator). No fp32 SM80 TC atom of this shape.
+template <class Element> struct Sm80MvmrMmaAtomFor;
+template <> struct Sm80MvmrMmaAtomFor<cutlass::half_t> {
+  using type = SM80_16x8x16_F32F16F16F32_TN;
+};
+template <> struct Sm80MvmrMmaAtomFor<cutlass::bfloat16_t> {
+  using type = SM80_16x8x16_F32BF16BF16F32_TN;
+};
+
 // Per-instantiation tile config. Mirrors VvorCutlassSm80FpropConfig
 // verbatim — the GEMM shape is identical (single (M_TILE, S_TILE) tile,
 // contraction axis tiled by TileK). At enc4 fp16 (M=C=512), TileM=64,
 // TileN(=S_TILE)=64, TileK(=C-tile)=32.
-struct MvmrCutlassSm80FpropConfig {
+template <class Element_ = cutlass::half_t>
+struct MvmrCutlassSm80FpropConfigT {
   using TileM = _64;   // output M (weight rows / o channels)
   using TileN = _64;   // S_TILE (input-triplet rows for this tile)
   using TileK = _32;   // C-tile along the channel contraction axis
   using PIPE  = _3;    // 3-stage cp.async pipeline (matches example 59)
 
-  using ElementA   = cutlass::half_t;       // weight element
-  using ElementB   = cutlass::half_t;       // input element
+  using ElementA   = Element_;              // weight element (fp16/bf16)
+  using ElementB   = Element_;              // input element
   using ElementAcc = float;                 // fp32 accumulator
   using ElementC   = float;                 // fp32 output (o tile)
 
   using TileShape  = Shape<TileM, TileN, TileK>;
 
-  // SM80 fp16-input fp32-accum HMMA atom. m16n8k16 is the canonical fp16
-  // tensor-core atom on sm_80/sm_89.
+  // SM80 16-bit-input fp32-accum HMMA atom (m16n8k16), selected from the
+  // element type (half_t → F32F16F16F32, bfloat16_t → F32BF16BF16F32). The
+  // fp16 instantiation is byte-identical to the prior hardcode.
   using TiledMma = TiledMMA<
-      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+      MMA_Atom<typename Sm80MvmrMmaAtomFor<Element_>::type>,
       Layout<Shape<_2, _2, _1>>,      // 2x2 warps -> 4 warps = 128 threads
       Tile<_32, _32, Underscore>>;    // pad warp tile to (32, 32, K)
 
@@ -88,7 +99,7 @@ struct MvmrCutlassSm80FpropConfig {
 
   // ── Gmem tiled-copy for A (weight tile, C-major) ─────────────────────
   // A is (M_TILE, C_TILE) row-major in memory -- C is the leading dim
-  // (contiguous). The (_32,_4)×(_1,_8) form is the G14-validated layout
+  // (contiguous). The (_32,_4)×(_1,_8) form is the validated layout
   // (see the .cuh header note on the +1,+1-shift bug). Do NOT change to
   // (_16,_8) — that form overshoots TileK and clobbers smem.
   using GmemTiledCopyA = decltype(make_tiled_copy(
@@ -139,14 +150,18 @@ struct MvmrCutlassSm80FpropConfig {
   };
 };
 
+// fp16 alias = the exact prior type (byte-identical codegen); bf16
+// is the new bf16 instantiation. The sm_90 mvmr config aliases this Fprop
+// config (sparse_mvmr_cutlass_sm90.cuh), so both dtypes flow to sm_90 too.
+using MvmrCutlassSm80FpropConfig     = MvmrCutlassSm80FpropConfigT<cutlass::half_t>;
+using MvmrCutlassSm80FpropConfigBf16 = MvmrCutlassSm80FpropConfigT<cutlass::bfloat16_t>;
+
 // ── Kernel body ─────────────────────────────────────────────────────────
-//
-// Operates on already-tile-shaped gmem tensors:
+//// Operates on already-tile-shaped gmem tensors:
 //   gA : (M_TILE, C_seg) row-major fp16, C-contiguous  (weight tile)
 //   gB : (S_TILE, C_seg) row-major fp16, C-contiguous  (input tile)
 //   gC : (M_TILE, S_TILE) row-major fp32 (zero-initialized by host)
-//
-// Single-CTA launch. C_seg is the (padded) channel contraction length.
+//// Single-CTA launch. C_seg is the (padded) channel contraction length.
 // Structurally identical to VvorCutlassSm80SingleTileOp — only the
 // operand semantics (contraction over C, affine weight) differ; the
 // CUTLASS plumbing is unchanged.
@@ -208,12 +223,12 @@ struct MvmrCutlassSm80SingleTileOp {
         gB,
         accum,
         k_tile_iter, k_tile_count,
-        Underscore{},   // no residue predication for M1
+        Underscore{},   // no residue predication for the single-tile case
         threadIdx.x,
         smem_buf);
 
     // ── Epilogue: dense write of the accumulator through smem to gmem ──
-    // (M1 = dense write; the scatter-accumulate by a_idx is M3's problem.)
+    // (Dense write; the scatter-accumulate by a_idx is the full op's problem.)
     auto& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sC[0]),
                             typename Config::SmemLayoutOut{});
@@ -234,17 +249,14 @@ struct MvmrCutlassSm80SingleTileOp {
   }
 };
 
-// ── Task M3: full mvmr op — ragged K-segment grid + scatter epilogue ────────
-//
-// Drop-in replacement for sparse_matrix_vector_multiplication_reduction
+// ── Full mvmr op — ragged K-segment grid + scatter epilogue ─────────────────
+//// Drop-in replacement for sparse_matrix_vector_multiplication_reduction
 // (the Triton-grouped mvmr). One CTA per (m-tile, k-segment); the CTA
 // loops over S-chunks of its segment internally, running one
 // (M_TILE, S_TILE, C) GEMM per chunk and scatter-accumulating each
 // result column into o[o_idx[t]] via atomicAdd.
-//
-// ── The two genuinely-new surfaces vs M1/M2 (everything else inherited) ──
-//
-//  1. Ragged grid + per-segment S-chunk loop. mvmr's segment length is
+//// ── The two genuinely-new surfaces vs the single-tile/gathered ops ──
+////  1. Ragged grid + per-segment S-chunk loop. mvmr's segment length is
 //     the GEMM's *N/S* dimension (NOT the contraction — that is C, fixed
 //     and tiled by TileK inside the mainloop). A long segment therefore
 //     needs ceil(seg_len / S_TILE) separate GEMMs, each over a different
@@ -254,8 +266,7 @@ struct MvmrCutlassSm80SingleTileOp {
 //     table / no extra sync — exactly the grouped_mma.cuh structure
 //     (one worker per (k, ...) that loops triplets internally), lifted
 //     onto the CUTLASS GEMM core.
-//
-//  2. The scatter-accumulate epilogue. vvor wrote a *dense* grad_w[k]
+////  2. The scatter-accumulate epilogue. vvor wrote a *dense* grad_w[k]
 //     tile (output indexed by k directly). mvmr scatters into
 //     o[o_idx[t]] — output rows selected per triplet, many triplets per
 //     row. We lift the proven epilogue from
@@ -266,21 +277,18 @@ struct MvmrCutlassSm80SingleTileOp {
 //     run-length coalescing trick), accumulating consecutive same-o_idx
 //     columns in-register first. The op output buffer is fp32
 //     (mvmr_triton.py:128) so the fp32-atomicAdd precondition holds.
-//
-// Padded S-slots (the last partial S-tile, slots s ≥ chunk_len) clamp
-// (SegmentClampedGather, G24-T2 kernel-side virtual zero) to in-bounds
-// real input row 0 — NO host-appended sentinel row. The scatter loop
-// stops at chunk_len, so an OOB column's GEMM value is computed but
-// never emitted. OOB contribution is therefore exactly 0 by structural
-// exclusion (the prior Option-3 host-zero-row only ever zeroed these
-// same unused columns; the per-call host (N_b+1,W) alloc/copy/zero_ is
-// dropped). No garbage scattered.
-//
-// W stays affine: the host pre-transposes a (K,1,C,M) → aT (K,M,C)
+//// Padded S-slots (the last partial S-tile, slots s ≥ chunk_len) clamp
+// (SegmentClampedGather kernel-side virtual zero) to in-bounds real input
+// row 0 — NO host-appended sentinel row. The scatter loop stops at
+// chunk_len, so an OOB column's GEMM value is computed but never emitted.
+// OOB contribution is therefore exactly 0 by structural exclusion (a
+// host-zero-row only ever zeroed these same unused columns; the per-call
+// host (N_b+1,W) alloc/copy/zero_ is dropped). No garbage scattered.
+//// W stays affine: the host pre-transposes a (K,1,C,M) → aT (K,M,C)
 // C-contiguous once (the mvmr analog of vvor's pre-gather staging), so
-// the W[k] (M_TILE, C) tile is C-contiguous exactly like M1's A and the
-// M1 MvmrCutlassSm80FpropConfig + the M2 IndexedGather-on-S B view
-// compose directly — no new Config.
+// the W[k] (M_TILE, C) tile is C-contiguous exactly like the single-tile
+// A and the single-tile MvmrCutlassSm80FpropConfig + the IndexedGather-on-S
+// B view compose directly — no new Config.
 template <class Config>
 struct MvmrCutlassSm80FullOp {
   using TileM     = typename Config::TileM;
@@ -324,8 +332,7 @@ struct MvmrCutlassSm80FullOp {
   //   gW : (TileM, C_seg_padded)  affine C-contig  (W[k] m-tile slice)
   //   gB : (TileN, C_seg_padded)  S-gathered, C-contig (input chunk)
   // and scatter-accumulate the result columns into o via atomicAdd.
-  //
-  //   o_idx_chunk : pointer into o_idx at the chunk's first triplet
+  //  //   o_idx_chunk : pointer into o_idx at the chunk's first triplet
   //   chunk_len   : real triplet count in this chunk (≤ TileN)
   //   o_ptr       : (n_o, M_full) fp32 output (G=1 squeezed)
   //   m_start     : this CTA's M-tile origin

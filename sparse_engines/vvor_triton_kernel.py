@@ -14,7 +14,7 @@ import triton.language as tl
 # fp16-precision concern: the previous implementation accumulated the running
 # outer-product `block_o` in the inputs' native dtype, which means at fp16,
 # 128 outer-products sum in fp16 → ~9 bits of magnitude lost per accumulation
-# (matches the cycle-9 hybrid bench symptom). Fix: cast inputs to fp32 before
+# (matches a hybrid bench symptom). Fix: cast inputs to fp32 before
 # multiply so the running accumulator and the per-triplet outer-product are
 # both fp32.
 #

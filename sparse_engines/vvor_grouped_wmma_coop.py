@@ -1,11 +1,9 @@
-"""Grouped VVOR via cooperative-warp split-K WMMA kernel (cycle-3 §1.9a / G11.7a).
+"""Grouped VVOR via cooperative-warp split-K WMMA kernel.
 
 Same algorithm as sparse_vvor_grouped_wmma but each (k, mt, ct) tile is
 split across W=8 single-warp blocks along the T axis. Each block accumulates
 a partial 16x16 fp32 grad_weight fragment and atomicAdds to the pre-zeroed
 output. Goal: use more SMs at small-C stages (enc0: 108 -> 864 blocks at W=8).
-
-Pre-reg: cycle3_g11_7_three_lanes.md §1.9a.
 """
 
 import torch

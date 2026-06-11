@@ -53,7 +53,7 @@ static void sparse_vvor_grouped_wmma_impl_cuda(
     TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err));
 }
 
-// G11.5: dispatch on both feature dtype AND index dtype so the wrapper
+// Dispatch on both feature dtype AND index dtype so the wrapper
 // doesn't need to cast indices. build_triplets produces int32 indices for
 // most production point counts (<= INT32_MAX); parity tests use int64;
 // both are accepted natively.

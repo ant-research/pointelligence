@@ -1,12 +1,10 @@
-// Task 4 — Hopper sm_90 vvor backward entry point (cycle-4 §1.12 G14/G18).
-//
-// Build-only locally (dev box is sm_89; sm_90 runs on the H200 cluster
+// Hopper sm_90 vvor backward entry point.
+//// Build-only locally (dev box is sm_89; sm_90 runs on the H200 cluster
 // cell). See sparse_vvor_cutlass_sm90.cuh for the full rationale on why
 // this is the proven Sm80 `MainloopSm80CpAsyncUnpredicated` +
-// `SegmentClampedGather` op cross-compiled for sm_90 (R2-compliant
-// cp.async Hopper path) rather than a genuine WGMMA Sm90 collective.
-//
-// Host entry point `sparse_vvor_cutlass_sm90_full` mirrors
+// `SegmentClampedGather` op cross-compiled for sm_90 (cp.async Hopper
+// path) rather than a genuine WGMMA Sm90 collective.
+//// Host entry point `sparse_vvor_cutlass_sm90_full` mirrors
 // `sparse_vvor_cutlass_sm80_full` exactly (same algorithm, same
 // sentinel-zero-row at::cat, same (ct, mt, k) grid). It exists as a
 // distinct symbol so the Python dispatcher can route sm_90 hardware
@@ -31,8 +29,12 @@ namespace sparse_engines_cuda {
 
 namespace {
 
-using Sm90FullConfig = VvorCutlassSm90Config;                 // == Sm80GatherConfig
-using Sm90FullOp     = VvorCutlassSm90FullOp<Sm90FullConfig>;  // == Sm80FullOp
+// element-templated sm_90 config (== Sm80GatherConfigT).
+// fp16 (half_t) reproduces the prior path; bf16 (bfloat16_t) is the
+// new instantiation. The sm_90 kernel cross-compiles the same frozen Sm80
+// cp.async-Unpredicated op for the Hopper SASS.
+template <class Element>
+using Sm90FullConfigFor = VvorCutlassSm80GatherConfigT<Element>;
 using Sm90IndexT     = int32_t;
 
 // Gather functor: identical semantics to the sm_80 SegmentClampedGather
@@ -62,12 +64,13 @@ struct Sm90SegmentClampedGather {
   Index        sentinel_;
 };
 
+template <class Element>
 __global__
-__launch_bounds__(Sm90FullConfig::MaxThreadsPerBlock,
-                  Sm90FullConfig::MinBlocksPerMultiprocessor)
+__launch_bounds__(Sm90FullConfigFor<Element>::MaxThreadsPerBlock,
+                  Sm90FullConfigFor<Element>::MinBlocksPerMultiprocessor)
 void vvor_cutlass_sm90_full_kernel(
-    const cutlass::half_t* __restrict__ grad_output_ptr,  // (N_o+1, M_full)
-    const cutlass::half_t* __restrict__ input_ptr,        // (N_b+1, C_full)
+    const Element*         __restrict__ grad_output_ptr,  // (N_o+1, M_full)
+    const Element*         __restrict__ input_ptr,        // (N_b+1, C_full)
     const Sm90IndexT*      __restrict__ a_idx_ptr,        // (T,) sorted-by-k
     const Sm90IndexT*      __restrict__ b_idx_ptr,        // (T,)
     const int64_t*         __restrict__ seg_offs_ptr,     // (n_o + 1,)
@@ -78,6 +81,8 @@ void vvor_cutlass_sm90_full_kernel(
     int sentinel_b                                        // = N_b
 ) {
   using namespace cute;
+  using Sm90FullConfig = Sm90FullConfigFor<Element>;
+  using Sm90FullOp     = VvorCutlassSm90FullOp<Sm90FullConfig>;
 
   constexpr int TileM = int(Sm90FullConfig::TileM::value);
   constexpr int TileN = int(Sm90FullConfig::TileN::value);
@@ -132,12 +137,65 @@ void vvor_cutlass_sm90_full_kernel(
   op(mA, mB, mC, K_seg_padded, smem_buf);
 }
 
+// dtype-templated sm_90 launch helper (mirrors the sm_80
+// twin). Element ∈ {half_t, bfloat16_t}; C10 is the matching ATen type.
+template <class Element, class C10>
+static void launch_vvor_sm90_full(
+    const at::Tensor& gout_2d, const at::Tensor& inb_2d,
+    const at::Tensor& a_idx, const at::Tensor& b_idx,
+    const at::Tensor& seg_offs, at::Tensor& grad_weight,
+    int M_full, int C_full, int N_o, int N_b, int n_o_i
+) {
+  using Sm90FullConfig = Sm90FullConfigFor<Element>;
+  using Sm90FullOp     = VvorCutlassSm90FullOp<Sm90FullConfig>;
+  constexpr int M_TILE = int(Sm90FullConfig::TileM::value);
+  constexpr int N_TILE = int(Sm90FullConfig::TileN::value);
+
+  // Single-alloc sentinel-zero-row (see sm80 twin for rationale).
+  auto gout_pad = at::empty({N_o + 1, M_full}, gout_2d.options());
+  gout_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_o).copy_(gout_2d);
+  gout_pad.narrow(/*dim=*/0, /*start=*/N_o, /*length=*/1).zero_();
+  auto inb_pad = at::empty({N_b + 1, C_full}, inb_2d.options());
+  inb_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_b).copy_(inb_2d);
+  inb_pad.narrow(/*dim=*/0, /*start=*/N_b, /*length=*/1).zero_();
+
+  const int M_tiles = M_full / M_TILE;
+  const int C_tiles = C_full / N_TILE;
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr size_t smem_size = Sm90FullOp::kSmemBytes;
+
+  cudaError_t attr_err = cudaFuncSetAttribute(
+      vvor_cutlass_sm90_full_kernel<Element>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_size));
+  TORCH_CHECK(attr_err == cudaSuccess,
+      "cudaFuncSetAttribute (sm90 full) failed: ", cudaGetErrorString(attr_err));
+
+  dim3 grid(C_tiles, M_tiles, n_o_i);   // (ct, mt, k)
+  vvor_cutlass_sm90_full_kernel<Element>
+      <<<grid, Sm90FullConfig::MaxThreadsPerBlock, smem_size, stream>>>(
+          reinterpret_cast<const Element*>(gout_pad.template data_ptr<C10>()),
+          reinterpret_cast<const Element*>(inb_pad .template data_ptr<C10>()),
+          a_idx.data_ptr<Sm90IndexT>(),
+          b_idx.data_ptr<Sm90IndexT>(),
+          seg_offs.data_ptr<int64_t>(),
+          grad_weight.data_ptr<float>(),
+          M_full, C_full,
+          /*sentinel_a=*/N_o,
+          /*sentinel_b=*/N_b);
+
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+      "vvor_cutlass_sm90_full kernel launch failed: ", cudaGetErrorString(err));
+}
+
 } // namespace
 
 at::Tensor sparse_vvor_cutlass_sm90_full(
-    at::Tensor grad_output,   // (N_o, 1, M_full) or (N_o, M_full) fp16
+    at::Tensor grad_output,   // (N_o, 1, M_full) or (N_o, M_full) fp16/bf16
     at::Tensor a_idx,         // (T,) int32 — output-row idx, sorted by k
-    at::Tensor input_b,       // (N_b, 1, C_full) or (N_b, C_full) fp16
+    at::Tensor input_b,       // (N_b, 1, C_full) or (N_b, C_full) fp16/bf16
     at::Tensor b_idx,         // (T,) int32 — input-row idx
     at::Tensor seg_offs,      // (n_o + 1,) int64 — per-k segment offsets
     int64_t n_o
@@ -146,9 +204,14 @@ at::Tensor sparse_vvor_cutlass_sm90_full(
       "sparse_vvor_cutlass_sm90_full: grad_output / input_b must be CUDA");
   TORCH_CHECK(a_idx.is_cuda() && b_idx.is_cuda() && seg_offs.is_cuda(),
       "sparse_vvor_cutlass_sm90_full: index / seg_offs tensors must be CUDA");
-  TORCH_CHECK(grad_output.scalar_type() == at::kHalf &&
-              input_b.scalar_type() == at::kHalf,
-      "sparse_vvor_cutlass_sm90_full: fp16 only");
+  // fp16 OR bf16 (both operands same dtype); fp32 rejected.
+  TORCH_CHECK(grad_output.scalar_type() == input_b.scalar_type(),
+      "sparse_vvor_cutlass_sm90_full: grad_output and input_b must share dtype "
+      "(got ", grad_output.scalar_type(), " and ", input_b.scalar_type(), ")");
+  TORCH_CHECK(grad_output.scalar_type() == at::kHalf ||
+              grad_output.scalar_type() == at::kBFloat16,
+      "sparse_vvor_cutlass_sm90_full: fp16/bf16 only (got ",
+      grad_output.scalar_type(), ")");
   TORCH_CHECK(a_idx.scalar_type() == at::kInt && b_idx.scalar_type() == at::kInt,
       "sparse_vvor_cutlass_sm90_full: a_idx / b_idx must be int32");
   TORCH_CHECK(seg_offs.scalar_type() == at::kLong,
@@ -174,23 +237,15 @@ at::Tensor sparse_vvor_cutlass_sm90_full(
   TORCH_CHECK(gout_2d.dim() == 2 && inb_2d.dim() == 2,
       "sparse_vvor_cutlass_sm90_full: grad_output / input must be 2-D after squeeze");
 
-  constexpr int M_TILE = int(Sm90FullConfig::TileM::value);
-  constexpr int N_TILE = int(Sm90FullConfig::TileN::value);
+  // TileM/N dtype-invariant.
+  constexpr int M_TILE = int(VvorCutlassSm90Config::TileM::value);
+  constexpr int N_TILE = int(VvorCutlassSm90Config::TileN::value);
 
   const int M_full = static_cast<int>(gout_2d.size(1));
   const int C_full = static_cast<int>(inb_2d .size(1));
   const int n_o_i  = static_cast<int>(n_o);
   const int N_o    = static_cast<int>(gout_2d.size(0));
   const int N_b    = static_cast<int>(inb_2d .size(0));
-
-  // G17: single-alloc construction (see sm80 twin for rationale). Identical
-  // contiguous (N+1, W) sentinel-row buffer, strictly fewer dispatched ops.
-  auto gout_pad = at::empty({N_o + 1, M_full}, gout_2d.options());
-  gout_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_o).copy_(gout_2d);
-  gout_pad.narrow(/*dim=*/0, /*start=*/N_o, /*length=*/1).zero_();
-  auto inb_pad = at::empty({N_b + 1, C_full}, inb_2d.options());
-  inb_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_b).copy_(inb_2d);
-  inb_pad.narrow(/*dim=*/0, /*start=*/N_b, /*length=*/1).zero_();
 
   TORCH_CHECK(M_full % M_TILE == 0,
       "sparse_vvor_cutlass_sm90_full: M_full=", M_full,
@@ -202,38 +257,19 @@ at::Tensor sparse_vvor_cutlass_sm90_full(
       "sparse_vvor_cutlass_sm90_full: seg_offs must have n_o+1 elements (got ",
       seg_offs.numel(), ", n_o=", n_o, ")");
 
-  const int M_tiles = M_full / M_TILE;
-  const int C_tiles = C_full / N_TILE;
-
   auto options_w = at::TensorOptions().dtype(torch::kFloat32).device(gout_2d.device());
   auto grad_weight = torch::zeros({n_o, 1, M_full, C_full}, options_w);
 
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr size_t smem_size = Sm90FullOp::kSmemBytes;
-
-  cudaError_t attr_err = cudaFuncSetAttribute(
-      vvor_cutlass_sm90_full_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_size));
-  TORCH_CHECK(attr_err == cudaSuccess,
-      "cudaFuncSetAttribute (sm90 full) failed: ", cudaGetErrorString(attr_err));
-
-  dim3 grid(C_tiles, M_tiles, n_o_i);   // (ct, mt, k)
-  vvor_cutlass_sm90_full_kernel
-      <<<grid, Sm90FullConfig::MaxThreadsPerBlock, smem_size, stream>>>(
-          reinterpret_cast<const cutlass::half_t*>(gout_pad.data_ptr<c10::Half>()),
-          reinterpret_cast<const cutlass::half_t*>(inb_pad .data_ptr<c10::Half>()),
-          a_idx.data_ptr<Sm90IndexT>(),
-          b_idx.data_ptr<Sm90IndexT>(),
-          seg_offs.data_ptr<int64_t>(),
-          grad_weight.data_ptr<float>(),
-          M_full, C_full,
-          /*sentinel_a=*/N_o,
-          /*sentinel_b=*/N_b);
-
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess,
-      "vvor_cutlass_sm90_full kernel launch failed: ", cudaGetErrorString(err));
+  // dispatch on operand dtype (fp16 → prior path).
+  if (gout_2d.scalar_type() == at::kHalf) {
+    launch_vvor_sm90_full<cutlass::half_t, c10::Half>(
+        gout_2d, inb_2d, a_idx, b_idx, seg_offs, grad_weight,
+        M_full, C_full, N_o, N_b, n_o_i);
+  } else {  // at::kBFloat16 (guarded above)
+    launch_vvor_sm90_full<cutlass::bfloat16_t, c10::BFloat16>(
+        gout_2d, inb_2d, a_idx, b_idx, seg_offs, grad_weight,
+        M_full, C_full, N_o, N_b, n_o_i);
+  }
 
   return grad_weight;
 }

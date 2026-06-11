@@ -1,15 +1,15 @@
-"""Tier-2 CUTLASS skeleton vvor (cycle-4 §1.11 G14 Task 1).
+"""Tier-2 CUTLASS skeleton vvor.
 
-This is the *skeleton* path per pre-reg cycle4_tier2_cutlass_vvor.md §6
-day-3 GO/NO-GO criteria — affine CUTLASS layouts only, no IndexedGather.
-The Python wrapper PRE-GATHERS one (k, mt, ct) segment's rows from
-grad_output / input into contiguous (M_TILE, K_seg) and (N_TILE, K_seg)
-buffers, then calls the single-tile op which performs the inner
-(M_TILE, N_TILE, K_seg) GEMM via `CollectiveMma<MainloopSm80CpAsyncUnpredicated>`.
+This is the *skeleton* path — affine CUTLASS layouts only, no
+IndexedGather. The Python wrapper PRE-GATHERS one (k, mt, ct) segment's
+rows from grad_output / input into contiguous (M_TILE, K_seg) and
+(N_TILE, K_seg) buffers, then calls the single-tile op which performs
+the inner (M_TILE, N_TILE, K_seg) GEMM via
+`CollectiveMma<MainloopSm80CpAsyncUnpredicated>`.
 
-Task 2 will replace the explicit pre-gather with `make_gather_tensor`
-composed-layout inside cp.async loads. Task 3 will add the outer
-(k, mt, ct) grid scheduler.
+The gathered variant replaces the explicit pre-gather with
+`make_gather_tensor` composed-layout inside cp.async loads. The full op
+adds the outer (k, mt, ct) grid scheduler.
 
 Public surface:
   vvor_cutlass_sm80_single_tile_reference(...)
@@ -122,7 +122,7 @@ def vvor_cutlass_sm80_single_tile_reference(
     return A32 @ B32.transpose(0, 1)
 
 
-# ─── Task 2 — kernel-side IndexedGather (K-mode) ──────────────────────────────
+# ─── Kernel-side IndexedGather (K-mode) ───────────────────────────────────────
 
 
 def pad_indices_for_gather(
@@ -157,7 +157,7 @@ def vvor_cutlass_sm80_single_tile_gathered(
     c_start:     int,
     k_seg_padded: int,
 ) -> Tensor:
-    """Task-2 entry: composed IndexedGather inside the CUTLASS mainloop.
+    """Gathered entry: composed IndexedGather inside the CUTLASS mainloop.
 
     Reads grad_output / input directly (no Python pre-gather) and lets the
     `make_gather_tensor` composed layout drive K-mode gather inside the
@@ -180,7 +180,7 @@ def vvor_cutlass_sm80_single_tile_gathered_reference(
     m_start:     int,
     c_start:     int,
 ) -> Tensor:
-    """Scalar reference for the Task-2 entrypoint.
+    """Scalar reference for the gathered entrypoint.
 
     Computes (M_TILE, N_TILE) fp32 tile by gathering on the Python side
     and doing the matmul in fp32 (matches the CUTLASS fp32 accumulator).
@@ -203,7 +203,7 @@ def vvor_cutlass_sm80_single_tile_gathered_reference(
     return A_gathered.transpose(0, 1).float() @ B_gathered.float()
 
 
-# ─── Task 3 — full vvor backward (outer (k, mt, ct) grid scheduler) ───────────
+# ─── Full vvor backward (outer (k, mt, ct) grid scheduler) ────────────────────
 
 
 def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
@@ -214,7 +214,7 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
     o_idx: Tensor,    # (T,) int — kernel-offset index per triplet, sorted asc
     n_o: int,         # number of kernel offsets (K_offsets) = grad_weight k-dim
 ) -> Tensor:
-    """Full vvor backward via the Tier-2 CUTLASS path (cycle-4 §1.11 G14 Task 3).
+    """Full vvor backward via the Tier-2 CUTLASS path.
 
     Drop-in replacement for
     ``sparse_vector_vector_outer_product_reduction_grouped_wmma_coop`` /
@@ -227,7 +227,10 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
     Preconditions (shared with the other grouped paths):
       - o_idx sorted ascending (sort_by="k")
       - G == 1
-      - fp16 inputs (fp32 / bf16 not supported by this Tier-2 path)
+      - fp16 OR bf16 inputs, both operands the same dtype (the
+        SM80_16x8x16_F32BF16BF16F32_TN atom path handles bf16). fp32 is
+        NOT supported — there is no SM80 tensor-core atom of this shape for
+        true fp32 (only TF32/BF16/FP16); fp32 conv stays on the Triton path.
       - M and C multiples of the kernel tile (TileM=TileN=64)
     """
     a = a.contiguous()
@@ -239,9 +242,9 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
 
     if G != 1:
         raise ValueError("CUTLASS full vvor requires G == 1")
-    if a.dtype != torch.float16 or b.dtype != torch.float16:
+    if a.dtype != b.dtype or a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
-            "CUTLASS full vvor is fp16-only "
+            "CUTLASS full vvor is fp16/bf16-only, both operands same dtype "
             f"(got a={a.dtype}, b={b.dtype})"
         )
     if M % M_TILE != 0 or C % N_TILE != 0:
@@ -259,10 +262,10 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
     seg_offs_i64 = seg_offs.to(torch.int64)
 
     # Arch dispatch: route Hopper (sm_90+) hardware to the sm_90-targeted
-    # op (cycle-4 §1.12 G14/G18 Task 4). The two ops are algorithmically
-    # identical (same Sm80 cp.async-Unpredicated + sentinel-zero-row); the
-    # sm_90 symbol exists so the H200 cell exercises the sm_90 SASS path.
-    # On sm_80/89 the sm_80 op stays the path of record.
+    # op. The two ops are algorithmically identical (same Sm80
+    # cp.async-Unpredicated + sentinel-zero-row); the sm_90 symbol exists
+    # so sm_90 hardware exercises the sm_90 SASS path. On sm_80/89 the
+    # sm_80 op stays the path of record.
     major = torch.cuda.get_device_capability(a.device)[0]
     if major >= 9:
         return torch.ops.sparse_engines_cuda.sparse_vvor_cutlass_sm90_full(

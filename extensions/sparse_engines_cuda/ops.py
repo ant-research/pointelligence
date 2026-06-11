@@ -27,13 +27,15 @@ def _(a, a_idx, b, b_idx, o_idx, n):
     torch._check(a.device == b_idx.device)
     torch._check(a.device == o_idx.device)
 
-    torch._check(a.dtype == torch.float32)
+    # CUDA kernel accepts fp32 / fp16 / bf16 (a and b share
+    # the dtype); fp32-accumulate, output cast back to input dtype.
+    torch._check(a.dtype in (torch.float32, torch.float16, torch.bfloat16))
     torch._check(a.ndim == 4)
 
     torch._check(a_idx.dtype == torch.int32)
     torch._check(a_idx.ndim == 1)
 
-    torch._check(b.dtype == torch.float32)
+    torch._check(b.dtype == a.dtype)
     torch._check(b.ndim == 3)
     torch._check(a.size(1) == b.size(1))
     torch._check(b.size(2) == b.size(2))
@@ -104,13 +106,15 @@ def _(a, a_idx, b, b_idx, o_idx, n):
     torch._check(a.device == b_idx.device)
     torch._check(a.device == o_idx.device)
 
-    torch._check(a.dtype == torch.float32)
+    # CUDA kernel accepts fp32 / fp16 / bf16 (a and b share
+    # the dtype); fp32-accumulate, output cast back to input dtype.
+    torch._check(a.dtype in (torch.float32, torch.float16, torch.bfloat16))
     torch._check(a.ndim == 3)
 
     torch._check(a_idx.dtype == torch.int32)
     torch._check(a_idx.ndim == 1)
 
-    torch._check(b.dtype == torch.float32)
+    torch._check(b.dtype == a.dtype)
     torch._check(b.ndim == 3)
     torch._check(a.size(1) == b.size(1))
 

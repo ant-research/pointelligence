@@ -37,9 +37,9 @@ _L_CHUNK_OPTIONS = (16, 32, 64, 128, 256)
 # tl.dot has shape `(M, L) @ (L, C) → (M, C)`. We require both M and C
 # ≥ 128 — i.e. the matmul tile must be deep on both axes for the tensor-
 # core throughput to overcome the per-program setup cost. Empirical
-# crossover from PTv3 stage-profile benches matches MVMR's: grouped beats
-# per_triplet starting at C=128 (fp16/bf16, tied at fp32) and dominates
-# at C ≥ 256.
+# crossover from the PointConv3d engine bench PTv3 stage profile
+# matches MVMR's: grouped beats per_triplet starting at C=128 (fp16/bf16,
+# tied at fp32) and dominates at C ≥ 256.
 _GROUPED_MIN_DIM = 128
 
 
@@ -100,11 +100,11 @@ def _try_grouped_dispatch(
 def sparse_vector_vector_outer_product_reduction(
     a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, o_idx: Tensor, n_o: int
 ) -> Tensor:
-    # Cycle-3 §1.5 (Gate 1): when the dispatch override is
-    # "force_grouped_wmma_vvor", bypass the Triton path entirely and route
-    # to the hand-CUDA WMMA-direct grouped kernel. Same autograd hooks
-    # apply (registered on this @triton_op below), so the backward path
-    # of an mvmr-fwd invocation still flows through here correctly.
+    # When the dispatch override is "force_grouped_wmma_vvor", bypass the
+    # Triton path entirely and route to the hand-CUDA WMMA-direct grouped
+    # kernel. Same autograd hooks apply (registered on this @triton_op
+    # below), so the backward path of an mvmr-fwd invocation still flows
+    # through here correctly.
     if current_mode() == "force_grouped_wmma_vvor":
         from .vvor_grouped_wmma import (
             sparse_vector_vector_outer_product_reduction_grouped_wmma,
@@ -122,19 +122,43 @@ def sparse_vector_vector_outer_product_reduction(
     if current_mode() in (
         "force_grouped_cutlass_vvor", "force_grouped_cutlass_mvmr_vvor",
     ):
-        # Cycle-4 §1.11 G14 Task 5: route to the Tier-2 CUTLASS
-        # implicit-GEMM + K-mode IndexedGather vvor. fp16/bf16 only;
-        # fp32 falls back to scalar-FMA exactly like the WMMA paths.
-        # M6a: the combined "force_grouped_cutlass_mvmr_vvor" mode ALSO
-        # routes vvor here. mvmr's backward computes grad_a via a vvor
-        # call (_backward_…sparse_matrix_vector_multiplication_reduction),
-        # so under the combined mode grad_a hits CUTLASS vvor here while
-        # mvmr fwd+grad_b hit CUTLASS mvmr in mvmr_triton.py.
-        if a.dtype == torch.float32:
+        # Route to the Tier-2 CUTLASS implicit-GEMM + K-mode IndexedGather
+        # vvor. fp16 OR bf16; fp32 falls back to scalar-FMA exactly like
+        # the WMMA paths (no SM80 fp32-input tensor-core atom).
+        # The combined "force_grouped_cutlass_mvmr_vvor" mode ALSO routes
+        # vvor here. mvmr's backward computes grad_a via a vvor call
+        # (_backward_…sparse_matrix_vector_multiplication_reduction), so
+        # under the combined mode grad_a hits CUTLASS vvor here while mvmr
+        # fwd+grad_b hit CUTLASS mvmr in mvmr_triton.py.
+        #        # The fallback must fire when the operands are not a matched
+        # CUTLASS-supported pair, not only when `a` is fp32. Under
+        # `torch.autocast(fp16)` the conv weight Parameter stays fp32 at the
+        # dispatch boundary, so grad_a arrives as a=fp16 (autocast-produced
+        # grad) but b=fp32. An `a.dtype == float32`-only guard would let that
+        # MIXED (a=fp16, b=fp32) pair through to the CUTLASS kernel, which
+        # raises. The CUTLASS kernel supports fp16 AND bf16 (matched
+        # operands), so the CUTLASS route is taken iff both operands share a
+        # dtype in {fp16, bf16}; any other pair (mixed, or fp32) takes the
+        # scalar-FMA fallback. No silent cast (that would change the user's
+        # autocast numerics).
+        #        # The scalar fallback (`vvor_grouped_cuda`) itself requires a and b
+        # to share a dtype (its CUDA kernel raises "expected Half but found
+        # Float" on a mixed pair). So normalize by promoting the narrower
+        # operand UP to the other's dtype before the fallback — lossless
+        # (a widening cast) and consistent with the kernel's fp32 accumulate;
+        # never a narrowing cast that would drop autocast-preserved precision.
+        _cutlass_ok = (
+            a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
+        )
+        if not _cutlass_ok:
             from .vvor_grouped_cuda import (
                 sparse_vector_vector_outer_product_reduction_grouped_cuda
                 as _fallback_scalar_fma,
             )
+            if a.dtype != b.dtype:
+                promoted = torch.promote_types(a.dtype, b.dtype)
+                a = a.to(promoted)
+                b = b.to(promoted)
             return _fallback_scalar_fma(a, a_idx, b, b_idx, o_idx, n_o)
         from .vvor_cutlass import (
             sparse_vector_vector_outer_product_reduction_grouped_cutlass,

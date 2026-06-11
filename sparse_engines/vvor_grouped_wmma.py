@@ -1,15 +1,13 @@
-"""Grouped VVOR via CUDA WMMA-direct kernel (Tier-1.5, cycle-3 §1).
+"""Grouped VVOR via CUDA WMMA-direct kernel.
 
 Same algorithm and calling convention as
 ``sparse_vector_vector_outer_product_reduction_grouped_cuda``
 (sparse_engines.vvor_grouped_cuda) but the inner loop uses
 ``wmma::mma_sync`` on m16n16k16 fp16/bf16 tiles instead of scalar
-``__fmaf_rn``. Targets the cycle-2 §3 conclusion that the vvor 3.5x
-regression vs Triton-grouped is compute-bound (scalar FMA vs
-tensor-core mma) rather than memory-bound (composite-sort A/B
-refuted memory-axis closure).
-
-Pre-reg: ``autoresearch/threads/conv_extreme/0_expectations/cycle3_wmma_direct_vvor.md``
+``__fmaf_rn``. Targets the finding that the vvor 3.5x regression vs
+Triton-grouped is compute-bound (scalar FMA vs tensor-core mma) rather
+than memory-bound (a composite-sort A/B experiment refuted memory-axis
+closure).
 
 Preconditions (in addition to the grouped-CUDA wrapper's):
   - dtype in {fp16, bf16}; fp32 falls back to ``sparse_vvor_grouped_cuda``
@@ -74,8 +72,8 @@ def sparse_vector_vector_outer_product_reduction_grouped_wmma(
     seg_offs = kernel_offset_segments(o_idx, K_offsets)
 
     # Pass int64 indices directly. The kernel accepts int64_t* natively,
-    # avoiding the per-call int64→int32 cast overhead that earlier wrapper-
-    # level profiling identified as the dominant T-scaling wrapper cost.
+    # avoiding the per-call int64→int32 cast overhead that profiling
+    # identified as the dominant T-scaling wrapper overhead.
     o = torch.ops.sparse_engines_cuda.sparse_vvor_grouped_wmma(
         a, a_idx, b, b_idx, o_idx, seg_offs, n_o
     )

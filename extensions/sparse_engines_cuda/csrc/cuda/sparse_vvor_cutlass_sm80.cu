@@ -1,22 +1,17 @@
-// Task 1+2 — single (M_TILE, N_TILE) CUTLASS GEMM for vvor backward.
-// Per pre-reg cycle4_tier2_cutlass_vvor.md §5+§6 day-3 GO/NO-GO criteria.
-//
-// Two host entry points share the same templated kernel body
+// Single (M_TILE, N_TILE) CUTLASS GEMM for vvor backward.
+//// Two host entry points share the same templated kernel body
 // (VvorCutlassSm80SingleTileOp in the .cuh):
-//
-//   Task 1 — sparse_vvor_cutlass_sm80_single_tile(A_seg, B_seg, K_seg_padded)
+////   sparse_vvor_cutlass_sm80_single_tile(A_seg, B_seg, K_seg_padded)
 //     Caller pre-gathers + pads. A_seg/B_seg are K-contig affine buffers.
-//   Task 2 — sparse_vvor_cutlass_sm80_single_tile_gathered(
+//   sparse_vvor_cutlass_sm80_single_tile_gathered(
 //                 grad_output, input_b, i_idx_seg, j_idx_seg,
 //                 m_start, c_start, K_seg_padded)
 //     Kernel-side `IndexedGather` composed layout drives K-mode gather
 //     inside CollectiveMma's cp.async loads (example 52 case 2 pattern).
-//
-// Both routes return a (M_TILE, N_TILE) fp32 tile with
+//// Both routes return a (M_TILE, N_TILE) fp32 tile with
 //   C[m, n] = sum_k grad_output[i_idx[k], m_start + m]
 //                  * input    [j_idx[k], c_start + n]
-//
-// Task 3 will add the outer (k, mt, ct) grid scheduler.
+//// The full backward path adds the outer (k, mt, ct) grid scheduler.
 
 #include "sparse_vvor_cutlass_sm80.cuh"
 
@@ -86,7 +81,7 @@ at::Tensor sparse_vvor_cutlass_sm80_single_tile(
   TORCH_CHECK(A_seg.is_cuda() && B_seg.is_cuda(),
       "sparse_vvor_cutlass_sm80: A_seg and B_seg must be CUDA tensors");
   TORCH_CHECK(A_seg.scalar_type() == at::kHalf && B_seg.scalar_type() == at::kHalf,
-      "sparse_vvor_cutlass_sm80: Task 1 supports fp16 only");
+      "sparse_vvor_cutlass_sm80: fp16 only");
   TORCH_CHECK(A_seg.is_contiguous() && B_seg.is_contiguous(),
       "sparse_vvor_cutlass_sm80: A_seg / B_seg must be contiguous (row-major)");
   TORCH_CHECK(A_seg.dim() == 2 && B_seg.dim() == 2,
@@ -138,34 +133,29 @@ at::Tensor sparse_vvor_cutlass_sm80_single_tile(
   return C_tile;
 }
 
-// ── Task 2: kernel-side IndexedGather (K-mode) ──────────────────────────────
-//
-// Algorithm:
+// ── kernel-side IndexedGather (K-mode) ──────────────────────────────────────
+//// Algorithm:
 //   A view: (M_TILE, K_seg) with A[m, k] = grad_output[i_idx[k], m_start + m]
 //           gmem stride (mode-0, mode-1) = (1, M_full applied via IndexedGather)
 //   B view: (N_TILE, K_seg) with B[n, k] = input[j_idx[k], c_start + n]
 //           gmem stride (mode-0, mode-1) = (1, C_full applied via IndexedGather)
-//
-// Both A and B are M/N-contiguous in gmem (i.e., the channel slice
+//// Both A and B are M/N-contiguous in gmem (i.e., the channel slice
 // m_start..m_start+TileM, c_start..c_start+TileN), with the K-axis
 // strided + gathered via the per-K-element index buffer.
-//
-// CollectiveMma<MainloopSm80CpAsyncUnpredicated, ...> ingests the
+//// CollectiveMma<MainloopSm80CpAsyncUnpredicated, ...> ingests the
 // ComposedLayout transparently: per-thread tile coordinates resolve
 // through the IndexedGather custom stride during cp.async source-
-// address computation. SmemLayout / TiledMma are unchanged from Task 1
-// (smem is K-contig for ldmatrix-compatible mma fragment loads).
-//
-// Vector-load caveat: the GmemTiledCopy in Config inherits Task 1's
-// K-vector layout (vec-along-K). With kernel-side gather, consecutive
+// address computation. SmemLayout / TiledMma are unchanged from the affine
+// path (smem is K-contig for ldmatrix-compatible mma fragment loads).
+//// Vector-load caveat: the GmemTiledCopy in Config inherits the affine
+// path's K-vector layout (vec-along-K). With kernel-side gather, consecutive
 // K-elements live in disparate gmem rows, so the cp.async PTX issued
 // per atom call would technically pull non-contiguous bytes if CuTe
-// treated the gather as a "no-op stride". To keep Task 2 safe, we
+// treated the gather as a "no-op stride". To keep the gather safe, we
 // pad i_idx_seg / j_idx_seg with sentinel index 0 — Python-side caller
 // is responsible for ensuring the padded slots' contribution is zero
 // (random-input parity tolerance handles padded-slot non-zero gather).
-//
-// **For numerical correctness, the padded-K slots must produce zero
+//// **For numerical correctness, the padded-K slots must produce zero
 // products in the reference too — the test mirrors this by reusing
 // the same i_idx/j_idx after padding (so reference and kernel agree
 // on what is "real K" vs "padded K").**
@@ -196,14 +186,12 @@ void vvor_cutlass_sm80_single_tile_gathered_kernel(
   using example::CustomStride;
 
   // Gather tensor for A (grad_output slice).
-  //
-  // base = grad_output_ptr + m_start  →  A[0,0] sees grad_output[idx[0], m_start]
+  //  // base = grad_output_ptr + m_start  →  A[0,0] sees grad_output[idx[0], m_start]
   // shape = (TileM, K_seg)
   // stride mode-0 (M) = _1{}  (contig column within grad_output row)
   // stride mode-1 (K) = CustomStride{IndexedGather{i_idx_ptr}, M_full}
   //                    i.e., k-step adds  i_idx_ptr[k] * M_full
-  //
-  // make_gather_tensor (from gather_tensor.hpp) finds the first non-
+  //  // make_gather_tensor (from gather_tensor.hpp) finds the first non-
   // unit stride in the stride tuple and wraps it in CustomStride+Indexed-
   // Gather. So we hand it the affine stride (_1{}, M_full) plus an
   // IndexedGather, and it builds the ComposedLayout automatically.
@@ -325,27 +313,31 @@ at::Tensor sparse_vvor_cutlass_sm80_single_tile_gathered(
   return C_tile;
 }
 
-// ── Task 3: full vvor backward — outer (k, mt, ct) grid scheduler ───────────
-//
-// Drop-in replacement for sparse_vector_vector_outer_product_reduction_grouped_*.
+// ── full vvor backward — outer (k, mt, ct) grid scheduler ───────────────────
+//// Drop-in replacement for sparse_vector_vector_outer_product_reduction_grouped_*.
 // One CTA per (k, mt, ct) tile; gridDim = (C_tiles, M_tiles, n_o). The CTA
 // reads its k-segment bounds from seg_offs[k]/seg_offs[k+1], builds K-mode
 // gather views over the segment's triplet slice (rounded up to a TileK
 // multiple), runs the Unpredicated CollectiveMma over the (TileM, TileN,
 // K_seg_padded) GEMM, and writes the fp32 (TileM, TileN) tile into
 // grad_weight[k, 0, mt*TileM.., ct*TileN..].
-//
-// Padded-slot resolution = Option 3 (sentinel-zero-row). See the
-// VvorCutlassSm80FullOp header in the .cuh for why Option 1 (predicated
-// mainloop) is the documented R1 blocker. The gather index functor below
+//// Padded-slot resolution = sentinel-zero-row. See the
+// VvorCutlassSm80FullOp header in the .cuh for why the predicated-mainloop
+// approach is infeasible here. The gather index functor below
 // clamps any K slot k ≥ seg_len to a guaranteed-zero SENTINEL ROW that the
 // host appends to grad_output (row N_o) and input (row N_b); the clamped
 // outer-product term is exactly 0. Arbitrary + empty seg_len just work.
 
 namespace {
 
-using FullConfig = VvorCutlassSm80GatherConfig;  // M/N-major smem + ldmatrix-T
-using FullOp     = VvorCutlassSm80FullOp<FullConfig>;
+// the full vvor op is templated on the operand element type
+// so fp16 (half_t) and bf16 (bfloat16_t) share one kernel body. TileM/N/K +
+// fp32 accumulator are dtype-invariant; only the gather-tensor element type
+// and the GEMM atom (via the Config) change. The fp16 instantiation is the
+// exact prior path (`VvorCutlassSm80GatherConfig` aliases
+// `…GatherConfigT<half_t>`), so existing fp16 codegen is unchanged.
+template <class Element>
+using FullConfigFor = VvorCutlassSm80GatherConfigT<Element>;  // M/N-major smem + ldmatrix-T
 using FullIndexT = int32_t;
 
 // Gather functor: maps K slot k → real triplet row idx_[k] when k < seg_len,
@@ -373,11 +365,13 @@ struct SegmentClampedGather {
   Index        sentinel_;
 };
 
+template <class Element>
 __global__
-__launch_bounds__(FullConfig::MaxThreadsPerBlock, FullConfig::MinBlocksPerMultiprocessor)
+__launch_bounds__(FullConfigFor<Element>::MaxThreadsPerBlock,
+                  FullConfigFor<Element>::MinBlocksPerMultiprocessor)
 void vvor_cutlass_sm80_full_kernel(
-    const cutlass::half_t* __restrict__ grad_output_ptr,  // (N_o+1, M_full) — last row = zero sentinel
-    const cutlass::half_t* __restrict__ input_ptr,        // (N_b+1, C_full) — last row = zero sentinel
+    const Element*         __restrict__ grad_output_ptr,  // (N_o+1, M_full) — last row = zero sentinel
+    const Element*         __restrict__ input_ptr,        // (N_b+1, C_full) — last row = zero sentinel
     const FullIndexT*      __restrict__ a_idx_ptr,        // (T,) sorted-by-k
     const FullIndexT*      __restrict__ b_idx_ptr,        // (T,)
     const int64_t*         __restrict__ seg_offs_ptr,     // (n_o + 1,)
@@ -388,6 +382,8 @@ void vvor_cutlass_sm80_full_kernel(
     int sentinel_b                                        // = N_b (zero row idx in input)
 ) {
   using namespace cute;
+  using FullConfig = FullConfigFor<Element>;
+  using FullOp     = VvorCutlassSm80FullOp<FullConfig>;
 
   constexpr int TileM = int(FullConfig::TileM::value);
   constexpr int TileN = int(FullConfig::TileN::value);
@@ -454,12 +450,72 @@ void vvor_cutlass_sm80_full_kernel(
   op(mA, mB, mC, K_seg_padded, smem_buf);
 }
 
+// dtype-templated launch helper. Element ∈ {half_t,
+// bfloat16_t}; C10 is the matching ATen scalar type (c10::Half / c10::BFloat16).
+// All shape math + the sentinel-pad are dtype-invariant; only the gmem
+// element type and the GEMM atom (via FullConfigFor<Element>) change. fp16
+// reproduces the prior launch byte-for-byte.
+template <class Element, class C10>
+static void launch_vvor_full(
+    const at::Tensor& gout_2d, const at::Tensor& inb_2d,
+    const at::Tensor& a_idx, const at::Tensor& b_idx,
+    const at::Tensor& seg_offs, at::Tensor& grad_weight,
+    int M_full, int C_full, int N_o, int N_b, int n_o_i
+) {
+  using FullConfig = FullConfigFor<Element>;
+  using FullOp     = VvorCutlassSm80FullOp<FullConfig>;
+  constexpr int M_TILE = int(FullConfig::TileM::value);
+  constexpr int N_TILE = int(FullConfig::TileN::value);
+
+  // sentinel-zero-row: append one all-zero row to grad_output
+  // (index N_o) and input (index N_b). Padded K slots (k ≥ seg_len) gather
+  // this row → zero outer-product contribution. Single-alloc construction:
+  // at::empty + narrow-copy + 1-row zero_ — fewer dispatched ops than
+  // at::cat. gout_2d/inb_2d are already contiguous, so the body is a dense DtoD.
+  auto gout_pad = at::empty({N_o + 1, M_full}, gout_2d.options());
+  gout_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_o).copy_(gout_2d);
+  gout_pad.narrow(/*dim=*/0, /*start=*/N_o, /*length=*/1).zero_();
+  auto inb_pad = at::empty({N_b + 1, C_full}, inb_2d.options());
+  inb_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_b).copy_(inb_2d);
+  inb_pad.narrow(/*dim=*/0, /*start=*/N_b, /*length=*/1).zero_();
+
+  const int M_tiles = M_full / M_TILE;
+  const int C_tiles = C_full / N_TILE;
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr size_t smem_size = FullOp::kSmemBytes;
+
+  cudaError_t attr_err = cudaFuncSetAttribute(
+      vvor_cutlass_sm80_full_kernel<Element>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_size));
+  TORCH_CHECK(attr_err == cudaSuccess,
+      "cudaFuncSetAttribute (full) failed: ", cudaGetErrorString(attr_err));
+
+  dim3 grid(C_tiles, M_tiles, n_o_i);   // (ct, mt, k)
+  vvor_cutlass_sm80_full_kernel<Element>
+      <<<grid, FullConfig::MaxThreadsPerBlock, smem_size, stream>>>(
+          reinterpret_cast<const Element*>(gout_pad.template data_ptr<C10>()),
+          reinterpret_cast<const Element*>(inb_pad .template data_ptr<C10>()),
+          a_idx.data_ptr<FullIndexT>(),
+          b_idx.data_ptr<FullIndexT>(),
+          seg_offs.data_ptr<int64_t>(),
+          grad_weight.data_ptr<float>(),
+          M_full, C_full,
+          /*sentinel_a=*/N_o,
+          /*sentinel_b=*/N_b);
+
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+      "vvor_cutlass_sm80_full kernel launch failed: ", cudaGetErrorString(err));
+}
+
 } // namespace
 
 at::Tensor sparse_vvor_cutlass_sm80_full(
-    at::Tensor grad_output,   // (N_o, 1, M_full) or (N_o, M_full) fp16
+    at::Tensor grad_output,   // (N_o, 1, M_full) or (N_o, M_full) fp16/bf16
     at::Tensor a_idx,         // (T,) int32 — output-row idx, sorted by k
-    at::Tensor input_b,       // (N_b, 1, C_full) or (N_b, C_full) fp16
+    at::Tensor input_b,       // (N_b, 1, C_full) or (N_b, C_full) fp16/bf16
     at::Tensor b_idx,         // (T,) int32 — input-row idx
     at::Tensor seg_offs,      // (n_o + 1,) int64 — per-k segment offsets
     int64_t n_o
@@ -468,9 +524,16 @@ at::Tensor sparse_vvor_cutlass_sm80_full(
       "sparse_vvor_cutlass_sm80_full: grad_output / input_b must be CUDA");
   TORCH_CHECK(a_idx.is_cuda() && b_idx.is_cuda() && seg_offs.is_cuda(),
       "sparse_vvor_cutlass_sm80_full: index / seg_offs tensors must be CUDA");
-  TORCH_CHECK(grad_output.scalar_type() == at::kHalf &&
-              input_b.scalar_type() == at::kHalf,
-      "sparse_vvor_cutlass_sm80_full: fp16 only");
+  // fp16 OR bf16. Both operands must share the dtype (the
+  // kernel reinterprets both as the same Element). fp32 has no SM80 TC atom
+  // of this shape → rejected (fp32 conv stays on the Triton path).
+  TORCH_CHECK(grad_output.scalar_type() == input_b.scalar_type(),
+      "sparse_vvor_cutlass_sm80_full: grad_output and input_b must share dtype "
+      "(got ", grad_output.scalar_type(), " and ", input_b.scalar_type(), ")");
+  TORCH_CHECK(grad_output.scalar_type() == at::kHalf ||
+              grad_output.scalar_type() == at::kBFloat16,
+      "sparse_vvor_cutlass_sm80_full: fp16/bf16 only (got ",
+      grad_output.scalar_type(), ")");
   TORCH_CHECK(a_idx.scalar_type() == at::kInt && b_idx.scalar_type() == at::kInt,
       "sparse_vvor_cutlass_sm80_full: a_idx / b_idx must be int32");
   TORCH_CHECK(seg_offs.scalar_type() == at::kLong,
@@ -496,32 +559,15 @@ at::Tensor sparse_vvor_cutlass_sm80_full(
   TORCH_CHECK(gout_2d.dim() == 2 && inb_2d.dim() == 2,
       "sparse_vvor_cutlass_sm80_full: grad_output / input must be 2-D after squeeze");
 
-  constexpr int M_TILE = int(FullConfig::TileM::value);
-  constexpr int N_TILE = int(FullConfig::TileN::value);
+  // TileM/N are dtype-invariant (same for half_t / bfloat16_t Config).
+  constexpr int M_TILE = int(VvorCutlassSm80GatherConfig::TileM::value);
+  constexpr int N_TILE = int(VvorCutlassSm80GatherConfig::TileN::value);
 
   const int M_full = static_cast<int>(gout_2d.size(1));
   const int C_full = static_cast<int>(inb_2d .size(1));
   const int n_o_i  = static_cast<int>(n_o);
   const int N_o    = static_cast<int>(gout_2d.size(0));
   const int N_b    = static_cast<int>(inb_2d .size(0));
-
-  // Option-3 sentinel-zero-row: append one all-zero row to grad_output
-  // (index N_o) and input (index N_b). Padded K slots (k ≥ seg_len) gather
-  // this row → zero outer-product contribution. The pad is contiguous so
-  // the kernel's gather stride math is unchanged.
-  //
-  // G17: single-alloc construction. The prior `at::cat({x, zeros}).contiguous()`
-  // did a redundant clone (at::cat already returns contiguous) plus a
-  // separate 1-row zeros alloc. One `at::empty` + a narrow-copy of the
-  // body + a 1-row `zero_` produces the identical contiguous (N+1, W)
-  // buffer with strictly fewer dispatched ops. gout_2d/inb_2d are already
-  // contiguous (above), so the body copy is a dense DtoD.
-  auto gout_pad = at::empty({N_o + 1, M_full}, gout_2d.options());
-  gout_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_o).copy_(gout_2d);
-  gout_pad.narrow(/*dim=*/0, /*start=*/N_o, /*length=*/1).zero_();
-  auto inb_pad = at::empty({N_b + 1, C_full}, inb_2d.options());
-  inb_pad.narrow(/*dim=*/0, /*start=*/0,   /*length=*/N_b).copy_(inb_2d);
-  inb_pad.narrow(/*dim=*/0, /*start=*/N_b, /*length=*/1).zero_();
 
   TORCH_CHECK(M_full % M_TILE == 0,
       "sparse_vvor_cutlass_sm80_full: M_full=", M_full,
@@ -533,39 +579,21 @@ at::Tensor sparse_vvor_cutlass_sm80_full(
       "sparse_vvor_cutlass_sm80_full: seg_offs must have n_o+1 elements (got ",
       seg_offs.numel(), ", n_o=", n_o, ")");
 
-  const int M_tiles = M_full / M_TILE;
-  const int C_tiles = C_full / N_TILE;
-
   // grad_weight shape matches the other grouped paths: (n_o, G=1, M, C).
   auto options_w = at::TensorOptions().dtype(torch::kFloat32).device(gout_2d.device());
   auto grad_weight = torch::zeros({n_o, 1, M_full, C_full}, options_w);
 
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr size_t smem_size = FullOp::kSmemBytes;
-
-  cudaError_t attr_err = cudaFuncSetAttribute(
-      vvor_cutlass_sm80_full_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_size));
-  TORCH_CHECK(attr_err == cudaSuccess,
-      "cudaFuncSetAttribute (full) failed: ", cudaGetErrorString(attr_err));
-
-  dim3 grid(C_tiles, M_tiles, n_o_i);   // (ct, mt, k)
-  vvor_cutlass_sm80_full_kernel
-      <<<grid, FullConfig::MaxThreadsPerBlock, smem_size, stream>>>(
-          reinterpret_cast<const cutlass::half_t*>(gout_pad.data_ptr<c10::Half>()),
-          reinterpret_cast<const cutlass::half_t*>(inb_pad .data_ptr<c10::Half>()),
-          a_idx.data_ptr<FullIndexT>(),
-          b_idx.data_ptr<FullIndexT>(),
-          seg_offs.data_ptr<int64_t>(),
-          grad_weight.data_ptr<float>(),
-          M_full, C_full,
-          /*sentinel_a=*/N_o,
-          /*sentinel_b=*/N_b);
-
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess,
-      "vvor_cutlass_sm80_full kernel launch failed: ", cudaGetErrorString(err));
+  // dispatch the launch on the operand dtype. fp16 → the
+  // exact prior half_t path; bf16 → the new bfloat16_t instantiation.
+  if (gout_2d.scalar_type() == at::kHalf) {
+    launch_vvor_full<cutlass::half_t, c10::Half>(
+        gout_2d, inb_2d, a_idx, b_idx, seg_offs, grad_weight,
+        M_full, C_full, N_o, N_b, n_o_i);
+  } else {  // at::kBFloat16 (guarded above)
+    launch_vvor_full<cutlass::bfloat16_t, c10::BFloat16>(
+        gout_2d, inb_2d, a_idx, b_idx, seg_offs, grad_weight,
+        M_full, C_full, N_o, N_b, n_o_i);
+  }
 
   return grad_weight;
 }

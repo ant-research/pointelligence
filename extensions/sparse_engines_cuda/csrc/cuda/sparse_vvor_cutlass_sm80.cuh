@@ -1,34 +1,32 @@
 #ifndef SPARSE_ENGINES_CUDA_SPARSE_VVOR_CUTLASS_SM80_CUH
 #define SPARSE_ENGINES_CUDA_SPARSE_VVOR_CUTLASS_SM80_CUH
 
-// ─── Cycle-4 §1.11 G14 — Tier-2 CUTLASS skeleton for vvor (Task 1, affine) ──
-//
-// Single-tile (M_TILE, N_TILE, K=seg_len) GEMM via CUTLASS 3.x
+// ─── Tier-2 CUTLASS skeleton for vvor (affine) ──────────────────────────────
+//// Single-tile (M_TILE, N_TILE, K=seg_len) GEMM via CUTLASS 3.x
 // CuTe + CollectiveMma<MainloopSm80CpAsyncUnpredicated<PIPE>, ...>. This
-// is the *skeleton* per pre-reg §6 day-3 GO/NO-GO: affine layouts only,
+// is the *skeleton*: affine layouts only,
 // the segment's grad_output / input rows are PRE-GATHERED on the Python
 // side into contiguous (M_TILE, K_seg) and (N_TILE, K_seg) buffers.
-//
-// Followups (Task 2+): replace the affine A/B layouts with
+//// Followups: replace the affine A/B layouts with
 // `make_gather_tensor(..., IndexedGather{idx_ptr})` so the gather
 // happens during cp.async load instead of as a separate Python step.
-//
-// Layouts:
+//// Layouts:
 //   A (grad_out segment): (M_TILE, K_seg) row-major  → strides (K_seg, 1)
 //   B (input    segment): (N_TILE, K_seg) row-major  → strides (K_seg, 1)
 //   C (grad_weight tile): (M_TILE, N_TILE) row-major → strides (N_TILE, 1)
-//
-// Both A and B have K (contraction) as the inner contiguous dim — matches
+//// Both A and B have K (contraction) as the inner contiguous dim — matches
 // example 59's "filter" + "activation" layouts (K = inner). The host-side
 // Python wrapper does `index_select(...).t().contiguous()` to produce this
 // memory layout; that's a single index_select + view, cheap.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/copy_atom.hpp>
 
+#include <cutlass/numeric_types.h>   // cutlass::half_t / cutlass::bfloat16_t
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/collective/collective_mma.hpp>
 
@@ -36,31 +34,51 @@ namespace sparse_engines_cuda {
 
 using namespace cute;
 
+// ── element-parameterized MMA-atom selector ────────────────
+// The SM80 fp16-input fp32-accum HMMA atom (m16n8k16) and its bf16 sibling
+// share an identical tile shape / fragment layout / fp32 accumulator — only
+// the operand element type differs. Selecting the atom from the element type
+// lets the Config structs below template over {half_t, bfloat16_t} with ZERO
+// other changes; the fp16 instantiation is byte-identical to the prior
+// hardcoded `MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>`. fp32 has NO SM80
+// tensor-core atom of this shape (only TF32/BF16/FP16) and is intentionally
+// absent — fp32 conv stays on the Triton path.
+template <class Element> struct Sm80MmaAtomFor;
+template <> struct Sm80MmaAtomFor<cutlass::half_t> {
+  using type = SM80_16x8x16_F32F16F16F32_TN;
+};
+template <> struct Sm80MmaAtomFor<cutlass::bfloat16_t> {
+  using type = SM80_16x8x16_F32BF16BF16F32_TN;
+};
+
 // Per-instantiation tile config. M_TILE / N_TILE picked to match
 // example-59-style 128-element major-mode + 32-element minor-mode tile.
-// For Task 1 we use a single (M_TILE, N_TILE) tile per launch — the outer
-// (k, mt, ct) grid is added in Task 3.
-//
-// At enc4 fp16 (M=C=512), M_TILE=64, N_TILE=64 gives Mt=Ct=8 — but Task 1
-// computes a single tile only, so we have the Python wrapper slice one
+// For the skeleton we use a single (M_TILE, N_TILE) tile per launch — the outer
+// (k, mt, ct) grid is added by the full backward path.
+//// At enc4 fp16 (M=C=512), M_TILE=64, N_TILE=64 gives Mt=Ct=8 — but the
+// single-tile path computes a single tile only, so we have the Python
+// wrapper slice one
 // (m_start..m_start+M_TILE, c_start..c_start+N_TILE) face of grad_weight.
-struct VvorCutlassSm80FpropConfig {
+template <class Element_ = cutlass::half_t>
+struct VvorCutlassSm80FpropConfigT {
   using TileM = _64;
   using TileN = _64;
   using TileK = _32;   // K-tile along seg_len contraction axis
   using PIPE  = _3;    // 3-stage cp.async pipeline (matches example 59)
 
-  using ElementA   = cutlass::half_t;       // grad_output element
-  using ElementB   = cutlass::half_t;       // input element
+  using ElementA   = Element_;              // grad_output element (fp16/bf16)
+  using ElementB   = Element_;              // input element
   using ElementAcc = float;                 // fp32 accumulator
   using ElementC   = float;                 // fp32 output (grad_weight tile)
 
   using TileShape  = Shape<TileM, TileN, TileK>;
 
-  // SM80 fp16-input fp32-accum HMMA atom. m16n8k16 is the canonical fp16
-  // tensor-core atom on sm_80/sm_89.
+  // SM80 16-bit-input fp32-accum HMMA atom (m16n8k16). The atom is selected
+  // from the element type: half_t → F32F16F16F32, bfloat16_t → F32BF16BF16F32
+  // (same shape/layout/accumulator). The fp16 instantiation is byte-identical
+  // to the prior hardcoded `MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>`.
   using TiledMma = TiledMMA<
-      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+      MMA_Atom<typename Sm80MmaAtomFor<Element_>::type>,
       Layout<Shape<_2, _2, _1>>,      // 2x2 warps -> 4 warps = 128 threads
       Tile<_32, _32, Underscore>>;    // pad warp tile to (32, 32, K)
 
@@ -78,7 +96,7 @@ struct VvorCutlassSm80FpropConfig {
   // 32 thr along M × 4 thr along K × 8-element K-vector per thread =
   // (TileM=64, TileK=32) coverage in 2 passes along M. Earlier code
   // used (16, 8) threads × val=8 → Tiler_MN=(16, 64), which overshoots
-  // TileK=32 by 2× and produces the cycle-4 (+1, +1) shift bug because
+  // TileK=32 by 2× and produces a (+1, +1) shift bug because
   // threads with K_idx≥4 clobber threads K_idx<4's smem writes.
   using GmemTiledCopyA = decltype(make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, ElementA>{},
@@ -139,14 +157,17 @@ struct VvorCutlassSm80FpropConfig {
   };
 };
 
+// fp16 alias = the exact prior type (byte-identical codegen); bf16
+// is the new bf16 instantiation.
+using VvorCutlassSm80FpropConfig     = VvorCutlassSm80FpropConfigT<cutlass::half_t>;
+using VvorCutlassSm80FpropConfigBf16 = VvorCutlassSm80FpropConfigT<cutlass::bfloat16_t>;
+
 // ── Kernel body ─────────────────────────────────────────────────────────
-//
-// Operates on already-tile-shaped gmem tensors:
+//// Operates on already-tile-shaped gmem tensors:
 //   gA : (M_TILE, K_seg) row-major fp16, K-contiguous
 //   gB : (N_TILE, K_seg) row-major fp16, K-contiguous
 //   gC : (M_TILE, N_TILE) row-major fp32 (zero-initialized by host)
-//
-// Single-CTA launch. K_seg is dynamic (= segment length, varies per k).
+//// Single-CTA launch. K_seg is dynamic (= segment length, varies per k).
 template <class Config>
 struct VvorCutlassSm80SingleTileOp {
   using TileM     = typename Config::TileM;
@@ -193,8 +214,7 @@ struct VvorCutlassSm80SingleTileOp {
     // Tile gA / gB into K-tiles of width TileK. Single-(M, N) tile case:
     // M_TILE and N_TILE already match TileM/TileN exactly, so there's
     // only one (M, N) tile but k_tile_count K-tiles.
-    //
-    // local_tile produces shape (TileM, TileK, k_tile_count) for gA.
+    //    // local_tile produces shape (TileM, TileK, k_tile_count) for gA.
     auto gA = local_tile(gA_full, make_tile(TileM{}, TileK{}), make_coord(0, _));  // (TileM, TileK, k')
     auto gB = local_tile(gB_full, make_tile(TileN{}, TileK{}), make_coord(0, _));  // (TileN, TileK, k')
 
@@ -207,7 +227,7 @@ struct VvorCutlassSm80SingleTileOp {
         gB,
         accum,
         k_tile_iter, k_tile_count,
-        Underscore{},   // no residue predication for Task 1
+        Underscore{},   // no residue predication for the single-tile path
         threadIdx.x,
         smem_buf);
 
@@ -232,38 +252,37 @@ struct VvorCutlassSm80SingleTileOp {
   }
 };
 
-// ── Task 2 config: M/N-contig smem + ldmatrix-T (for K-mode gather) ─────────
-//
-// Task 1 has K-contig smem because A/B are stored with K as the contiguous
-// mode (Python pre-gather produces K-major buffers). For Task 2 we read
+// ── gather config: M/N-contig smem + ldmatrix-T (for K-mode gather) ─────────
+//// The affine path has K-contig smem because A/B are stored with K as the
+// contiguous mode (Python pre-gather produces K-major buffers). For the
+// gather path we read
 // directly from grad_output (N_o, M_full) row-major + input (N_b, C_full)
 // row-major, so the M and N axes are gmem-contig in source. Composed
 // IndexedGather makes the K axis a per-K-element gather; loads along the
 // K axis are NOT contig and cannot use 128b cp.async.
-//
-// Resolution: vectorize cp.async along M (resp. N), which IS gmem-contig,
+//// Resolution: vectorize cp.async along M (resp. N), which IS gmem-contig,
 // and make smem M/N-major (the non-gathered axis is the inner smem mode).
 // The SM80 m16n8k16 fp16 MMA atom still needs K-contig fragments in
 // registers, so we use ldmatrix-T (SM75_U16x8_LDSM_T) to transpose during
 // smem→reg load — same trick the canonical sm_80 NT example uses.
-//
-// All other Task 1 settings (TileM/N/K, TiledMma, PIPE, ElementA/B/C,
+//// All other affine-path settings (TileM/N/K, TiledMma, PIPE, ElementA/B/C,
 // SmemLayoutOut, GmemTiledCopyC, SmemCopyAtomC) are inherited unchanged.
-struct VvorCutlassSm80GatherConfig {
+template <class Element_ = cutlass::half_t>
+struct VvorCutlassSm80GatherConfigT {
   using TileM = _64;
   using TileN = _64;
   using TileK = _32;
   using PIPE  = _3;
 
-  using ElementA   = cutlass::half_t;
-  using ElementB   = cutlass::half_t;
+  using ElementA   = Element_;
+  using ElementB   = Element_;
   using ElementAcc = float;
   using ElementC   = float;
 
   using TileShape  = Shape<TileM, TileN, TileK>;
 
   using TiledMma = TiledMMA<
-      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+      MMA_Atom<typename Sm80MmaAtomFor<Element_>::type>,
       Layout<Shape<_2, _2, _1>>,
       Tile<_32, _32, Underscore>>;
 
@@ -304,7 +323,7 @@ struct VvorCutlassSm80GatherConfig {
                          Stride<_1, _32>>{}));
   using SmemCopyAtomB   = Copy_Atom<SM75_U16x8_LDSM_T, ElementB>;
 
-  // Epilogue — reuse Task 1's M-major Stride-(TileN, 1) output layout.
+  // Epilogue — reuse the affine path's M-major Stride-(TileN, 1) output layout.
   using SmemLayoutOut = Layout<Shape<TileM, TileN>,
                                Stride<TileN, _1>>;
 
@@ -326,11 +345,17 @@ struct VvorCutlassSm80GatherConfig {
   };
 };
 
-// ── Task 3: full-vvor op — Unpredicated mainloop + sentinel-zero-row ────────
-//
-// PADDED-SLOT RESOLUTION: **Option 3 (sentinel-zero-row)** from the design
-// doc / pre-reg. Option 1 (K-axis predicated `MainloopSm80CpAsync`) was
-// attempted first and is the documented R1 blocker: the predicated mainloop
+// fp16 alias = the exact prior type (byte-identical codegen); bf16
+// is the new bf16 instantiation. The sm_90 vvor config is an alias of the
+// Gather config (see sparse_vvor_cutlass_sm90.cuh), so both dtypes flow to
+// sm_90 for free.
+using VvorCutlassSm80GatherConfig     = VvorCutlassSm80GatherConfigT<cutlass::half_t>;
+using VvorCutlassSm80GatherConfigBf16 = VvorCutlassSm80GatherConfigT<cutlass::bfloat16_t>;
+
+// ── full-vvor op — Unpredicated mainloop + sentinel-zero-row ────────────────
+//// PADDED-SLOT RESOLUTION: sentinel-zero-row. A K-axis predicated
+// `MainloopSm80CpAsync` was
+// attempted first and is infeasible: the predicated mainloop
 // does an *in-place* `gA = cute::domain_offset(make_coord(0, k_residue, 0),
 // gA)` (sm80_mma_multistage.hpp:500). For a `ComposedLayout` gather tensor
 // `domain_offset` returns a layout whose `Offset` TYPE changes
@@ -338,10 +363,10 @@ struct VvorCutlassSm80GatherConfig {
 // non-constant) so the `operator=` back into `gA` does not type-check
 // ("no operator = matches these operands"). Templating the existing
 // SingleTileOp on the predicated mainloop without a CUTLASS-internal
-// rewrite is therefore infeasible inside the task budget → fall back to
-// Option 3 per the pre-reg's explicit ">1h ⇒ Option 2/3" guidance.
-//
-// Option 3 keeps the proven Task-2 `MainloopSm80CpAsyncUnpredicated` +
+// rewrite is therefore infeasible → fall back to the
+// sentinel-zero-row approach.
+//// The sentinel-zero-row approach keeps the proven gather-path
+// `MainloopSm80CpAsyncUnpredicated` +
 // IndexedGather path verbatim. The only addition is a gather index
 // functor (`SegmentClampedGather`, defined in the .cu) that returns a
 // guaranteed-zero SENTINEL ROW for any K slot k ≥ seg_len. The host
@@ -350,8 +375,7 @@ struct VvorCutlassSm80GatherConfig {
 // outer-product contribution is exactly 0 — no garbage injected, no
 // symmetric-padding trick, works for arbitrary / empty seg_len. Cost:
 // one extra gmem row per a/b (≤ M_full + C_full fp16 = a few KB).
-//
-// One CTA computes one (k, mt, ct) tile. K_seg_padded is rounded up to a
+//// One CTA computes one (k, mt, ct) tile. K_seg_padded is rounded up to a
 // TileK multiple by the host; the Unpredicated mainloop sees a clean
 // K-tile count. Empty segments (seg_len == 0) → all K slots clamp to the
 // sentinel zero row → the (TileM, TileN) tile is exactly zero (matches

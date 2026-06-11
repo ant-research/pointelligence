@@ -19,7 +19,7 @@ The two engines under test:
 Methodology:
   - 5 warmup + 12 measurement runs.
   - torch.cuda.synchronize() + time.perf_counter() for cross-kernel
-    comparisons (NOT torch.cuda.Event — see PROGRESS.md Notes).
+    comparisons.
   - Median + IQR over the 12 measurement runs.
   - 3 process invocations recommended; this script measures one
     invocation. Use a driver script for cross-run aggregation.
@@ -77,7 +77,7 @@ PTV3_STAGES = {
     "enc4": (27,    200,    200, 512, 512,   1_700),
 }
 
-# G11.6 (cycle-3 §1.8): production-T mode. T values match what
+# Production-T mode. T values match what
 # build_triplets produces in the wrapper-level bench at PTv3 stage shapes
 # (~5 neighbors per query). enc0/enc1 added with their small C (32/64)
 # explicitly — even though the Triton grouped path's _GROUPED_MIN_C=128
@@ -119,7 +119,7 @@ def _make_vvor_indices(N_a, N_b, K_off, T, device):
 def _composite_resort_vvor(a_idx, b_idx, o_idx, N_a):
     """Re-sort triplets by composite key (o_idx primary, a_idx secondary).
 
-    Used by the cycle-2 §3 A/B test (post-FAIL refinement): does the
+    Used by the composite-key A/B test (post-FAIL refinement): does the
     hand-CUDA vvor close the 3.5x regression if we ensure consecutive
     triplets within a k-segment share a_idx (= out-point index in
     vvor's convention)?
@@ -137,8 +137,8 @@ def _composite_resort_vvor(a_idx, b_idx, o_idx, N_a):
 def _time_fn(fn, n_warmup=5, n_iters=12):
     """Median + IQR ms over n_iters runs, after n_warmup discarded warmups.
 
-    Uses torch.cuda.synchronize() + time.perf_counter() per PROGRESS.md
-    Notes (NOT torch.cuda.Event — measurement overhead inflates short
+    Uses torch.cuda.synchronize() + time.perf_counter() (NOT
+    torch.cuda.Event — measurement overhead inflates short
     kernels).
     """
     for _ in range(n_warmup):
@@ -196,7 +196,7 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
     results["triton_grouped_mvmr"] = _time_fn(triton_mvmr)
     results["triton_grouped_vvor"] = _time_fn(triton_vvor)
 
-    # --- Hand-CUDA grouped path (Branch B / G10 under test) ---
+    # --- Hand-CUDA grouped path under test ---
     def cuda_mvmr():
         sparse_matrix_vector_multiplication_reduction_grouped_cuda(
             a, a_idx_m, b, b_idx_m, o_idx_m, N_o,
@@ -211,7 +211,7 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
     results["cuda_grouped_vvor"] = _time_fn(cuda_vvor)
 
     # --- Hand-CUDA grouped path with composite (k, a)-sort (vvor only) ---
-    # Cycle-2 §3 A/B refinement: re-sort triplets so consecutive items
+    # Composite-key A/B refinement: re-sort triplets so consecutive items
     # within each k-segment share a_idx (out-point), enabling the kernel's
     # `prev_out`-gated grad_out_reg reuse to actually fire.
     a_idx_v_re, b_idx_v_re, o_idx_v_re = _composite_resort_vvor(
@@ -231,7 +231,7 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
 
     results["composite_sort_overhead"] = _time_fn(vvor_resort_only)
 
-    # --- Hand-CUDA WMMA-direct vvor (Tier-1.5 / cycle-3 §1) ---
+    # --- Hand-CUDA WMMA-direct vvor ---
     # WMMA atom is m16n16k16 fp16/bf16. fp32 routes to scalar-FMA path
     # inside the wrapper (so the bench measurement is the WMMA kernel
     # specifically only for fp16/bf16 dtype).
@@ -248,7 +248,7 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
             "note": "WMMA atom not available for fp32; routes to scalar-FMA fallback",
         }
 
-    # --- Coop-warp split-K WMMA vvor (cycle-3 §1.9a / G11.7a) ---
+    # --- Coop-warp split-K WMMA vvor ---
     # W=8 slices per tile: 8x more blocks than single-warp baseline. Goal:
     # reduce kernel under-utilization at small-C / large-T (enc0: 108 -> 864 blocks).
     if dtype in (torch.float16, torch.bfloat16):
@@ -265,14 +265,16 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
         }
 
     # --- Tier-2 CUTLASS implicit-GEMM + K-mode IndexedGather vvor
-    #     (cycle-4 §1.11 G14 Tasks 1-3). fp16-only: the C++ kernel
-    #     TORCH_CHECKs at::kHalf. bf16/fp32 report NaN with a note,
-    #     mirroring the WMMA fp32 pattern. This is the §2.2 metric.
+    #     (fp16 + bf16): the C++ kernel accepts at::kHalf OR
+    #     at::kBFloat16 (element-templated Config +
+    #     SM80_16x8x16_F32BF16BF16F32_TN atom). fp32 reports NaN with a
+    #     note (no SM80 fp32-input tensor-core atom), mirroring the WMMA
+    #     fp32 pattern.
     # The Tier-2 path additionally requires M and C to be multiples of
     # the 64x64 kernel tile (intrinsic kernel constraint, not a bug);
     # enc0 (M=C=32) is below tile size and reports NaN with a note.
     _M_v, _C_v = g_out.shape[2], b.shape[2]
-    if dtype == torch.float16 and _M_v % 64 == 0 and _C_v % 64 == 0:
+    if dtype in (torch.float16, torch.bfloat16) and _M_v % 64 == 0 and _C_v % 64 == 0:
         def cutlass_vvor():
             sparse_vector_vector_outer_product_reduction_grouped_cutlass(
                 g_out, a_idx_v, b, b_idx_v, o_idx_v, K_off,
@@ -280,8 +282,8 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
         results["cuda_grouped_vvor_cutlass"] = _time_fn(cutlass_vvor)
     else:
         _note = (
-            "Tier-2 CUTLASS vvor is fp16-only (C++ TORCH_CHECK at::kHalf)"
-            if dtype != torch.float16
+            "Tier-2 CUTLASS vvor is fp16/bf16-only (no SM80 fp32-input TC atom)"
+            if dtype not in (torch.float16, torch.bfloat16)
             else f"Tier-2 CUTLASS vvor requires M,C %% 64 == 0; got M={_M_v}, C={_C_v}"
         )
         results["cuda_grouped_vvor_cutlass"] = {
@@ -291,16 +293,15 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
         }
 
     # --- Tier-2 CUTLASS implicit-GEMM + S-mode IndexedGather + scatter
-    #     mvmr (G22 plan §4 Tasks M1-M4; M4's force_grouped_cutlass_mvmr
-    #     dispatch mode). fp16-only: the C++ kernel TORCH_CHECKs at::kHalf.
-    #     bf16/fp32 report NaN with a note, mirroring the vvor-CUTLASS
-    #     pattern. This is the §2.2 *engine* metric (M5).
+    #     mvmr (force_grouped_cutlass_mvmr dispatch mode; added bf16).
+    #     fp16 + bf16: the C++ kernel accepts at::kHalf OR at::kBFloat16.
+    #     fp32 reports NaN with a note, mirroring the vvor-CUTLASS pattern.
     # mvmr's kernel tile is TileM=64 (M axis) / TileK=32 (C contraction
     # axis), so the constraint is M % 64 == 0 and C % 32 == 0 (vvor's is
     # M,C % 64 — different because vvor's tile is 64x64x32 over a
     # different contraction axis). enc0 (M=C=32) fails M % 64 and reports
     # NaN with a note, mirroring the vvor-CUTLASS enc0 handling.
-    if dtype == torch.float16 and M % 64 == 0 and C % 32 == 0:
+    if dtype in (torch.float16, torch.bfloat16) and M % 64 == 0 and C % 32 == 0:
         def cutlass_mvmr():
             sparse_matrix_vector_multiplication_reduction_cutlass(
                 a, a_idx_m, b, b_idx_m, o_idx_m, N_o,
@@ -308,8 +309,8 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
         results["cuda_grouped_mvmr_cutlass"] = _time_fn(cutlass_mvmr)
     else:
         _note_m = (
-            "Tier-2 CUTLASS mvmr is fp16-only (C++ TORCH_CHECK at::kHalf)"
-            if dtype != torch.float16
+            "Tier-2 CUTLASS mvmr is fp16/bf16-only (no SM80 fp32-input TC atom)"
+            if dtype not in (torch.float16, torch.bfloat16)
             else f"Tier-2 CUTLASS mvmr requires M %% 64 == 0 and C %% 32 == 0; "
                  f"got M={M}, C={C}"
         )
@@ -342,13 +343,13 @@ def main():
     ap.add_argument("--production-t", action="store_true",
                     help="Use production T sizes (matching build_triplets output in the "
                          "wrapper bench). Also includes enc0/enc1 stages with small C. "
-                         "Default: synthetic T (PTV3_STAGES from cycle-3 §1).")
+                         "Default: synthetic T (PTV3_STAGES).")
     ap.add_argument("--stages", nargs="+", default=None,
                     help="PTv3 stages to bench. Default: all stages in the active map "
                          "(synthetic = enc{2,3,4}; production-t = enc{0,1,2,3,4}).")
     ap.add_argument("--dtype", nargs="+", default=["fp16"],
                     choices=list(DTYPES.keys()),
-                    help="dtypes to bench (default: fp16 only — the cycle-2 §3 target)")
+                    help="dtypes to bench (default: fp16 only — the primary target)")
     ap.add_argument("--json", type=str, default=None, help="Write JSON results to this path")
     args = ap.parse_args()
 
@@ -369,7 +370,7 @@ def main():
     cc = torch.cuda.get_device_capability(0)
     print(f"# GPU: {gpu_name} (sm_{cc[0]}{cc[1]})")
     print(f"# torch: {torch.__version__}")
-    print(f"# mode: {'production-T (from build_triplets)' if args.production_t else 'synthetic-T (cycle-3 §1)'}")
+    print(f"# mode: {'production-T (from build_triplets)' if args.production_t else 'synthetic-T'}")
     print(f"# stages: {args.stages}")
     print(f"# dtypes: {args.dtype}")
     print()
@@ -438,11 +439,11 @@ def main():
                 v_c_coop_iqr = r["cuda_grouped_vvor_wmma_coop"]["iqr_ms"]
                 print(f"  vvor  cuda-WMMA-coop ={v_c_coop:7.3f}ms "
                       f"(IQR {v_c_coop_iqr:.3f})  "
-                      f"ratio coop/triton={ratio_coop:.3f}x  [{pf_coop} per §1.9a]")
+                      f"ratio coop/triton={ratio_coop:.3f}x  [{pf_coop}]")
             v_c_cut = r["cuda_grouped_vvor_cutlass"]["median_ms"]
             if v_c_cut == v_c_cut:  # not NaN (fp16 only)
                 ratio_cut = v_c_cut / max(1e-6, v_t)
-                # Pre-reg §2.2 decision bands (cycle-4 §1.11 G14).
+                # Decision bands.
                 pf_cut = (
                     "BEAT" if ratio_cut <= 0.95
                     else "MATCH" if ratio_cut <= 1.00
@@ -453,14 +454,14 @@ def main():
                 v_c_cut_iqr = r["cuda_grouped_vvor_cutlass"]["iqr_ms"]
                 print(f"  vvor  cuda-CUTLASS   ={v_c_cut:7.3f}ms "
                       f"(IQR {v_c_cut_iqr:.3f})  "
-                      f"ratio cutlass/triton={ratio_cut:.3f}x  [{pf_cut} per §2.2]")
+                      f"ratio cutlass/triton={ratio_cut:.3f}x  [{pf_cut}]")
             else:
                 print(f"  vvor  cuda-CUTLASS   = SKIPPED "
-                      f"(Tier-2 CUTLASS vvor is fp16-only)")
+                      f"({r['cuda_grouped_vvor_cutlass'].get('note', 'fp16/bf16-only')})")
             m_c_cut = r["cuda_grouped_mvmr_cutlass"]["median_ms"]
             if m_c_cut == m_c_cut:  # not NaN (fp16 only)
                 ratio_m_cut = m_c_cut / max(1e-6, m_t)
-                # Pre-reg §2.2 ENGINE bands (G22 plan §5; M5).
+                # ENGINE bands.
                 pf_m_cut = (
                     "ENGINE-BEAT" if ratio_m_cut <= 0.95
                     else "ENGINE-MATCH" if ratio_m_cut <= 1.15
@@ -469,10 +470,10 @@ def main():
                 m_c_cut_iqr = r["cuda_grouped_mvmr_cutlass"]["iqr_ms"]
                 print(f"  mvmr  cuda-CUTLASS   ={m_c_cut:7.3f}ms "
                       f"(IQR {m_c_cut_iqr:.3f})  "
-                      f"ratio cutlass/triton={ratio_m_cut:.3f}x  [{pf_m_cut} per §2.2]")
+                      f"ratio cutlass/triton={ratio_m_cut:.3f}x  [{pf_m_cut}]")
             else:
                 print(f"  mvmr  cuda-CUTLASS   = SKIPPED "
-                      f"(Tier-2 CUTLASS mvmr is fp16-only / tile constraint)")
+                      f"({r['cuda_grouped_mvmr_cutlass'].get('note', 'fp16/bf16-only / tile constraint')})")
             print(f"  mvmr+vvor combined  triton={cmb['triton_ms']:.3f}ms  "
                   f"cuda={cmb['cuda_ms']:.3f}ms  "
                   f"ratio cuda/triton={cmb['cuda_vs_triton_ratio']:.3f}x")

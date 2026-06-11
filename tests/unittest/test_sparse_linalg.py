@@ -205,5 +205,66 @@ class TestSparseLinAlg(unittest.TestCase):
             print()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestNativeLegacyLowPrecision(unittest.TestCase):
+    """the legacy scalar CUDA ops now accept fp16 / bf16.
+
+    Previously the C++ ops (`sparse_engines_cuda.ops.{mvmr,vvor}`) were
+    fp32-only (TORCH_CHECK kFloat32). a later change added an
+    AT_DISPATCH_FLOATING_TYPES_AND2 dispatch + fp32-accumulate-then-cast-back
+    so they handle all three precisions on CUDA (the CPU reference impl
+    stays fp32-only by design). This asserts the fp16/bf16 native forward
+    matches the fp32 numpy reference within the dtype's mantissa tolerance.
+    """
+
+    def _build(self, device="cuda"):
+        torch.manual_seed(9527)
+        N_a, N_b, N_o, G, M, C = 5**3, 512, 1024, 1, 256, 128
+        a = torch.randn(N_a, G, C, M, device=device, dtype=torch.float32)
+        b = torch.randn(N_b, G, C, device=device, dtype=torch.float32)
+        T = 4000
+        a_idx = torch.randint(0, N_a, (T,), device=device, dtype=torch.int32)
+        a_idx, _ = torch.sort(a_idx)
+        b_idx = torch.randint(0, N_b, (T,), device=device, dtype=torch.int32)
+        o_idx = torch.randint(0, N_o, (T,), device=device, dtype=torch.int32)
+        return a, b, a_idx, b_idx, o_idx, N_o, N_a
+
+    def test_native_mvmr_low_precision_fwd(self):
+        a, b, a_idx, b_idx, o_idx, N_o, _ = self._build()
+        ref = sparse_matrix_vector_multiplication_reduction_numpy(
+            a, a_idx, b, b_idx, o_idx, N_o)            # fp32 reference
+        for tag, dt, tol in [("fp16", torch.float16, 5e-3),
+                             ("bf16", torch.bfloat16, 2e-2)]:
+            with self.subTest(dtype=tag):
+                out = sparse_engines_cuda.ops.sparse_matrix_vector_multiplication_reduction(
+                    a.to(dt), a_idx, b.to(dt), b_idx, o_idx, N_o)
+                self.assertEqual(out.dtype, dt,
+                    f"legacy mvmr must cast back to input dtype {tag}")
+                self.assertTrue(
+                    check_all_close(out.float(), ref, f"mvmr-{tag}", tol),
+                    f"native legacy mvmr {tag} diverged from fp32 ref")
+
+    def test_native_vvor_low_precision_fwd(self):
+        a, b, a_idx, b_idx, o_idx, _, N_a = self._build()
+        # vvor signature: (grad_out (N_o,G,M), o_idx, input (N_b,G,C), b_idx,
+        # a_idx, N_a) — mirror the impl()'s da computation. Use a (N_o,G,M)
+        # grad_out and the input b; reduce into the weight-shaped output.
+        N_o = 1024
+        G, M, C = 1, 256, 128
+        do = torch.randn(N_o, G, M, device="cuda", dtype=torch.float32)
+        ref = sparse_vector_vector_outer_product_reduction_numpy(
+            do, o_idx, b, b_idx, a_idx, N_a)           # fp32 reference
+        for tag, dt, tol in [("fp16", torch.float16, 5e-3),
+                             ("bf16", torch.bfloat16, 2e-2)]:
+            with self.subTest(dtype=tag):
+                out = sparse_engines_cuda.ops.sparse_vector_vector_outer_product_reduction(
+                    do.to(dt), o_idx, b.to(dt), b_idx, a_idx, N_a)
+                self.assertEqual(out.dtype, dt,
+                    f"legacy vvor must cast back to input dtype {tag}")
+                self.assertTrue(
+                    check_all_close(out.float(), ref, f"vvor-{tag}", tol),
+                    f"native legacy vvor {tag} diverged from fp32 ref")
+
+
 if __name__ == "__main__":
     unittest.main()

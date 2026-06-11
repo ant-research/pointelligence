@@ -55,8 +55,14 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 	const auto c = cw * warp_size + thread_id;
 	const int l = min(L, T - (n * L));
 
-	T_a a = 0.0f;
-	T_b b = 0.0f;
+	// accumulate in fp32 regardless of input dtype. `a` is
+	// shuffled across the warp via __shfl_sync (no overload for 2-byte
+	// c10::Half / c10::BFloat16) and both feed __fmul_rn/__fmaf_rn, so the
+	// register-resident values are float (upcast on load via to_float_src).
+	// fp16/bf16 loads upcast; fp32 is a no-op cast → byte-identical to the
+	// prior fp32 path.
+	float a = 0.0f;
+	float b = 0.0f;
 	constexpr auto FULL_MASK = 0xffffffff;
 
 	auto a_k_prev = std::numeric_limits<int32_t>::max();
@@ -73,14 +79,14 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 
 			if (a_k_i != a_k_prev) {
 				if (thread_id < Tm) {
-					a = a_ptr[a_k_i + thread_id];
+					a = to_float_src(a_ptr[a_k_i + thread_id]);
 				}
 				a_k_prev = a_k_i;
 			}
 
 			if (b_k_i != b_k_prev) {
 				if (c < C) {
-					b = b_ptr[b_k_i + c];
+					b = to_float_src(b_ptr[b_k_i + c]);
 				}
 				b_k_prev = b_k_i;
 			}
@@ -126,14 +132,14 @@ __global__ void __launch_bounds__(MAX_THREADS_PER_BLOCK)
 
 			if (a_k_i != a_k_prev) {
 				if (thread_id < Tm_max) {
-					a = a_ptr[a_k_i + thread_id];
+					a = to_float_src(a_ptr[a_k_i + thread_id]);
 				}
 				a_k_prev = a_k_i;
 			}
 
 			if (b_k_i != b_k_prev) {
 				if (c < C) {
-					b = b_ptr[b_k_i + c];
+					b = to_float_src(b_ptr[b_k_i + c]);
 				}
 				b_k_prev = b_k_i;
 			}
@@ -175,12 +181,10 @@ void sparse_vector_vector_outer_product_reduction_impl_cuda_ct(
 	const auto M = a.size(2);
 	const auto C = b.size(2);
 
-	const auto a_ptr = a.data_ptr<float>();
 	const auto a_idx_ptr = a_idx.data_ptr<int32_t>();
-	const auto b_ptr = b.data_ptr<float>();
 	const auto b_idx_ptr = b_idx.data_ptr<int32_t>();
 	const auto o_idx_ptr = o_idx.data_ptr<int32_t>();
-	auto o_ptr = o.data_ptr<float>();
+	auto o_ptr = o.data_ptr<float>();   // output accumulator is always fp32
 
 	const auto warp_size = 32;
 	const auto warp_num = 32;
@@ -196,8 +200,18 @@ void sparse_vector_vector_outer_product_reduction_impl_cuda_ct(
 
 	dim3 grid((N_G_Mt_Cw + warp_num - 1) / warp_num);
 	cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-	sparse_vector_vector_outer_product_reduction_kernel<float, float, warp_size, Tm>
-		<<<grid, block, 0, stream>>>(a_ptr, a_idx_ptr, b_ptr, b_idx_ptr, o_idx_ptr, T, G, M, C, N, L, o_ptr);
+
+	// dispatch the input element type (fp32 / fp16 / bf16);
+	// fp32-accumulate via to_float_src. fp32 reproduces the prior
+	// `<float,float>` instantiation byte-for-byte.
+	AT_DISPATCH_FLOATING_TYPES_AND2(
+		at::kHalf, at::kBFloat16, a.scalar_type(),
+		"sparse_vector_vector_outer_product_reduction_cuda", [&] {
+			const auto a_ptr = a.data_ptr<scalar_t>();
+			const auto b_ptr = b.data_ptr<scalar_t>();
+			sparse_vector_vector_outer_product_reduction_kernel<scalar_t, scalar_t, warp_size, Tm>
+				<<<grid, block, 0, stream>>>(a_ptr, a_idx_ptr, b_ptr, b_idx_ptr, o_idx_ptr, T, G, M, C, N, L, o_ptr);
+		});
 
 	cudaError_t err{cudaGetLastError()};
 	TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err))

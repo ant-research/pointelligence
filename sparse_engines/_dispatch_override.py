@@ -33,7 +33,7 @@ from typing import Literal
 #                      `a_idx`/`o_idx` not sorted (correctness > speed)
 #   "force_per_triplet" — skip grouped, always use legacy kernel
 #   "force_grouped_wmma_vvor" — vvor-only: route through the hand-CUDA
-#                      WMMA-direct grouped kernel (cycle-3 §1 / G11).
+#                      WMMA-direct grouped kernel.
 #                      mvmr stays on whatever Triton routing applies.
 #                      Same preconditions as the WMMA wrapper:
 #                      G == 1, dtype in {fp16, bf16, fp32→scalar-FMA
@@ -41,33 +41,36 @@ from typing import Literal
 #   "force_grouped_cutlass_mvmr" — mvmr-only: route the mvmr functional
 #                      op (forward AND the grad_b backward, which is a
 #                      second mvmr call with a transposed weight) through
-#                      the Tier-2 CUTLASS path (G22 plan §4 Task M4).
-#                      fp16/G==1/sorted-a_idx only; fp32/bf16 fall back
-#                      to the existing Triton-grouped path. vvor stays on
-#                      whatever Triton routing applies.
-#   "force_grouped_cutlass_mvmr_vvor" — combined mode (G22 plan §4 Task
-#                      M6a): route mvmr fwd+grad_b → CUTLASS mvmr AND
+#                      the Tier-2 CUTLASS path.
+#                      fp16 OR bf16 (via the
+#                      SM80_16x8x16_F32BF16BF16F32_TN atom) / G==1 /
+#                      sorted-a_idx only; fp32 (and mixed-dtype pairs)
+#                      fall back to the existing Triton-grouped path —
+#                      no SM80 fp32-input tensor-core atom of this shape.
+#                      vvor stays on whatever Triton routing applies.
+#   "force_grouped_cutlass_mvmr_vvor" — combined mode:
+#                      route mvmr fwd+grad_b → CUTLASS mvmr AND
 #                      vvor grad_a → CUTLASS vvor *simultaneously* in the
 #                      same forward/backward. The single-mode modes are
-#                      mutually exclusive (M5 Qualification 2): under
+#                      mutually exclusive: under
 #                      "force_grouped_cutlass_mvmr" vvor's grad_a falls
 #                      back to Triton, and "force_grouped_cutlass_vvor"
-#                      leaves mvmr on Triton — so the Goal-03 wrapper
-#                      headline (CUTLASS mvmr fwd+grad_b AND CUTLASS vvor
-#                      grad_a active together) is inexpressible without
-#                      this. Composes the two already-proven component
-#                      routings under one label; each keeps its own fp16
-#                      gating (mvmr fp16-only; vvor fp16/bf16, fp32
-#                      scalar-FMA fallback).
-#   "force_fused_conv" — G26-T2(b): route PointConv3d's mvmr+autograd
+#                      leaves mvmr on Triton — so having CUTLASS mvmr
+#                      fwd+grad_b AND CUTLASS vvor grad_a active together
+#                      is inexpressible without this. Composes the two
+#                      component routings under one label; each keeps its
+#                      own dtype gating (both mvmr AND vvor CUTLASS
+#                      accept fp16 OR bf16; fp32 / mixed-dtype pairs
+#                      fall back — mvmr to Triton-grouped, vvor to
+#                      scalar-FMA).
+#   "force_fused_conv" — route PointConv3d's mvmr+autograd
 #                      through the single `FusedPointConv3d` Function
 #                      (mvmr_cutlass.py). Collapses the 3 @triton_op/
 #                      autograd-graph boundaries + 2 seg_offs builds + the
 #                      duplicate Python .contiguous() into one Function;
-#                      forward S2 is zero-copy (no-op-collapse view), the
-#                      frozen CUTLASS mvmr/vvor full kernels are reused
+#                      the CUTLASS mvmr/vvor full kernels are reused
 #                      as-is. grad_b retains its single existing host
-#                      transpose-repack (the named G25 residual). fp16/
+#                      transpose-repack. fp16/
 #                      G==1/sorted/tile-multiple — same hard preconditions
 #                      as the underlying _cutlass entry points (which
 #                      raise on violation). All other modes/paths are
