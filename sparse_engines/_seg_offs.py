@@ -11,6 +11,7 @@ issues one ``tl.dot`` per chunk (LHS rows = L_CHUNK ≥ 16 → tensor cores
 fire), and scatter-adds the partial result to the output indices.
 """
 
+import weakref
 from typing import Tuple
 
 import torch
@@ -41,6 +42,77 @@ def kernel_offset_segments(idx_sorted: Tensor, num_kernel_offsets: int) -> Tenso
     # `searchsorted(sorted_seq, values)` returns insertion points; since
     # idx_sorted is sorted ascending, this gives the start of each segment.
     return torch.searchsorted(idx_sorted, bins)
+
+
+_SORTED_CACHE: dict = {}
+_SORTED_CACHE_MAX = 256
+
+_SEG_CACHE: dict = {}
+_SEG_CACHE_MAX = 64
+
+
+def kernel_offset_segments_cached(
+    idx_sorted: Tensor, num_kernel_offsets: int
+) -> Tensor:
+    """Memoized ``kernel_offset_segments`` — the Triton grouped path
+    rebuilds seg_offs 3x per training step (fwd mvmr, vvor grad_a,
+    grad_b mvmr) on the same triplet structure; the CUTLASS path
+    already shares it via the autograd ctx.
+
+    Key: ``(data_ptr, _version, numel, K)`` + a weakref liveness check
+    on the SOURCE tensor (alive + same _version + same data_ptr, else
+    evict-and-rebuild) — the weakref closes the recycled-data_ptr
+    aliasing hole a ptr/version-only key has (a new tensor allocated at
+    a recycled address could otherwise alias a stale entry; the same
+    hardening as the fold cache). ``inference_mode`` tensors (no
+    version counter) bypass the cache. Residual documented assumption:
+    version-bypassing writes (``.data`` / ``set_``) are invisible, as
+    everywhere else.
+    """
+    try:
+        ver = idx_sorted._version
+    except RuntimeError:  # inference_mode tensor — no version counter
+        return kernel_offset_segments(idx_sorted, num_kernel_offsets)
+    key = (idx_sorted.data_ptr(), ver, idx_sorted.numel(),
+           int(num_kernel_offsets))
+    hit = _SEG_CACHE.get(key)
+    if hit is not None:
+        src, seg = hit
+        alive = src()
+        if (alive is not None and alive._version == ver
+                and alive.data_ptr() == key[0]):
+            return seg
+        del _SEG_CACHE[key]
+    seg = kernel_offset_segments(idx_sorted, num_kernel_offsets)
+    if len(_SEG_CACHE) >= _SEG_CACHE_MAX:
+        _SEG_CACHE.pop(next(iter(_SEG_CACHE)))
+    _SEG_CACHE[key] = (weakref.ref(idx_sorted), seg)
+    return seg
+
+
+def is_sorted_cached(idx: Tensor) -> bool:
+    """Sortedness check with a verdict memo — removes the per-call host
+    sync from the grouped-dispatch hot path (the ``.item()`` here was
+    the last remaining per-call sync; measured -11% isolated / -34%
+    back-to-back at the C=512 regime).
+
+    Key: ``(data_ptr, _version, numel)``. ``_version`` increments on any
+    in-place write, so a mutated tensor re-checks; a NEW tensor at a
+    recycled address re-checks unless it coincidentally shares numel AND
+    the allocator-recycled pointer with version 0 — triplet index
+    tensors are built once per rulebook and never written in place, so
+    in practice every distinct rulebook re-checks once and training
+    steps hit the memo. Bounded FIFO (256 entries).
+    """
+    key = (idx.data_ptr(), idx._version, idx.numel())
+    hit = _SORTED_CACHE.get(key)
+    if hit is not None:
+        return hit
+    verdict = bool((idx[1:] >= idx[:-1]).all().item())
+    if len(_SORTED_CACHE) >= _SORTED_CACHE_MAX:
+        _SORTED_CACHE.pop(next(iter(_SORTED_CACHE)))
+    _SORTED_CACHE[key] = verdict
+    return verdict
 
 
 def chunk_grid_for_segments(

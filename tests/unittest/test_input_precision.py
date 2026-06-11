@@ -45,7 +45,7 @@ class TestInputPrecision(unittest.TestCase):
         ref_t = torch.tensor(ref, device=device)
 
         # Force grouped path so the precision flag matters.
-        with dispatch_mode("force_grouped"):
+        with dispatch_mode("force_fsg"):
             with precision_mode("default"):
                 out_tf32 = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                     a, a_idx, b, b_idx, o_idx, N_o,

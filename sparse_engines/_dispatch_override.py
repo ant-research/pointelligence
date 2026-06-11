@@ -29,16 +29,18 @@ from typing import Literal
 
 # ── Dispatch path (grouped vs per-triplet) ──
 #   "auto"           — production threshold-based dispatch (default)
-#   "force_grouped"  — try grouped Triton; still falls back if G > 1 or
-#                      `a_idx`/`o_idx` not sorted (correctness > speed)
-#   "force_per_triplet" — skip grouped, always use legacy kernel
-#   "force_grouped_wmma_vvor" — vvor-only: route through the hand-CUDA
+#   "force_fsg"  — grouped Triton at ANY G (native G>1, one group per
+#                      program or BSG>1 multi-group blocks); still falls
+#                      back if `a_idx`/`o_idx` not sorted
+#                      (correctness > speed)
+#   "force_pt" — skip grouped, always use legacy kernel
+#   "force_fsg_wmma_vvor" — vvor-only: route through the hand-CUDA
 #                      WMMA-direct grouped kernel.
 #                      mvmr stays on whatever Triton routing applies.
 #                      Same preconditions as the WMMA wrapper:
 #                      G == 1, dtype in {fp16, bf16, fp32→scalar-FMA
 #                      fallback}, M % 16 == 0, C % 16 == 0.
-#   "force_grouped_cutlass_mvmr" — mvmr-only: route the mvmr functional
+#   "force_fsg_cutlass_mvmr" — mvmr-only: route the mvmr functional
 #                      op (forward AND the grad_b backward, which is a
 #                      second mvmr call with a transposed weight) through
 #                      the Tier-2 CUTLASS path.
@@ -48,13 +50,13 @@ from typing import Literal
 #                      fall back to the existing Triton-grouped path —
 #                      no SM80 fp32-input tensor-core atom of this shape.
 #                      vvor stays on whatever Triton routing applies.
-#   "force_grouped_cutlass_mvmr_vvor" — combined mode:
+#   "force_fsg_cutlass_mvmr_vvor" — combined mode:
 #                      route mvmr fwd+grad_b → CUTLASS mvmr AND
 #                      vvor grad_a → CUTLASS vvor *simultaneously* in the
 #                      same forward/backward. The single-mode modes are
 #                      mutually exclusive: under
-#                      "force_grouped_cutlass_mvmr" vvor's grad_a falls
-#                      back to Triton, and "force_grouped_cutlass_vvor"
+#                      "force_fsg_cutlass_mvmr" vvor's grad_a falls
+#                      back to Triton, and "force_fsg_cutlass_vvor"
 #                      leaves mvmr on Triton — so having CUTLASS mvmr
 #                      fwd+grad_b AND CUTLASS vvor grad_a active together
 #                      is inexpressible without this. Composes the two
@@ -63,12 +65,13 @@ from typing import Literal
 #                      accept fp16 OR bf16; fp32 / mixed-dtype pairs
 #                      fall back — mvmr to Triton-grouped, vvor to
 #                      scalar-FMA).
-#   "force_fused_conv" — route PointConv3d's mvmr+autograd
+#   "force_fsg_fused" — route PointConv3d's mvmr+autograd
 #                      through the single `FusedPointConv3d` Function
 #                      (mvmr_cutlass.py). Collapses the 3 @triton_op/
 #                      autograd-graph boundaries + 2 seg_offs builds + the
 #                      duplicate Python .contiguous() into one Function;
-#                      the CUTLASS mvmr/vvor full kernels are reused
+#                      forward S2 is zero-copy (no-op-collapse view), the
+#                      frozen CUTLASS mvmr/vvor full kernels are reused
 #                      as-is. grad_b retains its single existing host
 #                      transpose-repack. fp16/
 #                      G==1/sorted/tile-multiple — same hard preconditions
@@ -76,11 +79,28 @@ from typing import Literal
 #                      raise on violation). All other modes/paths are
 #                      byte-unchanged when this mode is not set (the
 #                      routing site short-circuits only on this string).
+
+# v1.2.0 PT/FSG/TIG taxonomy: canonical dispatch strings are
+# generation-prefixed. The pre-rename strings are NOT aliased (clean
+# break) — they raise with the replacement named.
+_LEGACY_RENAMES = {
+    "force_per_triplet": "force_pt",
+    "force_grouped": "force_fsg",
+    "force_grouped_wmma_vvor": "force_fsg_wmma_vvor",
+    "force_grouped_wmma_coop_vvor": "force_fsg_wmma_coop_vvor",
+    "force_grouped_cutlass_vvor": "force_fsg_cutlass_vvor",
+    "force_grouped_cutlass_mvmr": "force_fsg_cutlass_mvmr",
+    "force_grouped_cutlass_mvmr_vvor": "force_fsg_cutlass_mvmr_vvor",
+    "force_fused_conv": "force_fsg_fused",
+    "force_smig": "force_tig",
+}
+
 DispatchMode = Literal[
-    "auto", "force_grouped", "force_per_triplet",
-    "force_grouped_wmma_vvor", "force_grouped_wmma_coop_vvor",
-    "force_grouped_cutlass_vvor", "force_grouped_cutlass_mvmr",
-    "force_grouped_cutlass_mvmr_vvor", "force_fused_conv",
+    "auto", "force_fsg", "force_pt",
+    "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
+    "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
+    "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
+    "force_tig", "force_tig",
 ]
 
 # ── tl.dot input precision for the grouped path ──
@@ -112,16 +132,21 @@ def dispatch_mode(mode: DispatchMode):
     """Context manager scoping a non-default dispatch mode.
 
     Example:
-        with dispatch_mode("force_per_triplet"):
+        with dispatch_mode("force_pt"):
             out = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(...)
         # back to "auto" outside the block
     """
     if mode not in (
-        "auto", "force_grouped", "force_per_triplet",
-        "force_grouped_wmma_vvor", "force_grouped_wmma_coop_vvor",
-        "force_grouped_cutlass_vvor", "force_grouped_cutlass_mvmr",
-        "force_grouped_cutlass_mvmr_vvor", "force_fused_conv",
+        "auto", "force_fsg", "force_pt",
+        "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
+        "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
+        "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
+        "force_tig", "force_tig",
     ):
+        if mode in _LEGACY_RENAMES:
+            raise ValueError(
+                f"dispatch mode {mode!r} was renamed to "
+                f"{_LEGACY_RENAMES[mode]!r} (v1.2.0 PT/FSG/TIG taxonomy)")
         raise ValueError(f"unknown dispatch mode: {mode!r}")
     prev = _state["mode"]
     _state["mode"] = mode

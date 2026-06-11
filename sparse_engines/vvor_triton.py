@@ -24,15 +24,12 @@ from .vvor_triton_kernel import (
     sparse_vector_vector_outer_product_reduction_kernel,
     sparse_vector_vector_outer_product_reduction_grouped_kernel,
 )
-from ._seg_offs import kernel_offset_segments, total_chunks_for_lchunks
+from ._seg_offs import (is_sorted_cached, kernel_offset_segments,
+                         kernel_offset_segments_cached)
 from ._dispatch_override import current_mode, current_precision
 
 
 _GROUPED_MIN_TRIPLETS_PER_K = 16
-# L_CHUNK options that the grouped kernel's autotune palette covers.
-# Must match vvor_triton_kernel._GROUPED_AUTOTUNE_CONFIGS.
-_L_CHUNK_OPTIONS = (16, 32, 64, 128, 256)
-
 # Channel/M threshold (matches mvmr_triton._GROUPED_MIN_C). Grouped VVOR's
 # tl.dot has shape `(M, L) @ (L, C) → (M, C)`. We require both M and C
 # ≥ 128 — i.e. the matmul tile must be deep on both axes for the tensor-
@@ -56,30 +53,29 @@ def _try_grouped_dispatch(
       - G == 1 (production path; G > 1 falls back)
     """
     mode = current_mode()
-    if mode == "force_per_triplet":
+    if mode == "force_pt":
         return False
     K_offsets = n_o
-    # Cheap precondition first — no GPU work.
-    if G != 1:
-        return False
     # Threshold checks before sortedness so auto-mode below-threshold calls
     # don't pay a CPU↔GPU sync just to fall through.
+    # The G==1 gate is lifted for force modes (kernel is G-generic, one
+    # group per program at BLOCK_SIZE_G=1); auto keeps G==1.
     if mode == "auto":
+        if G != 1:
+            return False
         if min(M, C) < _GROUPED_MIN_DIM:
             return False
         if T < _GROUPED_MIN_TRIPLETS_PER_K * K_offsets:
             return False
     # Sortedness check (correctness precondition) — has a `.item()` sync.
-    if not bool((o_idx[1:] >= o_idx[:-1]).all().item()):
+    if not is_sorted_cached(o_idx):
         return False
-    seg_offs = kernel_offset_segments(o_idx, K_offsets)
-    total_chunks_options = total_chunks_for_lchunks(seg_offs, _L_CHUNK_OPTIONS)
-    total_by_lc = dict(zip(_L_CHUNK_OPTIONS, total_chunks_options))
-    if max(total_chunks_options) == 0:
-        return False
-
+    seg_offs = kernel_offset_segments_cached(o_idx, K_offsets)
+    # Grid: sync-free UPPER BOUND on the chunk count — see the mvmr
+    # wrapper's comment. Programs past the true chunk count exit early
+    # in the kernel.
     grid = lambda META: (
-        total_by_lc[META["L_CHUNK"]]
+        ((T + META["L_CHUNK"] - 1) // META["L_CHUNK"] + K_offsets)
         * triton.cdiv(G, META["BLOCK_SIZE_G"])
         * triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(C, META["BLOCK_SIZE_C"]),
@@ -100,19 +96,19 @@ def _try_grouped_dispatch(
 def sparse_vector_vector_outer_product_reduction(
     a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, o_idx: Tensor, n_o: int
 ) -> Tensor:
-    # When the dispatch override is "force_grouped_wmma_vvor", bypass the
+    # When the dispatch override is "force_fsg_wmma_vvor", bypass the
     # Triton path entirely and route to the hand-CUDA WMMA-direct grouped
     # kernel. Same autograd hooks apply (registered on this @triton_op
     # below), so the backward path of an mvmr-fwd invocation still flows
     # through here correctly.
-    if current_mode() == "force_grouped_wmma_vvor":
+    if current_mode() == "force_fsg_wmma_vvor":
         from .vvor_grouped_wmma import (
             sparse_vector_vector_outer_product_reduction_grouped_wmma,
         )
         return sparse_vector_vector_outer_product_reduction_grouped_wmma(
             a, a_idx, b, b_idx, o_idx, n_o,
         )
-    if current_mode() == "force_grouped_wmma_coop_vvor":
+    if current_mode() == "force_fsg_wmma_coop_vvor":
         from .vvor_grouped_wmma_coop import (
             sparse_vector_vector_outer_product_reduction_grouped_wmma_coop,
         )
@@ -120,12 +116,12 @@ def sparse_vector_vector_outer_product_reduction(
             a, a_idx, b, b_idx, o_idx, n_o,
         )
     if current_mode() in (
-        "force_grouped_cutlass_vvor", "force_grouped_cutlass_mvmr_vvor",
+        "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr_vvor",
     ):
         # Route to the Tier-2 CUTLASS implicit-GEMM + K-mode IndexedGather
         # vvor. fp16 OR bf16; fp32 falls back to scalar-FMA exactly like
         # the WMMA paths (no SM80 fp32-input tensor-core atom).
-        # The combined "force_grouped_cutlass_mvmr_vvor" mode ALSO routes
+        # The combined "force_fsg_cutlass_mvmr_vvor" mode ALSO routes
         # vvor here. mvmr's backward computes grad_a via a vvor call
         # (_backward_…sparse_matrix_vector_multiplication_reduction), so
         # under the combined mode grad_a hits CUTLASS vvor here while mvmr
@@ -166,6 +162,14 @@ def sparse_vector_vector_outer_product_reduction(
         return sparse_vector_vector_outer_product_reduction_grouped_cutlass(
             a, a_idx, b, b_idx, o_idx, n_o,
         )
+
+    # Mirrors mvmr_triton.py: the grouped kernel feeds operands natively
+    # into tl.dot — a MIXED dtype pair (AMP boundary) would
+    # CompilationError. Promote the narrower operand UP, lossless.
+    if a.dtype != b.dtype:
+        promoted = torch.promote_types(a.dtype, b.dtype)
+        a = a.to(promoted)
+        b = b.to(promoted)
 
     a = a.contiguous()
     b = b.contiguous()

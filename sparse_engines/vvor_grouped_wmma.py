@@ -41,9 +41,15 @@ def sparse_vector_vector_outer_product_reduction_grouped_wmma(
 
     Preconditions:
       - o_idx sorted ascending (sort_by="k")
-      - G == 1
       - dtype in {fp16, bf16, fp32}; fp32 routes to scalar-FMA grouped path
-      - M % 16 == 0 and C % 16 == 0 for the WMMA path
+      - per-group M % 16 == 0 and C % 16 == 0 for the WMMA path
+
+    G >= 1 supported natively: the frozen kernel's warp grid is
+    K * G * (M/16) * (C/16) and all loads/stores use G-strided pointer
+    math — no per-group loop or repack needed. The old wrapper-level
+    ``G == 1`` ValueError was stricter than the kernel. M / C here are
+    the PER-GROUP channel counts (a is (N, G, M), b is (N, G, C)), so
+    the %16 tile gates below are per-group gates.
     """
     if a.dtype == torch.float32:
         # fp32 not supported by m16n16k16 WMMA atom; dispatch to the
@@ -60,11 +66,10 @@ def sparse_vector_vector_outer_product_reduction_grouped_wmma(
     K_offsets = n_o
     input_dtype = a.dtype
 
-    if G != 1:
-        raise ValueError("WMMA-direct vvor requires G == 1")
     if M % 16 != 0 or C % 16 != 0:
         raise ValueError(
-            f"WMMA-direct vvor requires M and C divisible by 16; got M={M}, C={C}"
+            "WMMA-direct vvor requires per-group M and C divisible by 16; "
+            f"got per-group M={M}, C={C} (G={G})"
         )
     if not bool((o_idx[1:] >= o_idx[:-1]).all().item()):
         raise ValueError("o_idx must be sorted ascending for grouped path")

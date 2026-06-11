@@ -23,13 +23,9 @@ from .mvmr_triton_kernel import (
     sparse_matrix_vector_multiplication_reduction_kernel,
     sparse_matrix_vector_multiplication_reduction_grouped_kernel,
 )
-from ._seg_offs import kernel_offset_segments, total_chunks_for_lchunks
+from ._seg_offs import (is_sorted_cached, kernel_offset_segments,
+                         kernel_offset_segments_cached)
 from ._dispatch_override import current_mode, current_precision
-
-# L_CHUNK options that the grouped kernel's autotune palette covers.
-# See mvmr_triton_kernel._GROUPED_AUTOTUNE_CONFIGS. Must match.
-_L_CHUNK_OPTIONS = (16, 32, 64, 128, 256)
-
 
 # Channel threshold: grouped path wins above the tensor-core mma break-even.
 # Empirical (PointConv3d engine bench at PTv3 stage shapes,
@@ -69,36 +65,37 @@ def _try_grouped_dispatch(
     or force it off entirely (regardless of threshold).
     """
     mode = current_mode()
-    if mode == "force_per_triplet":
+    if mode == "force_pt":
         return False
     K_offsets = a.shape[0]
-    # Cheap precondition first — G is a Python int, no GPU work.
-    if G != 1:
-        return False
     # Threshold checks before the sortedness check so auto-mode below-threshold
-    # calls don't pay a CPU↔GPU sync just to fall through. force_grouped
+    # calls don't pay a CPU↔GPU sync just to fall through. force_fsg
     # bypasses these and runs the sortedness check.
+    # The G==1 gate is lifted for force modes — the grouped kernel's
+    # grid/pointer math is G-generic (one group per program at
+    # BLOCK_SIZE_G=1, tl.dot fires per group). auto keeps G==1 (no
+    # production behavior change).
     if mode == "auto":
+        if G != 1:
+            return False
         if C < _GROUPED_MIN_C:
             return False
         if T < _GROUPED_MIN_TRIPLETS_PER_K * K_offsets:
             return False
     # Sortedness check (correctness precondition for grouped path) — has a
     # `.item()` sync, so deferred until we've decided we want grouped.
-    if not bool((a_idx[1:] >= a_idx[:-1]).all().item()):
+    if not is_sorted_cached(a_idx):
         return False
-    seg_offs = kernel_offset_segments(a_idx, K_offsets)
-    # Compute total_chunks for each L_CHUNK in the autotune palette so
-    # the grid lambda can size the launch correctly per autotune trial.
-    # One batched .item() sync covers all options. Kernel walks seg_offs
-    # itself so we don't need to materialise a chunk_seg_offs tensor.
-    total_chunks_options = total_chunks_for_lchunks(seg_offs, _L_CHUNK_OPTIONS)
-    total_by_lc = dict(zip(_L_CHUNK_OPTIONS, total_chunks_options))
-    if max(total_chunks_options) == 0:
-        return False
-
+    seg_offs = kernel_offset_segments_cached(a_idx, K_offsets)
+    # Grid: sync-free UPPER BOUND on the chunk count.
+    # sum_k ceil(seg_len_k / L) <= cdiv(T, L) + K_offsets, and the bound
+    # needs only host-side ints — the old exact-count path
+    # (total_chunks_for_lchunks) paid a second host sync per call, which
+    # dominated the wrapper's fixed cost at small-N stages. Programs past
+    # the true chunk count exit early in the kernel (pid_chunk >=
+    # running after the seg_offs walk).
     grid = lambda META: (
-        total_by_lc[META["L_CHUNK"]]
+        ((T + META["L_CHUNK"] - 1) // META["L_CHUNK"] + K_offsets)
         * triton.cdiv(G, META["BLOCK_SIZE_G"])
         * triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(C, META["BLOCK_SIZE_C"]),
@@ -119,7 +116,7 @@ def _try_grouped_dispatch(
 def sparse_matrix_vector_multiplication_reduction(
     a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, o_idx: Tensor, n_o: int
 ) -> Tensor:
-    # When the dispatch override is "force_grouped_cutlass_mvmr", route
+    # When the dispatch override is "force_fsg_cutlass_mvmr", route
     # this functional op to the Tier-2 CUTLASS implicit-GEMM + S-mode
     # IndexedGather + atomicAdd scatter mvmr. Because grad_b is computed
     # by a *second* call to this same functional op (with a transposed
@@ -130,7 +127,7 @@ def sparse_matrix_vector_multiplication_reduction(
     # a_idx, M/C tile multiples) and raises on violation. The autograd
     # hooks registered on this @triton_op below still apply, so the
     # backward of a CUTLASS-routed forward also flows back through here.
-    # The combined "force_grouped_cutlass_mvmr_vvor" mode ALSO routes
+    # The combined "force_fsg_cutlass_mvmr_vvor" mode ALSO routes
     # mvmr (fwd+grad_b) here — it composes this mvmr routing with the
     # vvor grad_a CUTLASS routing in vvor_triton.py so both kernels are
     # active in the same forward/backward.
@@ -146,7 +143,7 @@ def sparse_matrix_vector_multiplication_reduction(
     # fp16 and bf16 both engage CUTLASS; fp32 still falls through (no SM80
     # fp32-input tensor-core atom).
     if current_mode() in (
-        "force_grouped_cutlass_mvmr", "force_grouped_cutlass_mvmr_vvor",
+        "force_fsg_cutlass_mvmr", "force_fsg_cutlass_mvmr_vvor",
     ) and a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16):
         from .mvmr_cutlass import (
             sparse_matrix_vector_multiplication_reduction_cutlass,
@@ -165,6 +162,17 @@ def sparse_matrix_vector_multiplication_reduction(
             a, a_idx, b, b_idx, o_idx, n_o, seg_offs=seg_offs,
         )
         return out.to(a.dtype) if out.dtype != a.dtype else out
+
+    # The grouped kernel feeds operands NATIVELY into tl.dot (no fp32
+    # upcast), which requires matched dtypes. A MIXED pair (e.g. a=fp32
+    # weight Parameter, b=fp16 autocast activation at the AMP boundary)
+    # would CompilationError — promote the narrower operand UP (lossless
+    # widening, same convention as the vvor scalar-FMA fallback). fp32
+    # pairs then take the tf32/ieee dot path.
+    if a.dtype != b.dtype:
+        promoted = torch.promote_types(a.dtype, b.dtype)
+        a = a.to(promoted)
+        b = b.to(promoted)
 
     a = a.contiguous()
     b = b.contiguous()
@@ -259,7 +267,7 @@ def _setup_context_sparse_matrix_vector_multiplication_reduction(ctx, inputs, ou
     if (
         ctx.needs_input_grad[2]
         and current_mode() in (
-            "force_grouped_cutlass_mvmr", "force_grouped_cutlass_mvmr_vvor",
+            "force_fsg_cutlass_mvmr", "force_fsg_cutlass_mvmr_vvor",
         )
         and a.dtype == torch.float16
     ):

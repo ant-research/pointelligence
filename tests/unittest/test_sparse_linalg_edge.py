@@ -190,7 +190,7 @@ class TestEdgeCases(unittest.TestCase):
 
     # ── Forced-grouped on tiny input (threshold bypass) ──
 
-    def test_force_grouped_below_threshold(self):
+    def test_force_fsg_below_threshold(self):
         """T=200, K=27 → avg=7.4 < 16. Auto would route to per-triplet;
         force-grouped runs the grouped kernel anyway. Must still be
         correct (just maybe slower than per-triplet for this size)."""
@@ -209,7 +209,7 @@ class TestEdgeCases(unittest.TestCase):
                 order = torch.argsort(a_idx, stable=True)
                 a_idx, b_idx, o_idx = a_idx[order], b_idx[order], o_idx[order]
 
-                with dispatch_mode("force_grouped"):
+                with dispatch_mode("force_fsg"):
                     out = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                         a, a_idx, b, b_idx, o_idx, 32,
                     )

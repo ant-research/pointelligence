@@ -19,8 +19,13 @@ def sparse_matrix_vector_multiplication_reduction_grouped_cuda(
 
     Preconditions (same as Triton grouped path):
       - a_idx sorted ascending (sort_by="k")
-      - G == 1
       - C >= 128 (weight reuse advantage threshold)
+
+    G >= 1 supported natively: the frozen kernel decodes (seg_k, g, ct,
+    mw) from its warp grid and indexes weight (K, G, C, M) / input
+    (N, G, C) / output (n_o, G, M) with G-strided pointer math — no
+    per-group loop or repack needed. The old wrapper-level ``G == 1``
+    ValueError was stricter than the kernel.
     """
     a = a.contiguous()
     b = b.contiguous()
@@ -32,8 +37,6 @@ def sparse_matrix_vector_multiplication_reduction_grouped_cuda(
     K_offsets = a.shape[0]
     input_dtype = a.dtype
 
-    if G != 1:
-        raise ValueError("Grouped CUDA kernel requires G == 1")
     if not bool((a_idx[1:] >= a_idx[:-1]).all().item()):
         raise ValueError("a_idx must be sorted ascending for grouped path")
 

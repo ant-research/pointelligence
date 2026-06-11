@@ -25,6 +25,17 @@ from torch import Tensor
 import sparse_engines_cuda._C  # noqa: F401 — load TORCH_LIBRARY init
 
 from ._seg_offs import kernel_offset_segments
+from .mvmr_cutlass import (
+    _INT32_LIM,
+    _folded_row_idx,
+    _folded_seg_offs,
+)
+
+
+# Escape hatch / test hook for the fold-G-into-K lever (mirrors
+# mvmr_cutlass._FOLD_G_ENABLED): False forces the per-group loop
+# fallback (the same path the int32-overflow guard takes).
+_FOLD_G_ENABLED = True
 
 
 # Pinned to match Config::TileM / TileN / TileK in
@@ -233,32 +244,26 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
         true fp32 (only TF32/BF16/FP16); fp32 conv stays on the Triton path.
       - M and C multiples of the kernel tile (TileM=TileN=64)
     """
-    a = a.contiguous()
-    b = b.contiguous()
-
     G = a.shape[1]
     M = a.shape[2]
     C = b.shape[2]
 
-    if G != 1:
-        raise ValueError("CUTLASS full vvor requires G == 1")
     if a.dtype != b.dtype or a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
             "CUTLASS full vvor is fp16/bf16-only, both operands same dtype "
             f"(got a={a.dtype}, b={b.dtype})"
         )
+    # Tile gates apply PER GROUP — M / C here are the per-group channel
+    # counts (grad_output is (N, G, Mg), input (N, G, Cg)).
     if M % M_TILE != 0 or C % N_TILE != 0:
         raise ValueError(
-            f"CUTLASS full vvor requires M % {M_TILE} == 0 and "
-            f"C % {N_TILE} == 0; got M={M}, C={C}"
+            f"CUTLASS full vvor requires per-group M % {M_TILE} == 0 and "
+            f"per-group C % {N_TILE} == 0; got per-group M={M}, C={C} (G={G})"
         )
     if not bool((o_idx[1:] >= o_idx[:-1]).all().item()):
         raise ValueError("o_idx must be sorted ascending for grouped path")
 
     seg_offs = kernel_offset_segments(o_idx, int(n_o))
-
-    a_idx_i32 = a_idx.to(torch.int32)
-    b_idx_i32 = b_idx.to(torch.int32)
     seg_offs_i64 = seg_offs.to(torch.int64)
 
     # Arch dispatch: route Hopper (sm_90+) hardware to the sm_90-targeted
@@ -268,10 +273,100 @@ def sparse_vector_vector_outer_product_reduction_grouped_cutlass(
     # sm_80 op stays the path of record.
     major = torch.cuda.get_device_capability(a.device)[0]
     if major >= 9:
-        return torch.ops.sparse_engines_cuda.sparse_vvor_cutlass_sm90_full(
-            a, a_idx_i32, b, b_idx_i32, seg_offs_i64, int(n_o),
-        )
+        op = torch.ops.sparse_engines_cuda.sparse_vvor_cutlass_sm90_full
+    else:
+        op = torch.ops.sparse_engines_cuda.sparse_vvor_cutlass_sm80_full
 
-    return torch.ops.sparse_engines_cuda.sparse_vvor_cutlass_sm80_full(
-        a, a_idx_i32, b, b_idx_i32, seg_offs_i64, int(n_o),
+    if G == 1:
+        a_idx_i32 = a_idx.to(torch.int32)
+        b_idx_i32 = b_idx.to(torch.int32)
+        a = a.contiguous()
+        b = b.contiguous()
+        return op(a, a_idx_i32, b, b_idx_i32, seg_offs_i64, int(n_o))
+
+    # ── G > 1: fold G into the kernel-offset axis — ONE launch of the
+    # frozen G==1 kernel (the per-group loop is retained in
+    # `_vvor_groups_loop` below as the int32-overflow fallback).
+    # Verified BITWISE-equal to the loop on real ScanNet scenes (the
+    # vvor kernel is deterministic per segment — no atomics); c256/G=4
+    # fp16 0.398 → 0.128 ms, c512 0.303 → 0.078 ms with cached indices.
+    # Layout (mirrors mvmr_cutlass's fold; same cached index helpers):
+    #   grad_out (N_a, G, Mg) → (G*N_a, 1, Mg)   (row g*N_a+i = group g's row i)
+    #   input    (N_b, G, Cg) → (G*N_b, 1, Cg)
+    #   a_idx' = concat_g(a_idx + g*N_a), b_idx' = concat_g(b_idx + g*N_b)
+    #   seg_offs' = concat_g(g*T + seg_offs[:-1]) ++ [G*T]
+    # Output (G*n_o, 1, Mg, Cg) → unfold → (n_o, G, Mg, Cg), identical
+    # shape/dtype contract as the loop's cat.
+    n_a = a.shape[0]
+    n_b = b.shape[0]
+    T = int(a_idx.numel())
+    if (
+        _FOLD_G_ENABLED
+        and G * n_a < _INT32_LIM
+        and G * n_b < _INT32_LIM
+        and G * T < _INT32_LIM
+    ):
+        af = a.permute(1, 0, 2).reshape(G * n_a, 1, M).contiguous()
+        bf = b.permute(1, 0, 2).reshape(G * n_b, 1, C).contiguous()
+        a_fold = _folded_row_idx(a_idx, n_a, G)
+        b_fold = _folded_row_idx(b_idx, n_b, G)
+        seg_fold = _folded_seg_offs(seg_offs_i64, o_idx, T, G)
+        out = op(af, a_fold, bf, b_fold, seg_fold, G * int(n_o))
+        return out.view(G, int(n_o), M, C).permute(1, 0, 2, 3).contiguous()
+
+    # Fold would overflow the int32 index ABI (or fold disabled) — take
+    # the per-group loop.
+    return _vvor_groups_loop(
+        a, b, a_idx.to(torch.int32), b_idx.to(torch.int32), seg_offs_i64,
+        int(n_o), G, op,
     )
+
+
+def _vvor_groups_loop(
+    a: Tensor,
+    b: Tensor,
+    a_idx_i32: Tensor,
+    b_idx_i32: Tensor,
+    seg_offs_i64: Tensor,
+    n_o: int,
+    G: int,
+    op,
+) -> Tensor:
+    """G > 1 wrapper-level per-group loop.
+
+    Pre-fold path of record, retained as the fallback when the
+    fold-G-into-K lever would overflow the kernels' int32 index ABI
+    (G*N or G*T ≥ 2^31), and as the reference arm for the fold parity
+    tests. The frozen `_full` host fn hard-TORCH_CHECKs G == 1 on both
+    operands, so groups are block-diagonal-decomposed into G
+    independent G==1 calls: group g uses grad_output[:, g],
+    input[:, g], writes grad_weight[:, g]. Index tensors + seg_offs are
+    GROUP-INVARIANT — built once by the caller, shared by every
+    per-group call.
+
+    Repack accounting (honest count): ONE batched
+    `permute(1,0,2).contiguous()` per operand — (N, G, Cg) →
+    (G, N, Cg) — so each per-group slice is already (N, 1, Cg)-
+    contiguous and the host fn's internal `.contiguous()` calls are
+    no-ops. Same total bytes as G==1's two `.contiguous()` calls, one
+    launch each instead of G. Structural handicap that remains: G
+    kernel launches + the final cat — quantified in the
+    grouped-operator benchmarks under benchmarks/operators/.
+
+    NOTE (measured negative): mvmr_cutlass's side-stream overlap was
+    tried here too and REVERTED — the per-group vvor kernels are ~0.1 ms
+    (vs mvmr's ~0.9 ms), so the event/record/wait plumbing costs more
+    than the overlap recovers (re-measured: c256/G=4 0.391 → 0.368 ms —
+    within noise; c512/G=4 0.289 → 0.354 ms — clear loss). Plain
+    sequential loop is the optimum at this size.
+    """
+    a_perm = a.permute(1, 0, 2).contiguous()
+    b_perm = b.permute(1, 0, 2).contiguous()
+    outs = [
+        op(
+            a_perm[g].unsqueeze(1), a_idx_i32, b_perm[g].unsqueeze(1),
+            b_idx_i32, seg_offs_i64, int(n_o),
+        )
+        for g in range(G)
+    ]
+    return torch.cat(outs, dim=1)  # (n_o, G, M, C)

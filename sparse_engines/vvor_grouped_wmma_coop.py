@@ -40,11 +40,14 @@ def sparse_vector_vector_outer_product_reduction_grouped_wmma_coop(
     C = b.shape[2]
     G = a.shape[1]
 
-    if G != 1:
-        raise ValueError("WMMA-coop vvor requires G == 1")
+    # G >= 1 supported natively: the frozen kernel's block grid is
+    # K * G * (M/16) * (C/16) * W with G-strided loads/stores — no
+    # per-group loop needed. M / C are PER-GROUP channel counts, so the
+    # %16 gate below is a per-group gate.
     if M % 16 != 0 or C % 16 != 0:
         raise ValueError(
-            f"WMMA-coop vvor requires M and C divisible by 16; got M={M}, C={C}"
+            "WMMA-coop vvor requires per-group M and C divisible by 16; "
+            f"got per-group M={M}, C={C} (G={G})"
         )
     if not bool((o_idx[1:] >= o_idx[:-1]).all().item()):
         raise ValueError("o_idx must be sorted ascending for grouped path")

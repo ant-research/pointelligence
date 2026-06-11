@@ -27,6 +27,9 @@ Public surface:
       The CUTLASS single-tile path. Caller pre-gathers + pads.
 """
 
+import weakref
+from collections import OrderedDict
+
 import torch
 from torch import Tensor
 
@@ -41,6 +44,156 @@ from ._seg_offs import kernel_offset_segments
 M_TILE = 64
 S_TILE = 64
 C_TILE = 32
+
+
+# ── G>1 per-group side streams ────────────────────────────────────────────────
+# The frozen CUTLASS `_full` kernels parallelize over (M-tiles ×
+# k-segments) only, so a per-group call at Cg=Mg=64 launches a mere
+# K_offsets CTAs (27 for a 3³ kernel) — heavily under-occupied. The G
+# independent group calls are therefore issued on dedicated side streams
+# and re-joined to the caller's stream, overlapping the under-occupied
+# kernels (measured 3.3× on c256/G=4 fp16).
+# Streams are created lazily per device and reused across calls. Shared
+# by vvor_cutlass.py (imported from here).
+_GROUP_STREAMS: dict = {}
+
+
+def _group_streams(device: torch.device, G: int) -> list:
+    key = torch.cuda.current_device() if device.index is None else device.index
+    streams = _GROUP_STREAMS.setdefault(key, [])
+    while len(streams) < G:
+        streams.append(torch.cuda.Stream(device=key))
+    return streams[:G]
+
+
+# ── G>1 fold-G-into-K_offsets (single-launch lever) ──────────────────────────
+# The frozen CUTLASS `_full` host fns accept arbitrary K_offsets /
+# seg_offs / n_o, so a G>1 block-diagonal call can be laid out as
+# G*K_offsets independent kernel-offset segments in ONE launch instead of
+# G per-group launches (G× more CTAs — directly fixes the
+# under-occupancy the per-group loop only papered over with side
+# streams). The replicated index buffers are GROUP-INVARIANT
+# functions of the triplet structure:
+#   row_idx'  = concat_g(row_idx + g*n_rows)            (T*G,)  int32
+#   seg_offs' = concat_g(g*T + seg_offs[:-1]) ++ [G*T]  (G*K+1,) int64
+# so they are cached across calls (training steps, and the fwd/grad_b
+# pair which share the same a_idx/b_idx/o_idx structure) — same sharing
+# precedent as the seg_offs ctx-share in mvmr_triton.py.
+#
+# Cache key per folded buffer:
+#   (kind, src.data_ptr(), src._version, src.numel(), src.dtype,
+#    fold params…, device)
+# and each entry stores a `weakref` to the source tensor. A hit is valid
+# only if (a) the key matches AND (b) the entry's original source tensor
+# is STILL ALIVE with the same data_ptr/_version. `_version` invalidates
+# on any IN-PLACE write to the source index tensor; the weakref-liveness
+# check closes the recycled-data_ptr hole (a *different* tensor freshly
+# allocated at a freed entry's data_ptr with coincidentally identical
+# _version/numel/dtype can never alias — its entry's weakref is dead, so
+# it misses and is rebuilt). Documented ASSUMPTION that remains: an
+# in-place content change that bypasses the version counter (e.g. raw
+# `.data` writes / `set_` games) is invisible to the cache — supported
+# callers never do that to index tensors. The seg_offs fold is keyed on
+# the SOURCE kernel-offset index tensor (mvmr a_idx / vvor o_idx, of
+# which seg_offs is a pure function), never on the internally-rebuilt
+# seg_offs temp whose allocator slot is recycled every call. Tensors
+# created under torch.inference_mode() expose no version counter — those
+# calls bypass the cache (folded per call; still correct).
+_FOLD_IDX_CACHE: OrderedDict = OrderedDict()
+_FOLD_IDX_CACHE_MAX = 32
+_INT32_LIM = 2 ** 31
+# Escape hatch / test hook: False forces the per-group loop fallback
+# (the same path the int32-overflow guard takes).
+_FOLD_G_ENABLED = True
+
+
+def fused_fold_legal(G: int, n_b: int, n_o: int, T: int) -> bool:
+    """conv.py routing guard for FusedPointConv3d at G>1: fold-G must be
+    enabled and the folded index ranges must fit int32 (the kernels'
+    index dtype). G==1 is always legal (no fold)."""
+    if G == 1:
+        return True
+    return (
+        _FOLD_G_ENABLED
+        and G * n_b < _INT32_LIM
+        and G * n_o < _INT32_LIM
+        and G * T < _INT32_LIM
+    )
+
+
+def _fold_cache_key(kind: str, src: Tensor, params: tuple):
+    try:
+        ver = src._version
+    except RuntimeError:        # inference tensor — no version counter
+        return None
+    return (kind, src.data_ptr(), ver, src.numel(), src.dtype) + params + (
+        src.device.index,
+    )
+
+
+def _fold_cache_get(key):
+    if key is None:
+        return None
+    entry = _FOLD_IDX_CACHE.get(key)
+    if entry is None:
+        return None
+    src_ref, val = entry
+    src = src_ref()
+    # Liveness + identity re-check (see cache notes above): the original
+    # source tensor must still be alive, unmutated, and at the same
+    # storage — otherwise this key is a recycled-ptr imposter; drop it.
+    if src is None or src._version != key[2] or src.data_ptr() != key[1]:
+        del _FOLD_IDX_CACHE[key]
+        return None
+    _FOLD_IDX_CACHE.move_to_end(key)
+    return val
+
+
+def _fold_cache_put(key, src: Tensor, val) -> None:
+    if key is None:
+        return
+    _FOLD_IDX_CACHE[key] = (weakref.ref(src), val)
+    while len(_FOLD_IDX_CACHE) > _FOLD_IDX_CACHE_MAX:
+        _FOLD_IDX_CACHE.popitem(last=False)
+
+
+def _folded_row_idx(idx: Tensor, n_rows: int, G: int) -> Tensor:
+    """concat_g(idx + g*n_rows) as int32, cached (see cache notes above)."""
+    key = _fold_cache_key("row", idx, (int(n_rows), int(G)))
+    hit = _fold_cache_get(key)
+    if hit is not None:
+        return hit
+    ar = torch.arange(G, device=idx.device, dtype=torch.int64)
+    folded = (
+        (idx.to(torch.int64).unsqueeze(0) + (ar * int(n_rows)).unsqueeze(1))
+        .reshape(-1).to(torch.int32)
+    )
+    _fold_cache_put(key, idx, folded)
+    return folded
+
+
+def _folded_seg_offs(seg_offs: Tensor, key_src: Tensor, T: int, G: int) -> Tensor:
+    """concat_g(g*T + seg_offs[:-1]) ++ [G*T] as int64, cached.
+
+    Keyed on `key_src` (the kernel-offset index tensor seg_offs was built
+    from), NOT on seg_offs itself — seg_offs is usually an internal
+    per-call temp whose allocator slot is recycled every call, which
+    would make the data_ptr/_version/weakref staleness machinery thrash
+    (see cache notes above).
+    """
+    K = int(seg_offs.numel()) - 1
+    key = _fold_cache_key("seg", key_src, (K, int(T), int(G)))
+    hit = _fold_cache_get(key)
+    if hit is not None:
+        return hit
+    seg64 = seg_offs.to(torch.int64)
+    ar = torch.arange(G, device=seg_offs.device, dtype=torch.int64)
+    folded = torch.cat([
+        (seg64[:-1].unsqueeze(0) + (ar * int(T)).unsqueeze(1)).reshape(-1),
+        torch.full((1,), int(T) * G, device=seg_offs.device, dtype=torch.int64),
+    ])
+    _fold_cache_put(key, key_src, folded)
+    return folded
 
 
 def _pad_to_c_tile(x: Tensor, c_seg: int) -> tuple[Tensor, int]:
@@ -296,24 +449,22 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
         triplet structure, invariant across both). When ``None`` it is
         built here as before (non-autograd / "auto"-mode callers).
     """
-    b = b.contiguous()
-
     K_offsets = a.shape[0]
     G = a.shape[1]
     C = a.shape[2]
     M = a.shape[3]
 
-    if G != 1:
-        raise ValueError("CUTLASS full mvmr requires G == 1")
     if a.dtype != b.dtype or a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
             "CUTLASS full mvmr is fp16/bf16-only, both operands same dtype "
             f"(got a={a.dtype}, b={b.dtype})"
         )
+    # Tile gates apply PER GROUP — C / M here are the per-group channel
+    # counts (weight is (K, G, Cg, Mg), input (N, G, Cg)).
     if M % M_TILE != 0 or C % C_TILE != 0:
         raise ValueError(
-            f"CUTLASS full mvmr requires M % {M_TILE} == 0 and "
-            f"C % {C_TILE} == 0; got M={M}, C={C}"
+            f"CUTLASS full mvmr requires per-group M % {M_TILE} == 0 and "
+            f"per-group C % {C_TILE} == 0; got per-group M={M}, C={C} (G={G})"
         )
     if not bool((a_idx[1:] >= a_idx[:-1]).all().item()):
         raise ValueError("a_idx must be sorted ascending for grouped path")
@@ -322,8 +473,6 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
         seg_offs = kernel_offset_segments(a_idx, int(K_offsets)).to(torch.int64)
     else:
         seg_offs = seg_offs.to(torch.int64)
-    b_idx_i32 = b_idx.to(torch.int32)
-    o_idx_i32 = o_idx.to(torch.int32)
 
     # Arch dispatch (mirrors vvor_cutlass.py): route Hopper (sm_90+)
     # hardware to the sm_90-targeted op. The two ops are algorithmically
@@ -333,13 +482,118 @@ def sparse_matrix_vector_multiplication_reduction_cutlass(
     # path of record.
     major = torch.cuda.get_device_capability(a.device)[0]
     if major >= 9:
-        return torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full(
-            a, b_idx_i32, b, o_idx_i32, seg_offs, int(n_o),
-        )
+        op = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full
+    else:
+        op = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm80_full
 
-    return torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm80_full(
-        a, b_idx_i32, b, o_idx_i32, seg_offs, int(n_o),
+    if G == 1:
+        b_idx_i32 = b_idx.to(torch.int32)
+        o_idx_i32 = o_idx.to(torch.int32)
+        b = b.contiguous()
+        return op(a, b_idx_i32, b, o_idx_i32, seg_offs, int(n_o))
+
+    # ── G > 1: fold G into K_offsets — ONE launch of the frozen G==1
+    # kernel (the per-group side-stream loop is retained in
+    # `_mvmr_groups_loop` below as the int32-overflow fallback).
+    # Verified against the loop on real ScanNet scenes: parity
+    # relF ≈ 2e-8 (atomicAdd-scatter reordering only); c256/G=4 fp16
+    # 1.138 → 0.962 ms, c512 0.450 → 0.273 ms with cached indices.
+    # Layout:
+    #   weight (K, G, Cg, Mg) → (G*K, 1, Cg, Mg)  (segment g*K+k = group g's W[k])
+    #   input  (N, G, Cg)     → (G*N, Cg)         (row g*N+i = group g's b[i])
+    #   b_idx' = concat_g(b_idx + g*N), o_idx' = concat_g(o_idx + g*n_o)
+    #   seg_offs' = concat_g(g*T + seg_offs[:-1]) ++ [G*T]
+    # Folded indices are group-invariant → cached (_folded_row_idx /
+    # _folded_seg_offs; see the fold-cache notes above _fold_cache_key).
+    # Output (G*n_o, 1, M) → unfold → (n_o, G, M) fp32, identical shape/
+    # dtype contract as the loop's cat.
+    n_b = b.shape[0]
+    T = int(b_idx.numel())
+    if (
+        _FOLD_G_ENABLED
+        and G * n_b < _INT32_LIM
+        and G * int(n_o) < _INT32_LIM
+        and G * T < _INT32_LIM
+    ):
+        wf = a.permute(1, 0, 2, 3).reshape(G * K_offsets, 1, C, M).contiguous()
+        ff = b.permute(1, 0, 2).reshape(G * n_b, C).contiguous()
+        b_fold = _folded_row_idx(b_idx, n_b, G)
+        o_fold = _folded_row_idx(o_idx, int(n_o), G)
+        seg_fold = _folded_seg_offs(seg_offs, a_idx, T, G)
+        out = op(wf, b_fold, ff, o_fold, seg_fold, G * int(n_o))
+        return out.view(G, int(n_o), M).permute(1, 0, 2).contiguous()
+
+    # Fold would overflow the int32 index ABI (or fold disabled) — take
+    # the per-group loop.
+    return _mvmr_groups_loop(
+        a, b, b_idx.to(torch.int32), o_idx.to(torch.int32), seg_offs,
+        int(n_o), G, major,
     )
+
+
+def _mvmr_groups_loop(
+    a: Tensor,
+    b: Tensor,
+    b_idx_i32: Tensor,
+    o_idx_i32: Tensor,
+    seg_offs: Tensor,
+    n_o: int,
+    G: int,
+    major: int,
+) -> Tensor:
+    """G > 1 wrapper-level per-group loop.
+
+    Pre-fold path of record, retained as the fallback when the
+    fold-G-into-K_offsets lever would overflow the kernels' int32 index
+    ABI (G*N or G*T ≥ 2^31), and as the reference arm for the fold
+    parity tests. The frozen `_full` host fn hard-TORCH_CHECKs
+    `a.size(1) == 1`, so groups are block-diagonal-decomposed into G
+    independent G==1 calls: group g uses weight[:, g], input[:, g],
+    writes out[:, g]. Index tensors + seg_offs are GROUP-INVARIANT —
+    built once by the caller, shared by every per-group call (not
+    rebuilt per group).
+
+    Repack accounting (honest count):
+      - input b: ONE batched repack `permute(1,0,2).contiguous()` —
+        (N, G, Cg) → (G, N, Cg) — so each per-group slice b_perm[g]
+        is already (N, 1, Cg)-contiguous and the host fn's internal
+        `inb_2d.contiguous()` is a no-op. Same total bytes as G==1's
+        single `.contiguous()`, one kernel launch instead of G.
+      - weight a: ONE batched pre-stage `permute(1,0,3,2).contiguous()`
+        — (K, G, Cg, Mg) → (G, K, Mg, Cg) — feeding the `_full_prestaged`
+        entry, which SKIPS `_full`'s per-call internal
+        `select(1,0).transpose(1,2).contiguous()` repack. Same total
+        bytes as the G host-internal repacks it replaces, one launch
+        instead of G.
+      - the per-group launches go to dedicated side streams
+        (`_group_streams`) — the under-occupied kernels (K_offsets CTAs
+        each) overlap instead of serializing.
+    Structural handicap that remains: G under-occupied kernel launches
+    + the final cat — quantified in the grouped-operator benchmarks
+    under benchmarks/operators/.
+    """
+    if major >= 9:
+        op_pre = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full_prestaged
+    else:
+        op_pre = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm80_full_prestaged
+    b_perm = b.permute(1, 0, 2).contiguous()
+    aT = a.permute(1, 0, 3, 2).contiguous()   # (G, K, Mg, Cg)
+    cur = torch.cuda.current_stream()
+    streams = _group_streams(a.device, G)
+    ev = torch.cuda.Event()
+    ev.record(cur)
+    outs: list = [None] * G
+    for g in range(G):
+        with torch.cuda.stream(streams[g]):
+            streams[g].wait_event(ev)
+            outs[g] = op_pre(
+                aT[g], b_idx_i32, b_perm[g].unsqueeze(1), o_idx_i32,
+                seg_offs, int(n_o),
+            )
+            outs[g].record_stream(cur)
+    for s in streams:
+        cur.wait_stream(s)
+    return torch.cat(outs, dim=1)  # (n_o, G, M) fp32
 
 
 # ─── Python-only fused PointConv3d autograd.Function ──────────────────────────
@@ -380,19 +634,44 @@ class FusedPointConv3d(torch.autograd.Function):
     """Fused PointConv3d fwd+bwd (Python-only).
 
     Collapses the eager mvmr-fwd / vvor-grad_a / mvmr-grad_b composition
-    into one Function reusing the frozen CUTLASS full kernels. fp16 / G==1
-    / sorted-a_idx / M,C tile-multiple — same hard preconditions as the
-    underlying `sparse_matrix_vector_multiplication_reduction_cutlass` /
-    `..._grouped_cutlass` entry points, which raise on violation.
+    into one Function reusing the frozen CUTLASS full kernels. fp16 /
+    sorted-a_idx / per-group M,C tile-multiple — same hard preconditions
+    as the underlying `sparse_matrix_vector_multiplication_reduction_cutlass`
+    / `..._grouped_cutlass` entry points, which raise on violation.
 
     Inputs mirror `sparse_matrix_vector_multiplication_reduction`:
-      weight (K, G=1, C, M) fp16, a_idx (T,) sorted asc, input_3d
-      (N, G=1, C) fp16, b_idx (T,), o_idx (T,), n_o int.
+      weight (K, G, Cg, Mg) fp16, a_idx (T,) sorted asc, input_3d
+      (N, G, Cg) fp16, b_idx (T,), o_idx (T,), n_o int.
+
+    G > 1: fold-G-into-K_offsets, single launch per leg — the same
+    mechanics as the fold wrappers above (weight → (G·K,1,Cg,Mg)
+    g-major, group-offset row indices via `_folded_row_idx`, seg_offs'
+    via `_folded_seg_offs` — both cached), so the fused mode keeps its
+    one-autograd-node / 3-launches shape at any G. Before this, G>1
+    entering here would `select(1, 0)` — group-0-only, a
+    silent-wrong-result hole; conv.py additionally guards fold legality
+    (int32 ranges) and falls through to the eager composition when
+    unmet.
     """
 
     @staticmethod
     def forward(ctx, weight, a_idx, input_3d, b_idx, o_idx, n_o):
         K_offsets = weight.shape[0]
+        G = weight.shape[1]
+        N_b = input_3d.shape[0]
+        T = a_idx.numel()
+
+        if G > 1 and not (
+            _FOLD_G_ENABLED
+            and G * N_b < _INT32_LIM
+            and G * int(n_o) < _INT32_LIM
+            and G * T < _INT32_LIM
+        ):
+            raise ValueError(
+                f"FusedPointConv3d G={G}: fold-G is disabled or exceeds "
+                f"int32 index range (G*N={G * N_b}, G*n_o={G * int(n_o)}, "
+                f"G*T={G * T}); route the eager composition instead"
+            )
 
         # ── Single weight stage, fed straight to `_full_prestaged`.
         # weight (K,1,C,M) → aT_fwd (K,M,C) C-contiguous — exactly the
@@ -402,31 +681,54 @@ class FusedPointConv3d(torch.autograd.Function):
         # This stage is THE one weight copy for the fwd side; amortized
         # over fwd + grad_a. `_prestaged` consumes the staged buffer
         # directly (no host-side repack on top of it).
-        aT_fwd = weight.select(1, 0).transpose(1, 2).contiguous()
+        # G>1: g-major fold (G·K, Mg, Cg) matching the folded seg_offs'
+        # segment order; still exactly one weight copy.
+        if G == 1:
+            aT_fwd = weight.select(1, 0).transpose(1, 2).contiguous()
+        else:
+            aT_fwd = weight.permute(1, 0, 3, 2).reshape(
+                G * K_offsets, weight.shape[3], weight.shape[2]
+            ).contiguous()
 
         # ── seg_offs built ONCE; reused by fwd host fn and grad_b. a_idx +
         # K_offsets are the fixed triplet structure, invariant fwd↔grad_b.
         seg_offs = kernel_offset_segments(a_idx, int(K_offsets)).to(torch.int64)
 
-        b = input_3d.contiguous()
-        b_idx_i32 = b_idx.to(torch.int32)
-        o_idx_i32 = o_idx.to(torch.int32)
+        if G == 1:
+            b = input_3d.contiguous()
+            b_idx_i32 = b_idx.to(torch.int32)
+            o_idx_i32 = o_idx.to(torch.int32)
+        else:
+            b = input_3d.permute(1, 0, 2).reshape(
+                G * N_b, 1, weight.shape[2]).contiguous()
+            b_idx_i32 = _folded_row_idx(b_idx, N_b, G)
+            o_idx_i32 = _folded_row_idx(o_idx, int(n_o), G)
+            # NOTE: at G>1 the ctx-saved seg_offs is the FOLDED one
+            # (length G*K+1) — grad_b reuses it directly.
+            seg_offs = _folded_seg_offs(seg_offs, a_idx, T, G)
 
+        n_o_launch = int(n_o) if G == 1 else G * int(n_o)
         major = torch.cuda.get_device_capability(weight.device)[0]
         if major >= 9:
             out = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full_prestaged(
-                aT_fwd, b_idx_i32, b, o_idx_i32, seg_offs, int(n_o),
+                aT_fwd, b_idx_i32, b, o_idx_i32, seg_offs, n_o_launch,
             )
         else:
             out = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm80_full_prestaged(
-                aT_fwd, b_idx_i32, b, o_idx_i32, seg_offs, int(n_o),
+                aT_fwd, b_idx_i32, b, o_idx_i32, seg_offs, n_o_launch,
             )
         out = out.to(weight.dtype) if out.dtype != weight.dtype else out
+        if G > 1:
+            # (G·n_o, 1, Mg) → (n_o, G, Mg), group-major channels —
+            # matches the (N, G, Cg) input convention conv.py flattens.
+            out = out.reshape(G, int(n_o), weight.shape[3]).permute(
+                1, 0, 2).contiguous()
 
         ctx.save_for_backward(weight, a_idx, input_3d, b_idx, o_idx, seg_offs)
         ctx.n_o = int(n_o)
         ctx.K_offsets = int(K_offsets)
         ctx.b_shape_0 = input_3d.shape[0]
+        ctx.G = G
         return out
 
     @staticmethod
@@ -468,21 +770,41 @@ class FusedPointConv3d(torch.autograd.Function):
             # single copy happens at this controlled stage, with NO
             # internal `_full` repack on top of it. seg_offs is reused
             # (not rebuilt); grad_a (vvor) path unchanged.
-            aT_gradb = weight.select(1, 0).contiguous()
-            b_idx_i32 = b_idx.to(torch.int32)
-            o_idx_i32 = o_idx.to(torch.int32)
+            G = ctx.G
+            if G == 1:
+                aT_gradb = weight.select(1, 0).contiguous()
+                b_idx_i32 = b_idx.to(torch.int32)
+                o_idx_i32 = o_idx.to(torch.int32)
+                grad_in = grad_out
+                n_rows = ctx.b_shape_0
+            else:
+                # Fold-G mirror of the forward (ctx seg_offs is already
+                # folded; row-index folds are cache hits from forward).
+                Cg, Mg = weight.shape[2], weight.shape[3]
+                aT_gradb = weight.permute(1, 0, 2, 3).reshape(
+                    G * ctx.K_offsets, Cg, Mg).contiguous()
+                b_idx_i32 = _folded_row_idx(b_idx, ctx.b_shape_0, G)
+                o_idx_i32 = _folded_row_idx(o_idx, ctx.n_o, G)
+                grad_in = grad_out.permute(1, 0, 2).reshape(
+                    G * ctx.n_o, 1, Mg).contiguous()
+                n_rows = G * ctx.b_shape_0
             major = torch.cuda.get_device_capability(weight.device)[0]
             if major >= 9:
                 grad_b = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm90_full_prestaged(
-                    aT_gradb, o_idx_i32, grad_out, b_idx_i32, seg_offs,
-                    ctx.b_shape_0,
+                    aT_gradb, o_idx_i32, grad_in, b_idx_i32, seg_offs,
+                    n_rows,
                 )
             else:
                 grad_b = torch.ops.sparse_engines_cuda.sparse_mvmr_cutlass_sm80_full_prestaged(
-                    aT_gradb, o_idx_i32, grad_out, b_idx_i32, seg_offs,
-                    ctx.b_shape_0,
+                    aT_gradb, o_idx_i32, grad_in, b_idx_i32, seg_offs,
+                    n_rows,
                 )
             if grad_b.dtype != weight.dtype:
                 grad_b = grad_b.to(weight.dtype)
+            if G > 1:
+                # (G·N, 1, Cg) → (N, G, Cg) matching input_3d.
+                grad_b = grad_b.reshape(G, ctx.b_shape_0,
+                                        weight.shape[2]).permute(
+                    1, 0, 2).contiguous()
 
         return grad_weight, None, grad_b, None, None, None

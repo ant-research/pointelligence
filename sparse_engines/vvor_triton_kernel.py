@@ -66,6 +66,18 @@ _AUTOTUNE_CONFIGS = [
     triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_C": 64}, num_warps=4),
     triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_C": 64}, num_warps=4),
     triton.Config({"L": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_C": 128}, num_warps=8),
+
+    # ── BLOCK_SIZE_G > 1: at G>1 small per-group Cg/Mg, a multi-group
+    # block amortizes the per-triplet index loads (the kernel's block
+    # math has always been G-generic). The (G, M, C) accumulator costs
+    # registers — keep M/C tiles small. Autotune will not pick these at
+    # G == 1.
+    triton.Config({"L": 64,  "BLOCK_SIZE_G": 2, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=2),
+    triton.Config({"L": 128, "BLOCK_SIZE_G": 2, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=4),
+    triton.Config({"L": 64,  "BLOCK_SIZE_G": 4, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=2),
+    triton.Config({"L": 128, "BLOCK_SIZE_G": 4, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
+    triton.Config({"L": 64,  "BLOCK_SIZE_G": 8, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
+    triton.Config({"L": 128, "BLOCK_SIZE_G": 8, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
 ]
 
 
@@ -211,6 +223,25 @@ _GROUPED_AUTOTUNE_CONFIGS = [
     # only K_inner grows, so register pressure on output is unchanged.
     triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_C": 64},  num_warps=4),
     triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_C": 128}, num_warps=8),
+    triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 1, "BLOCK_SIZE_M": 32,  "BLOCK_SIZE_C": 32},  num_warps=4),
+
+    # NOTE: BLOCK_SIZE_G=1 small-tile (16-wide M/C) configs were tried
+    # for small per-group widths and measured neutral-to-NEGATIVE on
+    # real ScanNet cells (see the same note in mvmr_triton_kernel;
+    # autotune mispicks them for the backward). Small tiles live only in
+    # the BLOCK_SIZE_G>1 block below.
+
+    # ── multi-group-per-program configs: one tl.dot per group in a
+    # static loop; the seg walk + idx gathers are amortized across
+    # BLOCK_SIZE_G groups. Only useful at G > 1 — autotune will not pick
+    # them at G == 1 (more masked work, no gain).
+    triton.Config({"L_CHUNK": 128, "BLOCK_SIZE_G": 2, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=4),
+    triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 2, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_C": 64}, num_warps=4),
+    triton.Config({"L_CHUNK": 128, "BLOCK_SIZE_G": 4, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=2),
+    triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 4, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=4),
+    triton.Config({"L_CHUNK": 128, "BLOCK_SIZE_G": 8, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
+    triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 8, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_C": 16}, num_warps=4),
+    triton.Config({"L_CHUNK": 256, "BLOCK_SIZE_G": 8, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_C": 32}, num_warps=8),
 ]
 
 
@@ -252,8 +283,11 @@ def sparse_vector_vector_outer_product_reduction_grouped_kernel(
     seg_end_k = tl.load(seg_offs + 1).to(tl.int32)
     chunk_idx_within_k = 0
     running = 0
+    # Carry seg_e into the next iteration's seg_s — one seg_offs load
+    # per iteration instead of two (the walk runs in EVERY program, and
+    # the program count multiplies by G at G>1).
+    seg_s = tl.load(seg_offs + 0).to(tl.int32)
     for k_iter in tl.range(0, K_offsets):
-        seg_s = tl.load(seg_offs + k_iter).to(tl.int32)
         seg_e = tl.load(seg_offs + k_iter + 1).to(tl.int32)
         chunks_in_this_k = (seg_e - seg_s + L_CHUNK - 1) // L_CHUNK
         if running <= pid_chunk and pid_chunk < running + chunks_in_this_k:
@@ -262,6 +296,14 @@ def sparse_vector_vector_outer_product_reduction_grouped_kernel(
             seg_end_k = seg_e
             chunk_idx_within_k = pid_chunk - running
         running += chunks_in_this_k
+        seg_s = seg_e
+
+    # Sync-free launch bound: the wrapper sizes the grid with
+    # cdiv(T, L_CHUNK) + K_offsets chunks — an upper bound on the true
+    # total (`running`). Surplus programs have no segment: exit before
+    # any loads (k_offset/seg bounds above would be stale defaults).
+    if pid_chunk >= running:
+        return
 
     seg_start = seg_start_k + chunk_idx_within_k * L_CHUNK
     seg_end_k = seg_end_k
@@ -280,29 +322,35 @@ def sparse_vector_vector_outer_product_reduction_grouped_kernel(
     gc_mask = g_mask[:, None] & c_mask[None, :]
     gmc_mask = g_mask[:, None, None] & m_mask[None, :, None] & c_mask[None, None, :]
 
-    # Gather indices for this chunk.
+    # Gather indices for this chunk (shared across all groups handled by
+    # this program — the BLOCK_SIZE_G > 1 path amortizes these plus the
+    # seg_offs walk above across the groups).
     a_idx_chunk = tl.load(a_idx + l_offsets, mask=l_mask, other=0)
     b_idx_chunk = tl.load(b_idx + l_offsets, mask=l_mask, other=0)
 
-    # Gather a (gradients): (L_CHUNK, G, M_tile).
-    a_ptrs = a + (
-        a_idx_chunk[:, None, None] * (G * M)
-        + g_offsets[None, :, None] * M
-        + m_offsets[None, None, :]
-    )
-    a_load_mask = l_mask[:, None, None] & gm_mask[None, :, :]
-    block_a = tl.load(a_ptrs, mask=a_load_mask, other=0.0).to(tl.float32)
-
-    # Gather b (features): (L_CHUNK, G, C_tile).
-    b_ptrs = b + (
-        b_idx_chunk[:, None, None] * (G * C)
-        + g_offsets[None, :, None] * C
-        + c_offsets[None, None, :]
-    )
-    b_load_mask = l_mask[:, None, None] & gc_mask[None, :, :]
-    block_b = tl.load(b_ptrs, mask=b_load_mask, other=0.0).to(tl.float32)
-
     if BLOCK_SIZE_G == 1:
+        # Gather a (gradients): (L_CHUNK, G, M_tile).
+        a_ptrs = a + (
+            a_idx_chunk[:, None, None] * (G * M)
+            + g_offsets[None, :, None] * M
+            + m_offsets[None, None, :]
+        )
+        # Native dtype: fp16/bf16 operands go straight into tl.dot (fp32
+        # accumulator via out_dtype) at full-rate mma; an unconditional
+        # .to(tl.float32) would demote them to TF32 mma. fp32 inputs
+        # unaffected.
+        a_load_mask = l_mask[:, None, None] & gm_mask[None, :, :]
+        block_a = tl.load(a_ptrs, mask=a_load_mask, other=0.0)
+
+        # Gather b (features): (L_CHUNK, G, C_tile).
+        b_ptrs = b + (
+            b_idx_chunk[:, None, None] * (G * C)
+            + g_offsets[None, :, None] * C
+            + c_offsets[None, None, :]
+        )
+        b_load_mask = l_mask[:, None, None] & gc_mask[None, :, :]
+        block_b = tl.load(b_ptrs, mask=b_load_mask, other=0.0)
+
         # tl.dot path: a^T @ b for the L_CHUNK rows.
         # block_a: (L_CHUNK, 1, M_tile) → (L_CHUNK, M_tile).T = (M_tile, L_CHUNK)
         # block_b: (L_CHUNK, 1, C_tile) → (L_CHUNK, C_tile)
@@ -314,19 +362,39 @@ def sparse_vector_vector_outer_product_reduction_grouped_kernel(
         out_2d = tl.dot(a_2d_T, b_2d, out_dtype=tl.float32,
                         input_precision=INPUT_PRECISION)   # (M_tile, C_tile)
         out_3d = tl.reshape(out_2d, (BLOCK_SIZE_G, BLOCK_SIZE_M, BLOCK_SIZE_C))
-    else:
-        # Group-conv fallback (G > 1 not in production today).
-        # block_a: (L_CHUNK, G, M)        block_b: (L_CHUNK, G, C)
-        # outer + reduce over L:
-        out_3d = tl.sum(
-            block_a[:, :, :, None] * block_b[:, :, None, :],
-            axis=0,
-        )
 
-    # Atomic-add to the kernel-offset's weight-grad tile.
-    o_ptr = o + k_offset * (G * M * C) + (
-        g_offsets[:, None, None] * (M * C)
-        + m_offsets[None, :, None] * C
-        + c_offsets[None, None, :]
-    )
-    tl.atomic_add(o_ptr, out_3d, mask=gmc_mask)
+        # Atomic-add to the kernel-offset's weight-grad tile.
+        o_ptr = o + k_offset * (G * M * C) + (
+            g_offsets[:, None, None] * (M * C)
+            + m_offsets[None, :, None] * C
+            + c_offsets[None, None, :]
+        )
+        tl.atomic_add(o_ptr, out_3d, mask=gmc_mask)
+    else:
+        # Multi-group-per-program path (replaces the old elementwise-FMA
+        # fallback, which no config exercised). One tl.dot PER GROUP in
+        # a static loop — tensor cores still fire for every group, while
+        # the seg_offs walk and the a_idx/b_idx chunk gathers above are
+        # paid once per program instead of once per (program, group).
+        lm_mask2 = l_mask[:, None] & m_mask[None, :]
+        lc_mask2 = l_mask[:, None] & c_mask[None, :]
+        mc_mask2 = m_mask[:, None] & c_mask[None, :]
+        for gi in tl.static_range(BLOCK_SIZE_G):
+            g_cur = pid_g * BLOCK_SIZE_G + gi
+            g_ok = g_cur < G
+            a_ptrs_g = a + (
+                a_idx_chunk[:, None] * (G * M) + g_cur * M
+                + m_offsets[None, :]
+            )
+            a_2d = tl.load(a_ptrs_g, mask=lm_mask2 & g_ok, other=0.0)
+            b_ptrs_g = b + (
+                b_idx_chunk[:, None] * (G * C) + g_cur * C
+                + c_offsets[None, :]
+            )
+            b_2d = tl.load(b_ptrs_g, mask=lc_mask2 & g_ok, other=0.0)
+            out_2d = tl.dot(tl.trans(a_2d), b_2d, out_dtype=tl.float32,
+                            input_precision=INPUT_PRECISION)
+            o_ptr_g = o + k_offset * (G * M * C) + g_cur * (M * C) + (
+                m_offsets[:, None] * C + c_offsets[None, :]
+            )
+            tl.atomic_add(o_ptr_g, out_2d, mask=mc_mask2 & g_ok)

@@ -85,8 +85,8 @@ class TestGroupedEquivalence(unittest.TestCase):
                          * 0.1).to(dtype)
                     a_idx, b_idx, o_idx = make_indices(N_a, N_b, N_o, T, device)
 
-                    out_grp = self._run_mvmr(a, a_idx, b, b_idx, o_idx, N_o, "force_grouped")
-                    out_pt  = self._run_mvmr(a, a_idx, b, b_idx, o_idx, N_o, "force_per_triplet")
+                    out_grp = self._run_mvmr(a, a_idx, b, b_idx, o_idx, N_o, "force_fsg")
+                    out_pt  = self._run_mvmr(a, a_idx, b, b_idx, o_idx, N_o, "force_pt")
                     rel = rel_err(out_grp, out_pt)
                     print(f"  MVMR-fwd [{stage_name} {dtype_name}] rel={rel:.3e}")
                     self.assertLess(rel, tol)
@@ -113,8 +113,8 @@ class TestGroupedEquivalence(unittest.TestCase):
                     order = torch.argsort(o_idx, stable=True)
                     a_idx, b_idx, o_idx = a_idx[order], b_idx[order], o_idx[order]
 
-                    out_grp = self._run_vvor(a, a_idx, b, b_idx, o_idx, K_off, "force_grouped")
-                    out_pt  = self._run_vvor(a, a_idx, b, b_idx, o_idx, K_off, "force_per_triplet")
+                    out_grp = self._run_vvor(a, a_idx, b, b_idx, o_idx, K_off, "force_fsg")
+                    out_pt  = self._run_vvor(a, a_idx, b, b_idx, o_idx, K_off, "force_pt")
                     rel = rel_err(out_grp, out_pt)
                     print(f"  VVOR-fwd [{stage_name} {dtype_name}] rel={rel:.3e}")
                     self.assertLess(rel, tol)
@@ -138,14 +138,14 @@ class TestGroupedEquivalence(unittest.TestCase):
                     # Run grouped path
                     a_g = a_data.detach().clone().requires_grad_(True)
                     b_g = b_data.detach().clone().requires_grad_(True)
-                    out_g = self._run_mvmr(a_g, a_idx, b_g, b_idx, o_idx, N_o, "force_grouped")
+                    out_g = self._run_mvmr(a_g, a_idx, b_g, b_idx, o_idx, N_o, "force_fsg")
                     grad_o = (torch.randn_like(out_g).float() * 0.1).to(out_g.dtype)
                     out_g.backward(grad_o)
 
                     # Run per-triplet path with same grad_o
                     a_p = a_data.detach().clone().requires_grad_(True)
                     b_p = b_data.detach().clone().requires_grad_(True)
-                    out_p = self._run_mvmr(a_p, a_idx, b_p, b_idx, o_idx, N_o, "force_per_triplet")
+                    out_p = self._run_mvmr(a_p, a_idx, b_p, b_idx, o_idx, N_o, "force_pt")
                     out_p.backward(grad_o)
 
                     rel_a = rel_err(a_g.grad, a_p.grad)

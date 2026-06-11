@@ -30,7 +30,12 @@ def sparse_vector_vector_outer_product_reduction_grouped_cuda(
 
     Preconditions:
       - o_idx sorted ascending (sort_by="k")
-      - G == 1
+
+    G >= 1 supported natively: the frozen kernel decodes (seg_k, g, mt,
+    cw) from its warp grid and indexes grad_output (N, G, M) / input
+    (N, G, C) / grad_weight (K, G, M, C) with G-strided pointer math —
+    no per-group loop or repack needed. The old wrapper-level ``G == 1``
+    ValueError was stricter than the kernel.
     """
     a = a.contiguous()
     b = b.contiguous()
@@ -42,8 +47,6 @@ def sparse_vector_vector_outer_product_reduction_grouped_cuda(
     K_offsets = n_o
     input_dtype = a.dtype
 
-    if G != 1:
-        raise ValueError("Grouped CUDA kernel requires G == 1")
     if not bool((o_idx[1:] >= o_idx[:-1]).all().item()):
         raise ValueError("o_idx must be sorted ascending for grouped path")
 
