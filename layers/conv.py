@@ -26,6 +26,7 @@ from .triplets import (
     handle_stride_and_build_triplets,
     radius_scaler_for_kernel_size,
 )
+from .generative import CoordinateGenerator, GeneratedSites, KernelStampGenerator
 
 
 # Perf-optimal auto-router measured boundary. The fused CUTLASS
@@ -326,3 +327,67 @@ def conv_with_stride(
     x = conv_op(x, m.i, m.j, m.k, m.num_points())
     return x, m
 
+
+class GenerativePointConv3d(GeneralConv):
+    __doc__ = r"""Generative-expansion point convolution.
+
+    Unlike :class:`PointConv3d` (submanifold: output sites ≡ input
+    sites), this operator *invents* a denser output point set Y from the
+    input set X and convolves X → Y. The output coordinate set is
+    produced by a swappable
+    :class:`~layers.generative.CoordinateGenerator` (default:
+    :class:`~layers.generative.KernelStampGenerator`, the deterministic
+    kernel-tap stamping rule).
+
+    ``forward(input, m)`` returns ``(features, m_out)`` — the new
+    :class:`MetaData` carries the generated points and links back to the
+    input as its ``parent``. A precomputed
+    :class:`~layers.generative.GeneratedSites` may be passed as ``sites``
+    to reuse a rulebook across sibling generative convs (an explicit
+    rulebook-reuse handle).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: _size_3_t = 3,
+        expansion: float = 2.0,
+        generator: Optional[CoordinateGenerator] = None,
+        groups: int = 1,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.kernel_size_3 = _triple(kernel_size)
+        self.expansion = expansion
+        if generator is None:
+            generator = KernelStampGenerator(self.kernel_size_3, expansion)
+        # The conv weight's tap count K is whatever the generator's
+        # stencil produces — for the default KernelStampGenerator that is
+        # prod(kernel_size); a custom-stencil generator may differ, and
+        # then the `kernel_size` argument is unused.
+        super().__init__(
+            in_channels,
+            out_channels,
+            generator.kernel_taps,
+            groups,
+            bias,
+            **factory_kwargs,
+        )
+        self.generator = generator
+
+    def forward(
+        self,
+        input: Tensor,
+        m: MetaData,
+        sites: Optional[GeneratedSites] = None,
+    ) -> Tuple[Tensor, MetaData]:
+        if sites is None:
+            sites = self.generator(m)
+        sites.validate()
+        x = self._conv_forward(
+            input, sites.i, sites.j, sites.k, sites.n_out, self.weight, self.bias
+        )
+        return x, sites.to_metadata(parent=m)

@@ -1,0 +1,347 @@
+"""Generative coordinate generation for point convolution.
+
+A generative point conv *invents* its output point set rather than
+reusing the input one (a denser output set, in contrast to a
+submanifold conv that keeps the input sparsity pattern). Coordinate
+generation is the defining design choice, so it is a swappable
+strategy:
+
+- :class:`GeneratedSites` — the generation result (output points + the
+  ``(i, j, k)`` rulebook wiring them to the input).
+- :class:`CoordinateGenerator` — the strategy protocol.
+- :class:`KernelStampGenerator` — the deterministic implementation:
+  each input point stamps the K kernel-tap offsets, the output set is
+  the deduplicated voxel-center union.
+
+The hard contract every generator must uphold: **every output index in
+``[0, n_out)`` appears at least once in the rulebook ``i``** — an
+orphan output point (generated, but with zero contributing input
+neighbours) leaves the conv undefined for it. This is the
+generative-side analog of the upsample-phase
+``build_triplets`` ``assert min(num_neighbors) > 0``.
+:meth:`GeneratedSites.validate` enforces it.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Protocol, runtime_checkable
+
+import torch
+from torch import Tensor
+from torch.nn.common_types import _size_3_t
+from torch.nn.modules.utils import _triple
+
+from internals.grid_lookup import reduce_indices_to_1d
+
+from .metadata import MetaData
+
+__all__ = [
+    "GeneratedSites",
+    "CoordinateGenerator",
+    "KernelStampGenerator",
+    "build_generative_triplets",
+]
+
+_INT32_MAX = 2147483647
+
+
+@dataclass
+class GeneratedSites:
+    """Result of a coordinate-generation strategy.
+
+    Bundles the invented output point set together with the rulebook
+    ``(i, j, k)`` connecting it to the input — they are produced in one
+    pass, so they ship together rather than as a separate build step.
+
+    Attributes:
+        points: ``(M, 3)`` generated output coordinates.
+        sample_inds: ``(M,)`` per-output-point sample id.
+        sample_sizes: ``(B,)`` points per sample.
+        grid_size: resolution of the generated set.
+        i: ``(T,)`` output index in ``[0, M)`` — the rulebook a_idx.
+        j: ``(T,)`` input index in ``[0, N)``.
+        k: ``(T,)`` kernel-tap index in ``[0, K)``.
+        aux: optional generator by-products (e.g. a learned generator's
+            occupancy logits for an auxiliary loss). ``None`` for the
+            deterministic generator.
+    """
+
+    points: Tensor
+    sample_inds: Tensor
+    sample_sizes: Tensor
+    grid_size: float
+    i: Tensor
+    j: Tensor
+    k: Tensor
+    aux: Optional[dict] = None
+
+    @property
+    def n_out(self) -> int:
+        return self.points.shape[0]
+
+    def validate(self) -> None:
+        """Enforce the ≥1-neighbour invariant (fail-closed).
+
+        Every generated output point must have at least one contributing
+        input neighbour, else the conv is undefined for it. Mirrors the
+        upsample-phase ``min(num_neighbors) > 0`` assert. Structurally
+        unreachable for :class:`KernelStampGenerator` (the output set is
+        the unique-image of the stamps), but it guards any future
+        generator.
+        """
+        n_out = self.n_out
+        if n_out == 0:
+            return
+        coverage = torch.bincount(self.i.long(), minlength=n_out)
+        if int(coverage.min()) == 0:
+            n_orphan = int((coverage == 0).sum())
+            raise RuntimeError(
+                f"GeneratedSites: {n_orphan} of {n_out} output point(s) have zero "
+                "contributing input neighbours — the generative conv is undefined "
+                "for them. A CoordinateGenerator must cover every output index in "
+                "the rulebook `i`."
+            )
+
+    def to_metadata(self, parent: Optional[MetaData]) -> MetaData:
+        """Wrap the generated set as a :class:`MetaData` linked to ``parent``."""
+        return MetaData(
+            points=self.points,
+            sample_inds=self.sample_inds,
+            sample_sizes=self.sample_sizes,
+            grid_size=self.grid_size,
+            i=self.i,
+            j=self.j,
+            k=self.k,
+            parent=parent,
+            auto_build_triplets=False,
+        )
+
+
+@runtime_checkable
+class CoordinateGenerator(Protocol):
+    """Strategy that invents an output point set from an input one.
+
+    A generative conv operator holds one and is agnostic to which.
+    ``kernel_taps`` is the number of stencil taps K — it must equal the
+    conv weight's kernel-size product. The returned :class:`GeneratedSites`
+    must satisfy the ≥1-neighbour contract (see module docstring).
+
+    .. note::
+        **Provisional API.** This strategy protocol is the locus of
+        future generative-conv work — staged strided-down-conv and
+        learnable-transpose members, plus learned-occupancy / deformable
+        generators, may reshape this interface and :class:`GeneratedSites`.
+        Treat the signature as unstable until the operator family
+        stabilises; the operator ``GenerativePointConv3d`` and its parity
+        contract are stable.
+    """
+
+    kernel_taps: int
+
+    def __call__(self, m: MetaData) -> GeneratedSites: ...
+
+
+def _default_cube_stencil(kernel_size, device) -> Tensor:
+    """Dense ks³ cube stencil — ``(K, 3)`` integer offsets.
+
+    Row-major over ``(k0, k1, k2)`` so the tap index matches
+    ``triplets.voxelize_3d``'s ``sum(k_l * [ks*ks, ks, 1])`` convention:
+    tap ``k`` has offset ``(kx - k0//2, ky - k1//2, kz - k2//2)``.
+    """
+    axes = [torch.arange(s, device=device) - (s // 2) for s in kernel_size]
+    grid = torch.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+    return torch.stack([g.reshape(-1) for g in grid], dim=1).to(torch.int64)
+
+
+@torch.compiler.disable
+def build_generative_triplets(
+    points: Tensor,
+    sample_inds: Tensor,
+    sample_sizes: Tensor,
+    grid_size: float,
+    kernel_size: _size_3_t = (3, 3, 3),
+    expansion: float = 2.0,
+    stencil: Optional[Tensor] = None,
+    sort_by: str = "k",
+) -> GeneratedSites:
+    """Stamp-and-dedup generative rulebook construction.
+
+    Each input point stamps the K stencil-tap offsets (scaled by
+    ``grid_size_out = grid_size / expansion``); the output set is the
+    deduplicated voxel-center union of all candidates. The rulebook
+    ``(i, j, k)`` is the inverse of the stamping — every candidate is a
+    live triplet (no pruning), so every output point is covered by
+    construction.
+
+    Args:
+        points: ``(N, 3)`` input coordinates.
+        sample_inds: ``(N,)`` per-input-point sample id.
+        sample_sizes: ``(B,)`` — used only for the output ``bincount`` width.
+        grid_size: input grid size.
+        kernel_size: kernel extent; ``K = prod(kernel_size)`` when
+            ``stencil`` is ``None``.
+        expansion: resolution divisor (``>= 1``).
+        stencil: optional ``(K, 3)`` integer offset table; defaults to
+            the dense ks³ cube.
+        sort_by: ``"k"`` (default — forward MVMR grouped tensor-core
+            path engages) or ``"i"``.
+
+    Returns:
+        A :class:`GeneratedSites` with the invented output set + rulebook.
+    """
+    with torch.no_grad():
+        device = points.device
+        N = points.shape[0]
+        kernel_size = _triple(kernel_size)
+        if stencil is None:
+            stencil = _default_cube_stencil(kernel_size, device)
+        else:
+            stencil = stencil.to(device=device)
+        K = stencil.shape[0]
+        grid_size_out = grid_size / expansion
+
+        # N=0 guard — reduce_indices_to_1d's amin would fail on empty input.
+        if N == 0:
+            empty_i = torch.empty(0, dtype=torch.int32, device=device)
+            return GeneratedSites(
+                points=points.new_empty((0, 3)),
+                sample_inds=torch.empty(0, dtype=torch.int64, device=device),
+                sample_sizes=torch.zeros(
+                    sample_sizes.numel(), dtype=torch.int64, device=device
+                ),
+                grid_size=grid_size_out,
+                i=empty_i,
+                j=empty_i.clone(),
+                k=empty_i.clone(),
+            )
+
+        # 1. Quantize each input point ONCE to its fine-grid voxel, then
+        #    integer-add the stencil (candidate t = input j, tap k → flat
+        #    index j*K + k). Quantizing once is exact: candidate voxel =
+        #    floor(p / grid_size_out) + δ, an integer add — there is no
+        #    per-candidate float re-quantization to drift at a voxel edge.
+        v0 = torch.div(points, grid_size_out, rounding_mode="floor").to(torch.int32)
+        cand_vox = (
+            v0.unsqueeze(1) + stencil.to(torch.int32).unsqueeze(0)
+        ).reshape(-1, 3)                                            # (N*K, 3)
+        j = torch.arange(N, device=device).repeat_interleave(K)
+        k = torch.arange(K, device=device).repeat(N)
+        cand_sample = sample_inds.repeat_interleave(K).to(torch.int32)
+
+        # 2. The sample id is a 4th hash column so candidates from
+        #    different samples never merge into one output voxel.
+        grid_inds = torch.cat(
+            [cand_vox, cand_sample.unsqueeze(1)], dim=1
+        ).contiguous()                                              # (N*K, 4) int32
+
+        # 3. Dedup -> the unique output voxels. torch.unique's inverse map
+        #    is the rulebook i, surjective onto [0, n_out) by construction.
+        #    Keep the sorted unique KEYS too — the output coords decode from
+        #    them arithmetically (step 4), avoiding a scatter+gather over N*K.
+        keys, keys_min, keys_stride, _ = reduce_indices_to_1d(grid_inds)
+        uniq_keys, i = torch.unique(keys, sorted=True, return_inverse=True)
+        n_out = int(i.max()) + 1 if i.numel() > 0 else 0
+
+        # 4. Output coordinates = voxel centers, decoded straight from the
+        #    sorted unique keys. reduce_indices_to_1d packs a row as
+        #    key = sum_d (vox_d - min_d) * stride_d with stride the rolled
+        #    cumprod of the per-dim ranges, so digit_d =
+        #    (key // stride_d) % range_d + min_d. Decoding the n_out unique
+        #    keys is cheaper than the old first-occurrence scatter_reduce over
+        #    N*K candidates + the (N*K,4) gather. Collision-free
+        #    encoding ⇒ the decode is exact. Vectorized over the 4 dims in
+        #    one broadcast (no per-dim Python loop ⇒ a single launch, so the
+        #    decode does not regress the small-N stages).
+        keys_min = keys_min.reshape(-1)                             # (4,)
+        keys_stride = keys_stride.reshape(-1).to(torch.int64)       # (4,)
+        keys_range = (grid_inds.amax(0) - keys_min + 1).to(torch.int64)  # (4,)
+        out_grid = (
+            (uniq_keys.unsqueeze(1) // keys_stride) % keys_range + keys_min
+        ).to(torch.int32)                                           # (n_out, 4)
+        new_points = (out_grid[:, :3].to(points.dtype) + 0.5) * grid_size_out
+        new_sample_inds = out_grid[:, 3].long()
+        new_sample_sizes = torch.bincount(
+            new_sample_inds, minlength=sample_sizes.numel()
+        )
+
+        # 5. Sort the triplets so the chosen axis is contiguous (sort_by="k"
+        #    lets the forward MVMR grouped tensor-core path engage).
+        if sort_by == "k":
+            # k == arange(K).repeat(N) is fully structured, so ordering the
+            # candidates by k is *exactly* the (N, K) -> (K, N) transpose
+            # permutation — candidate t = j*K + k moves to slot k*N + j.
+            # Under that permutation the post-sort j and k are themselves
+            # closed-form (j = arange(N) tiled per k-block, k = each value
+            # repeated N times), so only i needs the gather; the comparison
+            # sort over N*K keys AND two of the three index gathers vanish.
+            # That single torch.sort was ~44% of the enc0 builder cost.
+            # Bit-identical to torch.sort(k): same same-k contiguity, and the
+            # within-k-group (i, j) pairing is preserved row-for-row.
+            sorter = torch.arange(N * K, device=device).view(N, K).t().reshape(-1)
+            i = i[sorter]
+            j = torch.arange(N, device=device).repeat(K)
+            k = torch.arange(K, device=device).repeat_interleave(N)
+        elif sort_by == "i":
+            i, sorter = torch.sort(i)
+            j, k = j[sorter], k[sorter]
+        else:
+            raise ValueError(f'sort_by must be "k" or "i", got "{sort_by}"')
+
+        # 6. Normalize index dtype (int32 when safe — Triton autotune keys
+        #    on pointer dtype; mixed dtypes cause redundant cache entries).
+        idx_dtype = torch.int32 if max(n_out, N) <= _INT32_MAX else torch.int64
+        i, j, k = i.to(idx_dtype), j.to(idx_dtype), k.to(idx_dtype)
+
+    return GeneratedSites(
+        points=new_points,
+        sample_inds=new_sample_inds,
+        sample_sizes=new_sample_sizes,
+        grid_size=grid_size_out,
+        i=i,
+        j=j,
+        k=k,
+    )
+
+
+class KernelStampGenerator:
+    """Deterministic coordinate generator — kernel-tap stamping.
+
+    Each input point stamps the K stencil-tap offsets; the output set is
+    the deduplicated voxel-center union. Parameter-free, runs under
+    ``torch.no_grad()``. The ≥1-neighbour invariant holds by
+    construction (the output set is the unique-image of the stamps).
+
+    Args:
+        kernel_size: kernel extent (used for the default cube stencil).
+        expansion: resolution divisor — ``grid_size_out =
+            grid_size_in / expansion``, ``expansion >= 1``.
+        stencil: optional ``(K, 3)`` integer offset table for a
+            sparse/anisotropic stencil; defaults to the dense ks³ cube.
+    """
+
+    def __init__(
+        self,
+        kernel_size: _size_3_t,
+        expansion: float = 2.0,
+        stencil: Optional[Tensor] = None,
+    ) -> None:
+        if expansion < 1:
+            raise ValueError(f"expansion must be >= 1, got {expansion}")
+        self.kernel_size = _triple(kernel_size)
+        self.expansion = float(expansion)
+        self._stencil = stencil
+        self.kernel_taps = (
+            math.prod(self.kernel_size) if stencil is None else int(stencil.shape[0])
+        )
+
+    def __call__(self, m: MetaData) -> GeneratedSites:
+        return build_generative_triplets(
+            points=m.points,
+            sample_inds=m.sample_inds,
+            sample_sizes=m.sample_sizes,
+            grid_size=m.grid_size,
+            kernel_size=self.kernel_size,
+            expansion=self.expansion,
+            stencil=self._stencil,
+            sort_by="k",
+        )
