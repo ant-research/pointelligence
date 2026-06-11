@@ -13,7 +13,7 @@ default dispatcher would pick the winner.
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. \\
-        /workspace/.venv/bin/python benchmarks/operators/bench_resnet_grid.py
+        .venv/bin/python benchmarks/operators/bench_resnet_grid.py
     # add --dtype fp32 or --dtype bf16 to focus on one dtype
     # --depths 18,34 to subset
     # --scales 1.0,2.0 to subset
@@ -52,9 +52,10 @@ DTYPES = [
     ("bf16", torch.bfloat16),
 ]
 MODES = [
-    ("grouped",       "force_grouped"),
-    ("per_triplet",   "force_per_triplet"),
-    ("auto",          "auto"),  # Production dispatcher.
+    ("tig",           "force_tig"),  # v1.2.0 engine.
+    ("grouped",       "force_fsg"),  # v1.1.0 engine.
+    ("per_triplet",   "force_pt"),   # v1.0.0 engine.
+    ("auto",          "auto"),  # Production dispatcher (v1.2.0: routes TIG).
 ]
 
 

@@ -81,7 +81,7 @@ PTV3_STAGES = {
 # build_triplets produces in the wrapper-level bench at PTv3 stage shapes
 # (~5 neighbors per query). enc0/enc1 added with their small C (32/64)
 # explicitly — even though the Triton grouped path's _GROUPED_MIN_C=128
-# would normally route these to per-triplet, force_grouped lets us bench
+# would normally route these to per-triplet, force_fsg lets us bench
 # the grouped kernel directly for the kernel-vs-wrapper diagnostic.
 PTV3_STAGES_PRODUCTION_T = {
     "enc0": (27, 328_326, 328_326,  32,  32, 1_640_000),
@@ -182,13 +182,13 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
 
     # --- Triton grouped path (current production default for C >= 128) ---
     def triton_mvmr():
-        with dispatch_mode("force_grouped"):
+        with dispatch_mode("force_fsg"):
             sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                 a, a_idx_m, b, b_idx_m, o_idx_m, N_o,
             )
 
     def triton_vvor():
-        with dispatch_mode("force_grouped"):
+        with dispatch_mode("force_fsg"):
             sparse_engines.ops.sparse_vector_vector_outer_product_reduction(
                 g_out, a_idx_v, b, b_idx_v, o_idx_v, K_off,
             )
@@ -293,7 +293,7 @@ def bench_engine_level(stage, dtype_name, dtype, device, stages_map=None):
         }
 
     # --- Tier-2 CUTLASS implicit-GEMM + S-mode IndexedGather + scatter
-    #     mvmr (force_grouped_cutlass_mvmr dispatch mode; added bf16).
+    #     mvmr (force_fsg_cutlass_mvmr dispatch mode; added bf16).
     #     fp16 + bf16: the C++ kernel accepts at::kHalf OR at::kBFloat16.
     #     fp32 reports NaN with a note, mirroring the vvor-CUTLASS pattern.
     # mvmr's kernel tile is TileM=64 (M axis) / TileK=32 (C contraction

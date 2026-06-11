@@ -151,10 +151,10 @@ bit-for-bit, so there is **zero regression by construction** in that regime.
 
 Explicit overrides are available (see `sparse_engines/_dispatch_override.py`):
 
-- `dispatch_mode("force_grouped")` — always use the grouped path, ignoring the
+- `dispatch_mode("force_fsg")` — always use the grouped path, ignoring the
   threshold (for benchmarks and tests).
-- `dispatch_mode("force_fused_conv")` — force the `FusedPointConv3d` wrapper.
-- `dispatch_mode("force_per_triplet")` — force the Triton path (matches
+- `dispatch_mode("force_fsg_fused")` — force the `FusedPointConv3d` wrapper.
+- `dispatch_mode("force_pt")` — force the Triton path (matches
   `v1.0.0`).
 
 ## Implementation map
@@ -231,7 +231,7 @@ wrong workload.
   (grouped/WMMA wins); the intermediate scales straddle the boundary stage by
   stage.
 - **Dtypes** — `fp16, fp32, bf16`.
-- **Modes per cell** — `force_grouped` (the `v1.1.0` path), `force_per_triplet`
+- **Modes per cell** — `force_fsg` (the `v1.1.0` path), `force_pt`
   (the `v1.0.0` path), and `auto` (the production dispatcher). The third mode
   validates that the auto-router actually picks the empirical winner.
 - **Receptive-field scaler** — `2.5` (matches production `unet_pointcnnpp`).
@@ -269,7 +269,7 @@ iterations.
 | Operator (mvmr + vvor) | H200          | enc4 × fp16 (CUTLASS) | 0.924 ms | 0.381 ms | **2.42×** |
 
 End-to-end times are forward+backward; operator times are forward MVMR +
-backward VVOR combined. Speedup is quoted against `force_per_triplet`
+backward VVOR combined. Speedup is quoted against `force_pt`
 (bit-equivalent to `v1.0.0`).
 
 ### Why the kernel-level speedup (2.4×–2.75×) is bigger than the end-to-end speedup (1.5×–1.6×)
@@ -329,9 +329,9 @@ to zero regression; at `2.0×` it switches to grouped on every stage.
 | H200 | ResNet50 | 2.00× | 249.26 | 197.13 | 0.79× | 240.31 | 204.33 | 0.85× | 254.78 | 215.57 | 0.85× |
 
 `ratio = auto / per_triplet`. Numbers below 1.00× are speedups; **bold** marks
-the headline win per card. The `auto` dispatcher can beat `force_grouped` on a
+the headline win per card. The `auto` dispatcher can beat `force_fsg` on a
 given cell because it picks the dispatch *per stage* instead of *per network* —
-e.g. ResNet34 × 2.0× × fp16 on Ada: `force_grouped` is 221.16 ms, `auto` is
+e.g. ResNet34 × 2.0× × fp16 on Ada: `force_fsg` is 221.16 ms, `auto` is
 189.15 ms.
 
 ### Operator-level (mvmr + vvor combined, ms)
@@ -368,7 +368,7 @@ as a blanket rule.
   `sm_80`/`sm_89` the `sm_80` CUTLASS variant is used instead.
 - The 512-channel auto-router boundary is measured on H200 fp16. Smaller-`C`
   regimes deliberately keep the Triton path — change the threshold (via
-  `dispatch_mode("force_grouped")`) only after measuring on your own hardware.
+  `dispatch_mode("force_fsg")`) only after measuring on your own hardware.
 - Forward MVMR has no WMMA path in this release; fp16/bf16 forward uses
   scalar-FMA grouped. (Backward VVOR is where the outer-product / register-reuse
   win shows up.)
