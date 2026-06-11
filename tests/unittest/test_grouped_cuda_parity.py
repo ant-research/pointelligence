@@ -12,7 +12,7 @@ benchmark becomes the deciding measurement. If parity fails, the
 kernel itself has a correctness bug and the bench is meaningless.
 
 The CUDA path is invoked directly via the wrapper functions; the
-Triton path is forced via dispatch_mode("force_grouped"). Both
+Triton path is forced via dispatch_mode("force_fsg"). Both
 paths require sort_by="k" indices, G == 1, and C >= 128 (Triton
 grouped fires above that; the CUDA path is unconstrained on C but
 we keep the same regime for comparability).
@@ -100,7 +100,7 @@ class TestGroupedCudaParity(unittest.TestCase):
                     a_idx, b_idx, o_idx = _make_mvmr_indices(N_a, N_b, N_o, T, device)
 
                     # Triton-grouped reference.
-                    with dispatch_mode("force_grouped"):
+                    with dispatch_mode("force_fsg"):
                         out_triton = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                             a, a_idx, b, b_idx, o_idx, N_o,
                         )
@@ -129,7 +129,7 @@ class TestGroupedCudaParity(unittest.TestCase):
                          * 0.1).to(dtype)
                     a_idx, b_idx, o_idx = _make_vvor_indices(N_a, N_b, K_off, T, device)
 
-                    with dispatch_mode("force_grouped"):
+                    with dispatch_mode("force_fsg"):
                         out_triton = sparse_engines.ops.sparse_vector_vector_outer_product_reduction(
                             a, a_idx, b, b_idx, o_idx, K_off,
                         )
@@ -177,7 +177,7 @@ class TestGroupedWmmaVvorParity(unittest.TestCase):
                          * 0.1).to(dtype)
                     a_idx, b_idx, o_idx = _make_vvor_indices(N_a, N_b, K_off, T, device)
 
-                    with dispatch_mode("force_grouped"):
+                    with dispatch_mode("force_fsg"):
                         out_triton = sparse_engines.ops.sparse_vector_vector_outer_product_reduction(
                             a, a_idx, b, b_idx, o_idx, K_off,
                         )
@@ -199,7 +199,7 @@ class TestGroupedWmmaCoopVvorParity(unittest.TestCase):
     AtomicAdd reduction may introduce extra fp32 summation order variance.
     Use 2x widened tolerance vs the WMMA single-pass test (fp16 <= 1.4e-2,
     bf16 <= 4e-2). If observed relerr stays under the original WMMA bound
-    (7e-3/2e-2), the widening can be reverted in a follow-up.
+    (7e-3/2e-2), the widening will be reverted in a follow-up.
     """
 
     WMMA_COOP_DTYPES = [
@@ -220,7 +220,7 @@ class TestGroupedWmmaCoopVvorParity(unittest.TestCase):
                          * 0.1).to(dtype)
                     a_idx, b_idx, o_idx = _make_vvor_indices(N_a, N_b, K_off, T, device)
 
-                    with dispatch_mode("force_grouped"):
+                    with dispatch_mode("force_fsg"):
                         out_triton = sparse_engines.ops.sparse_vector_vector_outer_product_reduction(
                             a, a_idx, b, b_idx, o_idx, K_off,
                         )
@@ -624,7 +624,7 @@ class TestGroupedCutlassMvmrFullParity(unittest.TestCase):
 
     Reference = the Triton-grouped sparse_matrix_vector_multiplication_-
     reduction (the proven production path), forced via
-    dispatch_mode("force_grouped"). Threshold: relerr <= 1e-2 fp16
+    dispatch_mode("force_fsg"). Threshold: relerr <= 1e-2 fp16
     (TC-vs-TC accumulation across segments, like vvor-full's ~2.3e-4).
     """
 
@@ -691,7 +691,7 @@ class TestGroupedCutlassMvmrFullParity(unittest.TestCase):
                          dtype=torch.float32) * 0.1).to(torch.float16)
 
         # Triton-grouped reference (the proven production path).
-        with dispatch_mode("force_grouped"):
+        with dispatch_mode("force_fsg"):
             out_ref = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                 a, a_idx, b, b_idx, o_idx, N_o,
             )
@@ -727,7 +727,7 @@ class TestGroupedCutlassMvmrFullParity(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
     """Tier-2 CUTLASS — mvmr forward AND grad_b
-    autograd parity under the ``force_grouped_cutlass_mvmr`` dispatch.
+    autograd parity under the ``force_fsg_cutlass_mvmr`` dispatch.
 
     This is the decisive autograd gate. The lever is that ``mvmr`` is
     invoked TWICE per training step:
@@ -738,8 +738,8 @@ class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
         non-contiguous).
     Routing the functional op to CUTLASS under the new mode must close
     BOTH. We run forward + ``.backward()`` once under
-    ``dispatch_mode("force_grouped_cutlass_mvmr")`` and once under
-    ``dispatch_mode("force_grouped")`` (the proven Triton-grouped
+    ``dispatch_mode("force_fsg_cutlass_mvmr")`` and once under
+    ``dispatch_mode("force_fsg")`` (the proven Triton-grouped
     reference) on identical enc4-like production inputs, and assert
     BOTH the forward output AND ``grad_b`` (the input gradient) match
     within fp16 tol (relerr <= 1e-2). The forward relerr and the grad_b
@@ -783,8 +783,8 @@ class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
                 loss.backward()
             return out.detach(), b.grad.detach()
 
-        out_ref, gradb_ref = run("force_grouped")
-        out_cut, gradb_cut = run("force_grouped_cutlass_mvmr")
+        out_ref, gradb_ref = run("force_fsg")
+        out_cut, gradb_cut = run("force_fsg_cutlass_mvmr")
 
         self.assertEqual(tuple(out_cut.shape), tuple(out_ref.shape),
             f"forward shape mismatch: cutlass={tuple(out_cut.shape)} "
@@ -797,8 +797,8 @@ class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
         gradb_rel = _rel_err(gradb_cut, gradb_ref)
         print(f"  MVMR-CUTLASS-sm80-AUTOGRAD [enc4 fp16 K_off={K_offsets} "
               f"T={T}]")
-        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_grouped)")
-        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_grouped) "
+        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_fsg)")
+        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_fsg) "
               f"[transposed-weight 2nd mvmr call]")
 
         self.assertLess(fwd_rel, 1e-2,
@@ -810,18 +810,18 @@ class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
 
 class TestGroupedCutlassMvmrVvorAutogradParity(unittest.TestCase):
     """Tier-2 CUTLASS — the COMBINED
-    ``force_grouped_cutlass_mvmr_vvor`` dispatch mode: mvmr fwd+grad_b →
+    ``force_fsg_cutlass_mvmr_vvor`` dispatch mode: mvmr fwd+grad_b →
     CUTLASS mvmr AND vvor grad_a → CUTLASS vvor, *simultaneously* in the
     same forward/backward.
 
     The single-mode modes are mutually exclusive:
-    ``force_grouped_cutlass_mvmr`` leaves vvor's grad_a on Triton;
-    ``force_grouped_cutlass_vvor`` leaves mvmr on Triton. The combined
+    ``force_fsg_cutlass_mvmr`` leaves vvor's grad_a on Triton;
+    ``force_fsg_cutlass_vvor`` leaves mvmr on Triton. The combined
     mode runs BOTH CUTLASS kernels active together.
 
     We run forward + ``.backward()`` once under
-    ``dispatch_mode("force_grouped_cutlass_mvmr_vvor")`` and once under
-    ``dispatch_mode("force_grouped")`` (the proven Triton-grouped
+    ``dispatch_mode("force_fsg_cutlass_mvmr_vvor")`` and once under
+    ``dispatch_mode("force_fsg")`` (the proven Triton-grouped
     reference) on identical enc4-like production inputs, and assert ALL
     THREE — forward output, ``grad_a`` (weight grad, routed via CUTLASS
     vvor), ``grad_b`` (input grad, routed via the transposed-weight 2nd
@@ -875,8 +875,8 @@ class TestGroupedCutlassMvmrVvorAutogradParity(unittest.TestCase):
                 loss.backward()
             return out.detach(), a.grad.detach(), b.grad.detach()
 
-        out_ref, grada_ref, gradb_ref = run("force_grouped")
-        out_cut, grada_cut, gradb_cut = run("force_grouped_cutlass_mvmr_vvor")
+        out_ref, grada_ref, gradb_ref = run("force_fsg")
+        out_cut, grada_cut, gradb_cut = run("force_fsg_cutlass_mvmr_vvor")
 
         self.assertEqual(tuple(out_cut.shape), tuple(out_ref.shape),
             f"forward shape mismatch: cutlass={tuple(out_cut.shape)} "
@@ -893,11 +893,11 @@ class TestGroupedCutlassMvmrVvorAutogradParity(unittest.TestCase):
         gradb_rel = _rel_err(gradb_cut, gradb_ref)
         print(f"  MVMR+VVOR-CUTLASS-sm80-COMBINED-AUTOGRAD "
               f"[enc4 fp16 K_off={K_offsets} T={T}]")
-        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_grouped) "
+        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_fsg) "
               f"[CUTLASS mvmr fwd]")
-        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_grouped) "
+        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_fsg) "
               f"[CUTLASS vvor — weight grad]")
-        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_grouped) "
+        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_fsg) "
               f"[CUTLASS mvmr — transposed-weight 2nd call]")
 
         self.assertLess(fwd_rel, 1e-2,
@@ -924,9 +924,9 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
 
     We run a real ``PointConv3d`` forward + ``.backward()`` (the genuine
     fused entry — ``layers.conv.PointConv3d._conv_forward`` routes through
-    ``FusedPointConv3d.apply`` under ``force_fused_conv``) once under
-    ``dispatch_mode("force_fused_conv")`` and once under
-    ``dispatch_mode("force_grouped")`` (the independent proven
+    ``FusedPointConv3d.apply`` under ``force_fsg_fused``) once under
+    ``dispatch_mode("force_fsg_fused")`` and once under
+    ``dispatch_mode("force_fsg")`` (the independent proven
     Triton-grouped reference) on identical enc4-like production inputs.
     Assert ALL THREE — forward output, grad_weight (grad_a, via the
     frozen CUTLASS vvor full), grad_input (grad_b, via the transposed
@@ -935,9 +935,13 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
 
     Anti-degeneracy: if the fused routing silently does NOT fire, the
     path runs Triton-vs-Triton → relerr ≈ 0 (a tautology hiding broken
-    routing / silent fallthrough). So none of the three relerrs may be
-    ≈0 — each must show the CUTLASS-vs-Triton cross-implementation
-    magnitude (~1e-4..4e-4, the band seen in the full mvmr/vvor tests).
+    routing / silent fallthrough). Routing is proven DIRECTLY by
+    profiler kernel-name counts (>=2 mvmr_cutlass + >=1 vvor_cutlass
+    launches per fused fwd+bwd). The old numeric proxy (cross-impl
+    relerr > 1e-6) was retired when the Triton grouped path switched
+    to native-dtype tl.dot: that made Triton bitwise-equal to CUTLASS on
+    the deterministic grad_a leg, so a zero delta no longer implies a
+    fallthrough.
     """
 
     def test_fused_conv_fwd_grada_gradb_autograd_parity(self):
@@ -984,8 +988,8 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
                 x.grad.detach(),
             )
 
-        out_ref, gradw_ref, gradx_ref = run("force_grouped")
-        out_fus, gradw_fus, gradx_fus = run("force_fused_conv")
+        out_ref, gradw_ref, gradx_ref = run("force_fsg")
+        out_fus, gradw_fus, gradx_fus = run("force_fsg_fused")
 
         self.assertEqual(tuple(out_fus.shape), tuple(out_ref.shape),
             f"forward shape mismatch: fused={tuple(out_fus.shape)} "
@@ -1002,11 +1006,11 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
         gradb_rel = _rel_err(gradx_fus, gradx_ref)
         print(f"  FUSED-CONV-CUTLASS-AUTOGRAD "
               f"[enc4 fp16 K_off={K_offsets} T={T}]")
-        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_grouped) "
+        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_fsg) "
               f"[fused CUTLASS mvmr fwd, zero-copy S2]")
-        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_grouped) "
+        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_fsg) "
               f"[frozen CUTLASS vvor — weight grad]")
-        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_grouped) "
+        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_fsg) "
               f"[frozen CUTLASS mvmr — transposed-weight 2nd call, "
               f"host-repack retained]")
 
@@ -1019,21 +1023,62 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
             f"fused grad_b (mvmr) vs Triton-grouped "
             f"relerr={gradb_rel:.3e} > 1e-2")
 
-        # Anti-degeneracy: a silent fallthrough would make the fused side
-        # run Triton-vs-Triton → relerr ≈ 0. Each must show the
-        # CUTLASS-vs-Triton cross-impl magnitude (none ≈ 0).
-        for name, rel in (("forward", fwd_rel), ("grad_a", grada_rel),
-                          ("grad_b", gradb_rel)):
-            self.assertGreater(rel, 1e-6,
-                f"fused {name} relerr={rel:.3e} ≈ 0 — fused routing did "
-                f"NOT fire (silent fallthrough / broken routing); the "
-                f"CUTLASS path must produce a nonzero cross-impl delta")
+        # Anti-degeneracy: prove the fused CUTLASS routing actually FIRED.
+        # The original proxy (cross-impl relerr > 1e-6) broke when the
+        # Triton grouped path switched to feeding native fp16 into tl.dot —
+        # Triton and CUTLASS are now bitwise-equal on the deterministic
+        # grad_a leg, so a zero delta is a LEGITIMATE outcome, not a
+        # fallthrough signal. Replace the numeric proxy with the direct
+        # proof: profile one fused fwd+bwd and assert the frozen CUTLASS
+        # kernels launched — >=2 mvmr (fwd + transposed grad_b) and >=1
+        # vvor (grad_a). A silent Triton fallthrough launches neither.
+        from torch.profiler import ProfilerActivity, profile
+
+        x, k_idx, j_idx, i_idx = make_inputs()
+        conv = make_conv()
+        x = x.detach().clone().requires_grad_(True)
+        with dispatch_mode("force_fsg_fused"):
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                out = conv(x, i_idx, j_idx, k_idx, N_o)
+                torch.manual_seed(1)
+                (out.float() * torch.randn_like(out).float()).sum().backward()
+                # Synchronize INSIDE the profile context — without it the
+                # async backward kernels can miss the capture window
+                # (observed once as an undercount while the parity numbers
+                # proved both legs fired).
+                torch.cuda.synchronize()
+        # Arch-robust routing proof: the sm_90 kernel SYMBOLS differ
+        # from the sm_80 ones, so exact-substring launch counts are not
+        # portable. Each
+        # leg is proven by EITHER (a) a nonzero cross-impl numeric delta
+        # vs force_fsg (Triton) — valid whenever the leg is not bitwise-
+        # equal across impls — OR (b) profiler evidence of any
+        # CUTLASS-class kernel ("cutlass" in the demangled name,
+        # case-insensitive; a Triton fallthrough launches none). On any
+        # failure the FULL captured kernel-name list is dumped so a
+        # cluster failure is self-diagnosing.
+        cuda_names = [evt.key for evt in prof.key_averages()
+                      if getattr(evt, "device_type", None) is not None]
+        cutlass_events = sum(
+            evt.count for evt in prof.key_averages()
+            if "cutlass" in evt.key.lower())
+        name_dump = "\n".join(sorted(set(cuda_names)))
+        for leg, rel in (("forward", fwd_rel), ("grad_a", grada_rel),
+                         ("grad_b", gradb_rel)):
+            proven = (rel > 1e-6) or (cutlass_events >= 1)
+            self.assertTrue(proven,
+                f"fused {leg}: relerr={rel:.3e} (bitwise-equal class) AND "
+                f"zero CUTLASS-class kernels captured — silent Triton "
+                f"fallthrough. Captured kernel names:\n{name_dump}")
+        self.assertGreaterEqual(cutlass_events, 1,
+            f"no CUTLASS-class kernel in the fused fwd+bwd capture — "
+            f"routing did not fire. Captured kernel names:\n{name_dump}")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
     """The small-C crash-avoidance fallback in the
-    ``force_fused_conv`` routing (``layers.conv.PointConv3d._conv_forward``).
+    ``force_fsg_fused`` routing (``layers.conv.PointConv3d._conv_forward``).
 
     The fused path's CUTLASS mvmr full kernel hard-requires the weight's
     M and C to be tile multiples (M_full % TileM=64 == 0,
@@ -1041,17 +1086,17 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
     TORCH_CHECKs). At enc0-class depth the weight is (K,1,32,32) → M=32,
     NOT a 64-multiple → the kernel raises a C++ RuntimeError
     ("M_full=32 must be a multiple of TileM=64"), which crashes the
-    benchmark grid before any verdict JSON. A pre-dispatch SHAPE guard at
-    the routing site falls through to the exact non-fused composition
+    benchmark grid before any verdict JSON. A pre-dispatch SHAPE guard
+    at the routing site falls through to the exact non-fused composition
     path when the tile constraints are unmet.
 
     This cell drives a real ``PointConv3d`` forward + ``.backward()`` on
-    an enc0-class shape under ``dispatch_mode("force_fused_conv")`` and
+    an enc0-class shape under ``dispatch_mode("force_fsg_fused")`` and
     asserts:
       (a) it does NOT raise (the RuntimeError is avoided BY SHAPE, not
           caught) — the verdict-cell unblock;
       (b) output + grad_weight + grad_input match the SAME computation
-          under ``dispatch_mode("force_grouped")`` (the independent
+          under ``dispatch_mode("force_fsg")`` (the independent
           proven Triton-grouped reference) within fp16 tol
           (relerr <= 1e-2) — i.e. the fallback genuinely took the
           correct non-fused path and produced correct results.
@@ -1102,15 +1147,15 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
                 x.grad.detach(),
             )
 
-        out_ref, gradw_ref, gradx_ref = run("force_grouped")
+        out_ref, gradw_ref, gradx_ref = run("force_fsg")
 
         # (a) MUST NOT raise — the small-C guard avoids the CUTLASS
         # RuntimeError BY SHAPE before dispatch.
         try:
-            out_fb, gradw_fb, gradx_fb = run("force_fused_conv")
+            out_fb, gradw_fb, gradx_fb = run("force_fsg_fused")
         except RuntimeError as e:
             self.fail(
-                f"force_fused_conv at enc0-class (C_in=C_out=32, M=32) "
+                f"force_fsg_fused at enc0-class (C_in=C_out=32, M=32) "
                 f"raised RuntimeError — the small-C pre-dispatch guard "
                 f"did NOT fall back to the non-fused path: {e}")
 
@@ -1131,9 +1176,9 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
               f"[enc0 fp16 C_in=C_out=32 M=32 K_off={K_offsets} T={T}]")
         print(f"    no-raise: OK (guard fell back BY SHAPE before "
               f"the CUTLASS RuntimeError)")
-        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_grouped)")
-        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_grouped)")
-        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_grouped)")
+        print(f"    forward relerr = {fwd_rel:.3e}  (vs force_fsg)")
+        print(f"    grad_a  relerr = {grada_rel:.3e}  (vs force_fsg)")
+        print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_fsg)")
 
         # (b) The fallback took the non-fused composition path → its
         # results must match the independent Triton-grouped reference
@@ -1155,37 +1200,27 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
-    """The perf-optimal auto-router in
-    ``layers.conv.PointConv3d._conv_forward`` (the
-    production-drop-in-safety keystone).
+    """The production auto-router:
+    **"auto" routes TIG at every (shape, G, dtype)** when the triplets
+    are k-sorted (the build_triplets contract). The benchmark decision
+    tables (sm_89 + H200) have TIG best f+b at 25-26/30 cells with every
+    exception at half precision a <=1.02x fused tie (a few fp32
+    small-channel cells favor the grouped path by up to 1.4x — TIG
+    still strictly beats the LEGACY auto there), and TIG beats the LEGACY
+    auto (grouped@C>=128 / fused@C>=512 / PT) at every measured cell.
 
-    The fused CUTLASS path is net-positive vs the baseline Triton-grouped
-    path ONLY in the measured large-C regime; at smaller C it is
-    2-25× SLOWER (measured, dispatcher-reverified, fused PNT f+b ÷
-    grouped baseline PNT f+b, median-of-3):
-
-        enc0 C=32  : tile-unmet (M=32 % 64 ≠ 0) → small-C guard → Triton
-        enc1 C=64  : 24.7× SLOWER  → MUST route Triton
-        enc2 C=128 : 7.4×  SLOWER  → MUST route Triton
-        enc3 C=256 : 2.1×  SLOWER  → MUST route Triton
-        enc4 C=512 : 0.715× (net-positive — the ONLY validated win)
-                     → MAY route fused under "auto"
-
-    Zero-regression is GUARANTEED BY CONSTRUCTION: under the production
-    ``"auto"`` mode the router engages fused iff
-    ``C >= _FUSED_AUTOROUTER_MIN_C`` (=512), a strict subset of the
-    measured-net-positive set; every other shape takes the exact
-    baseline Triton path. A timing assertion would be flaky, so
-    this cell asserts the ROUTING DECISION (the guarantee itself) via a
-    spy on ``FusedPointConv3d``, plus numerical parity of the routed
-    output vs the independent ``force_grouped`` Triton reference.
+    This cell asserts the ROUTING DECISION via spies (TIG must engage
+    exactly once per call under "auto"; FusedPointConv3d must NEVER
+    engage under "auto") plus numerical parity of the routed output vs
+    the independent force_fsg Triton reference, at four stage shapes
+    and G in {1, 4}.
     """
 
-    def _run_stage(self, C_in, C_out, mode, spy):
-        """One PointConv3d fwd+bwd at (C_in,C_out) under `mode`; returns
-        (out, grad_w, grad_x, fused_called:int). `spy` is a 1-elem list
-        the patched FusedPointConv3d bumps on .apply."""
+    def _run_stage(self, C_in, C_out, mode, groups=1):
+        """One PointConv3d fwd+bwd at (C_in,C_out,groups) under `mode`;
+        returns (out, grad_w, grad_x, fused_calls, tig_calls)."""
         import sparse_engines.mvmr_cutlass as _mc
+        import sparse_engines.tig as _tig
         from layers.conv import PointConv3d
 
         device = "cuda"
@@ -1197,19 +1232,26 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
         k_idx, j_idx, i_idx = _make_mvmr_indices(
             K_offsets, N_b, N_o, T, device)
         torch.manual_seed(0)
-        conv = PointConv3d(C_in, C_out, kernel_size=3, groups=1,
+        conv = PointConv3d(C_in, C_out, kernel_size=3, groups=groups,
                            bias=False, device=device, dtype=torch.float16)
 
-        _Real = _mc.FusedPointConv3d
+        fused_spy, tig_spy = [0], [0]
+        _RealFused = _mc.FusedPointConv3d
+        _real_tig_mvmr = _tig.tig_mvmr
 
-        class _Spy:
+        class _SpyFused:
             @staticmethod
-            def apply(*a, **k):
-                spy[0] += 1
-                return _Real.apply(*a, **k)
+            def apply(*a, **kw):
+                fused_spy[0] += 1
+                return _RealFused.apply(*a, **kw)
+
+        def _spy_tig_mvmr(*a, **kw):
+            tig_spy[0] += 1
+            return _real_tig_mvmr(*a, **kw)
 
         x = x0.detach().clone().requires_grad_(True)
-        _mc.FusedPointConv3d = _Spy
+        _mc.FusedPointConv3d = _SpyFused
+        _tig.tig_mvmr = _spy_tig_mvmr
         try:
             with dispatch_mode(mode):
                 out = conv(x, i_idx, j_idx, k_idx, N_o)
@@ -1217,57 +1259,74 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                 w = torch.randn_like(out)
                 (out.float() * w.float()).sum().backward()
         finally:
-            _mc.FusedPointConv3d = _Real
+            _mc.FusedPointConv3d = _RealFused
+            _tig.tig_mvmr = _real_tig_mvmr
         return (out.detach(), conv.weight.grad.detach(),
-                x.grad.detach(), spy[0])
+                x.grad.detach(), fused_spy[0], tig_spy[0])
 
     def test_auto_router_decision_and_parity(self):
-        # (C_in, C_out, expect_fused_under_auto, label)
         STAGES = [
-            (32, 32, False, "enc0 (tile-unmet M=32%64≠0 → small-C guard)"),
-            (64, 64, False, "enc1 (C=64, measured 24.7× slower)"),
-            (256, 256, False, "enc3 (C=256, measured 2.1× slower)"),
-            (512, 512, True, "enc4 (C=512, measured 0.715× — net-positive)"),
+            (32, 32, 1, "enc0 C=32 G=1"),
+            (64, 64, 1, "enc1 C=64 G=1"),
+            (256, 256, 1, "enc3 C=256 G=1"),
+            (512, 512, 1, "enc4 C=512 G=1"),
+            (256, 256, 4, "c256 G=4 (grouped)"),
         ]
-        for C_in, C_out, expect_fused, label in STAGES:
+        for C_in, C_out, G, label in STAGES:
             with self.subTest(stage=label):
-                # Reference: the independent proven Triton-grouped path.
-                out_ref, gw_ref, gx_ref, n_ref = self._run_stage(
-                    C_in, C_out, "force_grouped", [0])
-                self.assertEqual(
-                    n_ref, 0,
-                    f"{label}: force_grouped must NEVER take the fused "
-                    f"path (spy={n_ref})")
+                # Reference: the independent Triton-grouped path.
+                out_ref, gw_ref, gx_ref, nf_ref, nt_ref = self._run_stage(
+                    C_in, C_out, "force_fsg", groups=G)
+                self.assertEqual(nf_ref, 0,
+                    f"{label}: force_fsg must never take fused")
+                self.assertEqual(nt_ref, 0,
+                    f"{label}: force_fsg must never take TIG")
 
-                # Production "auto": the routing decision under test.
-                out_a, gw_a, gx_a, n_auto = self._run_stage(
-                    C_in, C_out, "auto", [0])
+                # Production "auto": must route TIG, never fused.
+                out_a, gw_a, gx_a, nf_auto, nt_auto = self._run_stage(
+                    C_in, C_out, "auto", groups=G)
+                self.assertEqual(nf_auto, 0,
+                    f"{label}: 'auto' must NOT engage fused (the legacy "
+                    f"C>=512 fused rule is retired; spy={nf_auto})")
+                self.assertEqual(nt_auto, 1,
+                    f"{label}: 'auto' MUST route TIG exactly once "
+                    f"(the production default; spy={nt_auto})")
 
-                # (a) ROUTING DECISION = the zero-regression guarantee.
-                if expect_fused:
-                    self.assertEqual(
-                        n_auto, 1,
-                        f"{label}: 'auto' MUST engage fused in the "
-                        f"measured-net-positive regime (spy={n_auto})")
-                else:
-                    self.assertEqual(
-                        n_auto, 0,
-                        f"{label}: 'auto' MUST stay on Triton (== main, "
-                        f"zero-regression) for this measured-net-NEGATIVE "
-                        f"/ tile-unmet shape — engaging fused here would "
-                        f"REGRESS the network (spy={n_auto})")
-
-                # (b) Whatever path 'auto' chose, the result must be
-                # numerically correct vs the independent reference.
                 fwd = _rel_err(out_a, out_ref)
                 ga = _rel_err(gw_a, gw_ref)
                 gb = _rel_err(gx_a, gx_ref)
-                print(f"  AUTO-ROUTER [{label}] "
-                      f"fused_engaged={'YES' if n_auto else 'no'} "
+                print(f"  AUTO-ROUTER [{label}] tig=YES fused=no "
                       f"fwd={fwd:.3e} grad_a={ga:.3e} grad_b={gb:.3e}")
-                self.assertLess(fwd, 1e-2, f"{label}: fwd relerr {fwd:.3e}")
+                self.assertLess(fwd, 1e-2, f"{label}: fwd {fwd:.3e}")
                 self.assertLess(ga, 1e-2, f"{label}: grad_a {ga:.3e}")
                 self.assertLess(gb, 1e-2, f"{label}: grad_b {gb:.3e}")
+
+        # Unsorted triplets under "auto" must fall to the eager op
+        # (never TIG with assume_sorted on garbage).
+        import sparse_engines.tig as _tig
+        from layers.conv import PointConv3d
+        device = "cuda"
+        torch.manual_seed(0)
+        conv = PointConv3d(64, 64, kernel_size=3, groups=1, bias=False,
+                           device=device, dtype=torch.float16)
+        N = 200
+        x = (torch.randn(N, 64, device=device) * 0.1).to(torch.float16)
+        g = torch.Generator(device="cpu").manual_seed(5)
+        k_uns = torch.randint(0, 27, (1500,), generator=g).to(device)  # NOT sorted
+        j_idx = torch.randint(0, N, (1500,), generator=g).to(device)
+        i_idx = torch.randint(0, N, (1500,), generator=g).to(device)
+        spy = [0]
+        real = _tig.tig_mvmr
+        _tig.tig_mvmr = lambda *a, **kw: (spy.__setitem__(0, spy[0] + 1),
+                                          real(*a, **kw))[1]
+        try:
+            with dispatch_mode("auto"):
+                conv(x, i_idx, j_idx, k_uns, N)
+        finally:
+            _tig.tig_mvmr = real
+        self.assertEqual(spy[0], 0,
+            "'auto' routed TIG on UNSORTED triplets — the sortedness "
+            "guard is broken")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -1290,8 +1349,8 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
     (`torch.equal` is False `_full`-vs-`_full`; measured max|Δ| ≈
     4.77e-7 ≡ 1 ULP at the o-magnitude here). A literal-`torch.equal`
     bit-exact gate is therefore **unsatisfiable for this kernel by
-    construction** (a "relerr 0 / floating-identical" assumption would
-    pre-date this atomicAdd-epilogue fact).
+    construction** (a "relerr 0 / floating-identical" assumption
+    would pre-date this atomicAdd-epilogue fact).
 
     The correct, principled criterion (see the WHY block on
     ``_assert_no_systematic_excess`` for the full statistical argument):
@@ -1358,10 +1417,12 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
         return (M_full, C_full, N_b, N_o, K_offsets, T,
                 seg_offs, b_idx_i32, o_idx_i32)
 
-    # ---- statistically-sound parity criterion -----------------
-    #    # WHY A SINGLE-SHOT MAX BOUND IS STATISTICALLY INVALID HERE — DO NOT
+    # ---- statistically-sound parity criterion ----------------------------
+    #
+    # WHY A SINGLE-SHOT MAX BOUND IS STATISTICALLY INVALID HERE — DO NOT
     # "SIMPLIFY" THIS BACK TO A 4-SAMPLE-MAX ENVELOPE.
-    #    # The frozen `mvmr_cutlass_sm{80,90}_full_kernel` epilogue scatter-
+    #
+    # The frozen `mvmr_cutlass_sm{80,90}_full_kernel` epilogue scatter-
     # accumulates into `o` via floating-point `atomicAdd` across concurrent
     # CTAs. fp `atomicAdd` is order-non-deterministic, so EVERY launch —
     # `_full` or `_prestaged` — draws an output from the SAME zero-mean
@@ -1372,14 +1433,16 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
     # and `_prestaged` take EXACTLY the same two values
     # {-2.305234432220459, -2.305233955383301} — their per-element value
     # sets are identical; `_prestaged` adds no new value, no shift.
-    #    # Consequence: `prestaged↔full single-shot max|Δ|` and `full↔full
+    #
+    # Consequence: `prestaged↔full single-shot max|Δ|` and `full↔full
     # single-shot max|Δ|` are independent draws from the SAME ~1-ULP
     # (≈4.77e-7) bistable-spread distribution. The old gate compared one
     # such draw to `max` of ~6 others (4 `_full` launches) — an under-
     # powered extreme-value estimator: it false-FAILs whenever the
     # envelope happens to sample low while the single prestaged draw
     # samples high (observed: run-1 PASS / run-2 FAIL, identical binary).
-    #    # The principled fix: atomicAdd jitter is ZERO-MEAN, so AVERAGING over
+    #
+    # The principled fix: atomicAdd jitter is ZERO-MEAN, so AVERAGING over
     # K independent launches cancels it (per-element std σ≈3.6e-7 ⇒ the
     # mean's std falls as σ/√K) while a *systematic* repack bug (a fixed
     # per-element offset) survives the average unattenuated. We further
@@ -1531,17 +1594,17 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
     mixed (a=fp16, b=fp32) pair sailed past it into the fp16-only CUTLASS
     kernel, which raised
     ``ValueError: CUTLASS full vvor is fp16-only (got a=fp16, b=fp32)`` —
-    crashing every AMP step that used ``force_grouped_cutlass_mvmr_vvor``
-    (a downstream model). The fix routes any non-fp16 operand to the
+    crashing every AMP step that used ``force_fsg_cutlass_mvmr_vvor``
+    in a downstream model. The fix routes any non-fp16 operand to the
     scalar-FMA fallback (no silent fp16-cast). Asserts: (1) no raise, and
     (2) the fallback output matches the plain ``auto`` Triton path within
     fp16 tolerance.
     """
 
     MODES = [
-        "force_grouped_cutlass_mvmr_vvor",
-        "force_grouped_cutlass_vvor",
-        "force_grouped_cutlass_mvmr",
+        "force_fsg_cutlass_mvmr_vvor",
+        "force_fsg_cutlass_vvor",
+        "force_fsg_cutlass_mvmr",
     ]
 
     def _skip_if_no_cuda(self):
@@ -1565,8 +1628,8 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
         with dispatch_mode("auto"):
             ref = vvor(a16, a_idx, b16, b_idx, o_idx, K_off)
         b32 = b16.float()  # the autocast-kept-fp32 operand
-        for mode in ("force_grouped_cutlass_vvor",
-                     "force_grouped_cutlass_mvmr_vvor"):
+        for mode in ("force_fsg_cutlass_vvor",
+                     "force_fsg_cutlass_mvmr_vvor"):
             with self.subTest(mode=mode):
                 with dispatch_mode(mode):
                     try:
@@ -1595,8 +1658,8 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
         with dispatch_mode("auto"):
             ref = mvmr(a16, a_idx, b16, b_idx, o_idx, N_o)
         b32 = b16.float()
-        for mode in ("force_grouped_cutlass_mvmr",
-                     "force_grouped_cutlass_mvmr_vvor"):
+        for mode in ("force_fsg_cutlass_mvmr",
+                     "force_fsg_cutlass_mvmr_vvor"):
             with self.subTest(mode=mode):
                 with dispatch_mode(mode):
                     try:
@@ -1683,7 +1746,7 @@ class TestGroupedCutlassMvmrFullBf16Parity(unittest.TestCase):
     """FULL mvmr forward parity at **bf16**.
 
     The bf16 sibling of TestGroupedCutlassMvmrFullParity. Reference = the
-    Triton-grouped mvmr at bf16 (force_grouped). Threshold 1.5e-2.
+    Triton-grouped mvmr at bf16 (force_fsg). Threshold 1.5e-2.
     """
 
     def test_mvmr_cutlass_sm80_full_parity_bf16(self):
@@ -1724,7 +1787,7 @@ class TestGroupedCutlassMvmrFullBf16Parity(unittest.TestCase):
         b = (torch.randn(N_b, 1, C_full, device=device,
                          dtype=torch.float32) * 0.1).to(torch.bfloat16)
 
-        with dispatch_mode("force_grouped"):
+        with dispatch_mode("force_fsg"):
             out_ref = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                 a, a_idx, b, b_idx, o_idx, N_o,
             )

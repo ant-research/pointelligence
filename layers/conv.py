@@ -19,7 +19,7 @@ from torch.nn import Module
 from torch.nn.modules.utils import _triple
 
 from sparse_engines.ops import sparse_matrix_vector_multiplication_reduction
-from sparse_engines._dispatch_override import current_mode
+from sparse_engines._dispatch_override import current_mode, current_precision
 
 from .metadata import MetaData
 from .triplets import (
@@ -29,24 +29,19 @@ from .triplets import (
 from .generative import CoordinateGenerator, GeneratedSites, KernelStampGenerator
 
 
-# Perf-optimal auto-router measured boundary. The fused CUTLASS
-# PointConv3d path is net-positive vs the Triton-grouped path ONLY in the
-# measured large-C regime; at smaller C it is CATASTROPHICALLY slower.
-# Measured enc4 fp16 H200 (dispatcher-reverified, fused forward+backward
-# ÷ grouped forward+backward, median-of-3):
-#   enc1 C=64  → 24.7×   enc2 C=128 → 7.4×   enc3 C=256 → 2.1×  (SLOWER)
-#   enc4 C=512 → 0.715×  (net-positive — the ONLY validated win)
-# So under the production "auto" mode, auto-engage the fused path ONLY
-# when C (= weight.shape[2], the conv in/G channel) is at/above the
-# measured-net-positive boundary; default to the Triton path
-# (zero-regression by construction) for every unmeasured-or-net-negative
-# shape. 512 is the conservative measured cut (net-positive at 512,
-# net-NEGATIVE 2.1× at 256 → the boundary is in (256, 512]; pick the
-# validated point). Widen ONLY with additional measured net-positive
-# cells — never speculatively (the zero-regression guarantee is the
-# allowlist being a strict subset of the measured-net-positive set).
-# The explicit `force_fused_conv` override (benches/tests) is unaffected.
-_FUSED_AUTOROUTER_MIN_C = 512
+# The production "auto" default is **TIG** at every (shape, G, dtype):
+# the decision tables (sm_89 + H200, real ScanNet cells) have TIG best
+# f+b at 25-26/30 cells on both arches (exceptions are near-ties at
+# half precision, <=1.02x; a few fp32 small-channel cells favor the
+# grouped path by up to 1.4x
+# force_fsg_fused tie), and TIG strictly beats the legacy auto routing
+# (Triton-grouped@C>=128 / fused@C>=512 / per-triplet) at every
+# measured cell including all fp32 cells. The fused-at-C>=512
+# auto-engagement is RETIRED with its constant (`force_fsg_fused`
+# remains as the explicit override; its half-precision wins are all
+# <=1.02x over TIG — not worth a second default engine). FSG stays
+# fully reachable via the force_fsg* modes (rollback + ablation, one
+# release minimum).
 
 
 class GeneralConv(Module):
@@ -190,7 +185,7 @@ class GeneralConv(Module):
         else:
             input_3d = input.contiguous()
 
-        # Under "force_fused_conv" route the whole
+        # Under "force_fsg_fused" route the whole
         # mvmr+autograd through the single `FusedPointConv3d` Function
         # (collapses the 3 @triton_op/autograd-graph boundaries + 2
         # seg_offs builds + the duplicate .contiguous() into one Function;
@@ -201,7 +196,7 @@ class GeneralConv(Module):
         # autograd boundary (not nested inside the op's registered
         # autograd). fp16-only; non-fp16 falls through to the unchanged
         # eager op. Every other mode/path is byte-unchanged: this branch
-        # fires ONLY on the "force_fused_conv" string.
+        # fires ONLY on the "force_fsg_fused" string.
         #
         # Small-C crash-avoidance fallback. The fused path's CUTLASS mvmr
         # full kernel hard-requires the weight's M and C to be tile
@@ -218,7 +213,7 @@ class GeneralConv(Module):
         # JSON. So decide BY SHAPE *before* dispatch (not a fragile
         # try/except around the kernel): when the tile constraints are
         # unmet, fall through to EXACTLY the non-fused composition the
-        # `else` below takes when the mode is not "force_fused_conv" —
+        # `else` below takes when the mode is not "force_fsg_fused" —
         # already correct & parity-tested. The decision is on the forward
         # weight shape, invariant across fwd/bwd, so the whole step is
         # owned by one path (no fwd/bwd mix). Constraint-MET shapes still
@@ -230,31 +225,76 @@ class GeneralConv(Module):
         _fused_tiles_ok = (
             weight.shape[3] % M_TILE == 0 and weight.shape[2] % C_TILE == 0
         )
-        # Perf-optimal auto-router. `_fused_safe` = the fused
-        # CUTLASS path's hard preconditions (fp16 + tile-multiple M/C —
-        # the small-C crash-avoidance guard, unchanged). The
-        # routing DECISION on top of it:
-        #   • "force_fused_conv" (benches/tests): engage whenever
-        #     `_fused_safe` — byte-unchanged explicit override.
-        #   • "auto" (production default): engage ONLY in the measured-
-        #     net-positive regime (C >= _FUSED_AUTOROUTER_MIN_C); every
-        #     other shape → the Triton path (zero-regression).
+        # Auto-router (supersedes the fused-at-C>=512 rule): **TIG is the
+        # production default at every (shape, G, dtype)** — the decision
+        # tables (sm_89 + H200, real ScanNet cells) have TIG best f+b at
+        # 25-26/30 cells on BOTH arches (exceptions are near-ties at
+        # half precision, <=1.02x; a few fp32 small-channel cells favor
+        # the grouped path by up to 1.4x; fused
+        # tie), and TIG strictly beats the legacy auto (grouped@C>=128 /
+        # fused@C>=512 / per-triplet) at every measured cell including
+        # all fp32 cells. Routing:
+        #   • "force_fsg_fused" (benches/tests): fused whenever
+        #     `_fused_safe` — explicit override, unchanged.
+        #   • "auto" (production default): TIG when the triplets are
+        #     k-sorted (the build_triplets contract; memoized check) —
+        #     all dtypes, all G. Unsorted (non-production callers) falls
+        #     to the eager op below, which re-checks and lands on the
+        #     per-triplet path.
+        #   • "force_tig": TIG unconditionally (assume_sorted contract).
         #   • any other mode: → the eager op (those force_* modes are
         #     dispatched inside `sparse_matrix_vector_multiplication_
         #     reduction`); unchanged.
         _mode = current_mode()
-        _fused_safe = (weight.dtype == torch.float16) and _fused_tiles_ok
-        _use_fused = _fused_safe and (
-            _mode == "force_fused_conv"
-            or (
-                _mode == "auto"
-                and weight.shape[2] >= _FUSED_AUTOROUTER_MIN_C
-            )
+        # FusedPointConv3d is G-complete via fold-G-into-K (single launch
+        # per leg at any G). The only extra gate at G>1 is fold legality
+        # (int32 index ranges); unmet folds fall through to the eager
+        # composition below — never raise. The per-group tile check
+        # above already evaluates Mg/Cg (the weight layout is
+        # (K, G, Cg, Mg)).
+        from sparse_engines.mvmr_cutlass import fused_fold_legal
+
+        _fused_safe = (
+            (weight.dtype == torch.float16)
+            and _fused_tiles_ok
+            and fused_fold_legal(self.groups, input_3d.shape[0], n,
+                                 k.numel())
         )
+        _use_fused = _fused_safe and _mode == "force_fsg_fused"
+        # TIG preconditions: submanifold (N_in == N_out — TIG's
+        # grad_input is submanifold-scoped; generative / strided convs
+        # fall to the eager op below) for BOTH auto and force_tig (a
+        # network-wide force_tig must not crash on downsample layers —
+        # same correctness-over-speed fallback philosophy as
+        # force_fsg's unsorted-index fallback); plus, for auto only,
+        # k-sorted triplets (the build_triplets contract, memoized
+        # check — force_tig keeps its explicit assume_sorted contract).
+        _submanifold = input_3d.shape[0] == n
+        if _mode == "auto":
+            from sparse_engines._seg_offs import is_sorted_cached
+            _use_tig = _submanifold and is_sorted_cached(k)
+        else:
+            _use_tig = _mode == "force_tig" and _submanifold
         if _use_fused:
             from sparse_engines.mvmr_cutlass import FusedPointConv3d
 
             output = FusedPointConv3d.apply(weight, k, input_3d, j, i, n)
+        elif _use_tig:
+            # The TIG engine (flat orientation — the k-sorted triplets
+            # ARE the index, per-call index cost is one searchsorted;
+            # the hybrid mode needs the level-0 transform and is
+            # reserved for cached-topology use). One autograd node,
+            # 3 kernel launches f+b, zero weight staging.
+            # Also the automatic production default (sortedness verified
+            # above via the memoized check, so assume_sorted holds).
+            from sparse_engines.tig import TigIndex, tig_mvmr
+
+            idx = TigIndex(i, j, k, n, weight.shape[0],
+                            build_hybrid=False, assume_sorted=True)
+            output = tig_mvmr(
+                weight, input_3d.view(input_3d.shape[0], -1), idx,
+                input_precision=current_precision(),
+            ).view(-1, self.groups, self.out_channels // self.groups)
         else:
             output = sparse_matrix_vector_multiplication_reduction(weight, k, input_3d, j, i, n)
 
