@@ -123,8 +123,13 @@ def _tig_flat_kernel(
                     mask=c_mask[:, None] & m_mask[None, :], other=0.0)
         acc = tl.dot(x, w, acc, input_precision=INPUT_PRECISION)
 
+    # Accumulator buffer dtype is HOST-chosen: fp32 staging (the default —
+    # the cast below is then a no-op) or, under the bounded-fan-in
+    # contract at fp16, the native output dtype (skips the staging buffer
+    # + cast pass; <= K fp16 roundings per element, C-reduction stays
+    # fp32 in registers).
     tl.atomic_add(o32 + oi[:, None] * (G * M) + pid_g * M
-                  + m_offsets[None, :], acc,
+                  + m_offsets[None, :], acc.to(o32.dtype.element_ty),
                   mask=l_mask[:, None] & m_mask[None, :])
 
 
@@ -195,8 +200,13 @@ def _tig_flat_bisect_kernel(
                     mask=c_mask[:, None] & m_mask[None, :], other=0.0)
         acc = tl.dot(x, w, acc, input_precision=INPUT_PRECISION)
 
+    # Accumulator buffer dtype is HOST-chosen: fp32 staging (the default —
+    # the cast below is then a no-op) or, under the bounded-fan-in
+    # contract at fp16, the native output dtype (skips the staging buffer
+    # + cast pass; <= K fp16 roundings per element, C-reduction stays
+    # fp32 in registers).
     tl.atomic_add(o32 + oi[:, None] * (G * M) + pid_g * M
-                  + m_offsets[None, :], acc,
+                  + m_offsets[None, :], acc.to(o32.dtype.element_ty),
                   mask=l_mask[:, None] & m_mask[None, :])
 
 
@@ -1085,7 +1095,20 @@ def tig_grad_input(
         return out
     # roles per group: INW=M (gather grad_out rows by i), OUTW=C (scatter
     # by j); logical W'[k, g, m, c] = W[k, g, c, m] -> wc-stride 1, wm-stride M
-    o32 = torch.zeros(N, G * C, device=grad_out.device, dtype=torch.float32)
+    #
+    # Native-fp16 accumulation: under the disjoint-builder contract
+    # (exact_cover_out forward; per-tap parent-injectivity => fan-in <= K
+    # partials per output element) the fp32 staging buffer + final cast
+    # pass are the dominant grad_input cost — accumulating atomically in
+    # NATIVE fp16 measures 1.7-2.4x faster on Ada (sm_89) at relative
+    # error 5e-4-8e-4 (each partial is a full fp32-register C-reduction;
+    # only the <= K inter-partial adds round at fp16). bf16 is EXCLUDED
+    # (measured slower AND error to 7.5e-3 — 8 mantissa bits). Enabled on
+    # sm_8x; Hopper keeps the fp32-staging path pending measurement.
+    _native = (index.exact_cover_out and grad_out.dtype == torch.float16
+               and G == 1 and _fi1_wins_here())
+    acc_dtype = grad_out.dtype if _native else torch.float32
+    o32 = torch.zeros(N, G * C, device=grad_out.device, dtype=acc_dtype)
     gp = _packed_gp(G, C, M) if flat_cfg is None else None
     if gp is not None:
         if index.T:
@@ -1126,6 +1149,14 @@ def _wgrad_cfg(C: int, M: int, dtype: torch.dtype = torch.float16):
     if C <= 16 and M <= 16:
         L = 128 if dtype == torch.float32 else 256
         return dict(L=L, BM=16, BC=16, num_warps=4)
+    if C >= 128 and _fi1_wins_here():
+        # A 128-wide C tile beats the 64-wide bucket by 1.2-1.3x at
+        # C >= 128 (measured at deconv and submanifold shapes, fp16/bf16;
+        # 1.23x at fp32). fp32 stays at L=128 — the L=256 variant exceeds
+        # the shared-memory limit in some specializations. Enabled on
+        # sm_8x pending Hopper measurement (pure-config, parity-identical).
+        L = 128 if dtype == torch.float32 else 512
+        return dict(L=L, BM=64, BC=128, num_warps=8)
     L = 128 if dtype == torch.float32 else 512
     return dict(L=L, BM=64 if M >= 64 else 32, BC=64 if C >= 64 else 32,
                 num_warps=8 if C >= 64 else 4)
