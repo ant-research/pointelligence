@@ -26,7 +26,7 @@ from .vvor_triton_kernel import (
 )
 from ._seg_offs import (is_sorted_cached, kernel_offset_segments,
                          kernel_offset_segments_cached)
-from ._dispatch_override import current_mode, current_precision
+from ._dispatch_override import current_mode, resolve_input_precision
 
 
 _GROUPED_MIN_TRIPLETS_PER_K = 16
@@ -91,7 +91,7 @@ def _try_grouped_dispatch(
         a, a_idx, b, b_idx, o,
         seg_offs,
         K_offsets, G, M, C,
-        INPUT_PRECISION=current_precision(),
+        INPUT_PRECISION=resolve_input_precision(a.dtype),
     )
     return True
 

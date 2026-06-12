@@ -25,7 +25,7 @@ from .mvmr_triton_kernel import (
 )
 from ._seg_offs import (is_sorted_cached, kernel_offset_segments,
                          kernel_offset_segments_cached)
-from ._dispatch_override import current_mode, current_precision
+from ._dispatch_override import current_mode, resolve_input_precision
 
 # Channel threshold: grouped path wins above the tensor-core mma break-even.
 # Empirical (PointConv3d engine bench at PTv3 stage shapes,
@@ -117,7 +117,7 @@ def _try_grouped_dispatch(
         a, b, b_idx, o, o_idx,
         seg_offs,
         K_offsets, G, M, C,
-        INPUT_PRECISION=current_precision(),
+        INPUT_PRECISION=resolve_input_precision(b.dtype),
     )
     return True
 

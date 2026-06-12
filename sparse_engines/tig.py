@@ -44,6 +44,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch_override import resolve_input_precision
 from ._seg_offs import kernel_offset_segments
 
 __all__ = ["TigIndex", "tig_forward", "tig_grad_input",
@@ -930,7 +931,7 @@ def tig_forward(
     feat: torch.Tensor,
     index: TigIndex,
     mode: str = "auto",
-    input_precision: str = "tf32",
+    input_precision: Optional[str] = None,
     flat_cfg: Optional[dict] = None,
     l0_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
@@ -941,9 +942,12 @@ def tig_forward(
     small per-group M where the masked pass measured net-positive, else
     flat; both modes carry the group axis natively).
     Returns (N, G*M) flat in feat.dtype. fp32 inputs follow
-    ``input_precision`` ("tf32" matches the production grouped path's
-    default; "ieee" exact). G>1 is block-diagonal (v1.2.0).
+    ``input_precision`` (None resolves via ``resolve_input_precision``:
+    IEEE-exact unless tf32 is opted in — engine choice must not change
+    fp32 numerics). G>1 is block-diagonal (v1.2.0).
     """
+    if input_precision is None:
+        input_precision = resolve_input_precision(feat.dtype)
     if weight.dim() == 4:
         K, G, C, M = weight.shape
     else:
@@ -1056,7 +1060,7 @@ def tig_grad_input(
     weight: torch.Tensor,
     grad_out: torch.Tensor,
     index: TigIndex,
-    input_precision: str = "tf32",
+    input_precision: Optional[str] = None,
     flat_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
     """grad_feat[j] += grad_out[i] @ W[k]^T — the SAME flat kernel with
@@ -1064,6 +1068,8 @@ def tig_grad_input(
     (zero-copy, no staging). Sized by ``index.N_in`` so generative
     convs (N_in != N_out) get a correctly-shaped grad; for submanifold
     indices N_in == N (unchanged behavior)."""
+    if input_precision is None:
+        input_precision = resolve_input_precision(grad_out.dtype)
     if weight.dim() == 4:
         K, G, C, M = weight.shape
     else:
@@ -1168,11 +1174,13 @@ def tig_grad_weight(
     grad_out: torch.Tensor,
     index: TigIndex,
     weight_shape,
-    input_precision: str = "tf32",
+    input_precision: Optional[str] = None,
     wgrad_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
     """grad_W[k] += feat[j]^T (outer) grad_out[i] — implicit wgrad,
     Split-K via per-chunk atomic accumulation into an fp32 buffer."""
+    if input_precision is None:
+        input_precision = resolve_input_precision(feat.dtype)
     feat = feat.contiguous()
     grad_out = grad_out.contiguous()
     G = weight_shape[1] if len(weight_shape) == 4 else 1
@@ -1218,12 +1226,14 @@ def tig_backward_fused(
     grad_out: torch.Tensor,
     index: TigIndex,
     weight_shape,
-    input_precision: str = "tf32",
+    input_precision: Optional[str] = None,
     cfg: Optional[dict] = None,
 ):
     """One-pass backward (both grads). Net-positive at small M where the
     extra per-m-tile gx atomics don't dominate — routed by config.
     G>1 is block-diagonal (group axis in the grid, like the split path)."""
+    if input_precision is None:
+        input_precision = resolve_input_precision(feat.dtype)
     if weight.dim() == 4:
         K, G, C, M = weight.shape
     else:
@@ -1278,7 +1288,11 @@ class _TigMvmr(torch.autograd.Function):
 
 
 def tig_mvmr(weight: torch.Tensor, feat: torch.Tensor, index: TigIndex,
-              mode: str = "auto", input_precision: str = "tf32"):
+              mode: str = "auto", input_precision: Optional[str] = None):
     """Differentiable TIG mvmr: one autograd node for fwd + both grads
-    (3 kernel launches total on the flat path, zero weight staging)."""
+    (3 kernel launches total on the flat path, zero weight staging).
+    Precision resolves once here, so forward and backward stay
+    consistent even if the global tf32 knob flips mid-step."""
+    if input_precision is None:
+        input_precision = resolve_input_precision(feat.dtype)
     return _TigMvmr.apply(weight, feat, index, mode, input_precision)

@@ -1,15 +1,15 @@
 """Smoke test for the `precision_mode` flag on the grouped MVMR/VVOR.
 
-The grouped path's ``tl.dot`` defaults to ``input_precision="tf32"`` on
-Ampere+. ``precision_mode("ieee")`` switches to IEEE single-precision
-which loses tensor-core mma at fp32 inputs but tightens the per-multiply
-relative error from ~1e-3 (tf32) to ~1e-7 (fp32 fma).
+``precision_mode("tf32")`` runs the grouped path's ``tl.dot`` at tf32
+(tensor-core mma, ~1e-3 per-multiply rel error); ``"ieee"`` /
+``"default"`` (under factory torch settings) run IEEE single-precision
+(~1e-7). Default-resolution semantics live in
+test_fp32_routing_precision.py.
 
 We verify two things:
   1. ``precision_mode("ieee")`` produces tighter rel-error vs fp32-numpy
-     reference at fp32 inputs.
-  2. ``precision_mode("default")`` (= tf32) produces a result close
-     to the ieee result (within tf32's ~1e-3 budget).
+     reference at fp32 inputs than an explicit ``"tf32"`` scope.
+  2. ``precision_mode("tf32")`` still lands within tf32's ~1e-3 budget.
 """
 import sys, os
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,7 +46,7 @@ class TestInputPrecision(unittest.TestCase):
 
         # Force grouped path so the precision flag matters.
         with dispatch_mode("force_fsg"):
-            with precision_mode("default"):
+            with precision_mode("tf32"):
                 out_tf32 = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
                     a, a_idx, b, b_idx, o_idx, N_o,
                 )
@@ -65,7 +65,7 @@ class TestInputPrecision(unittest.TestCase):
         self.assertLess(rel_ieee, rel_tf32,
                          "IEEE precision should give tighter rel err than tf32")
         self.assertLess(rel_tf32, 5e-3,
-                         "tf32 default should still be within 5e-3 budget")
+                         "explicit tf32 scope should still be within 5e-3 budget")
         self.assertLess(rel_ieee, 1e-4,
                          "IEEE precision should reach <1e-4 rel err at fp32 inputs")
 

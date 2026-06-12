@@ -19,7 +19,7 @@ from torch.nn import Module
 from torch.nn.modules.utils import _triple
 
 from sparse_engines.ops import sparse_matrix_vector_multiplication_reduction
-from sparse_engines._dispatch_override import current_mode, current_precision
+from sparse_engines._dispatch_override import current_mode, resolve_input_precision
 
 from .metadata import MetaData
 from .triplets import (
@@ -348,7 +348,7 @@ class GeneralConv(Module):
                                 exact_cover_in=_eci)
                 output = tig_mvmr(
                     weight, input_3d.view(_n_in_rows, -1), idx,
-                    input_precision=current_precision(),
+                    input_precision=resolve_input_precision(input_3d.dtype),
                 ).view(-1, self.groups,
                        self.out_channels // self.groups)
         else:

@@ -107,7 +107,7 @@ DispatchMode = Literal[
 #               err per multiply on fp32 inputs)
 #   "ieee"    → IEEE single-precision; ~1e-7 rel err but no tensor-core mma
 #               at fp32 inputs (fp16/bf16 still use tensor cores)
-PrecisionMode = Literal["default", "ieee"]
+PrecisionMode = Literal["default", "ieee", "tf32"]
 
 
 _state: dict = {"mode": "auto", "precision": "default"}
@@ -121,9 +121,32 @@ def current_mode() -> DispatchMode:
 
 def current_precision() -> str:
     """Return the tl.dot ``input_precision`` string for the grouped path.
-    Used as the ``INPUT_PRECISION`` constexpr passed to the kernel."""
+    Used as the ``INPUT_PRECISION`` constexpr passed to the kernel.
+
+    ``"default"`` follows PyTorch's fp32-matmul convention: IEEE unless
+    the user opted into tf32 via the standard global knob
+    (``torch.backends.cuda.matmul.allow_tf32`` /
+    ``torch.set_float32_matmul_precision``). Engine choice is a pure
+    performance decision — the eager per-triplet engine computes IEEE
+    fp32, so a tf32 default on the tl.dot engines would let the
+    dispatcher silently change numerics (integer-valued fp32 features
+    land on the tf32 4096-grid at the 2^22 range)."""
     p = _state["precision"]
-    return "ieee" if p == "ieee" else "tf32"
+    if p in ("ieee", "tf32"):
+        return p
+    import torch
+    return "tf32" if torch.backends.cuda.matmul.allow_tf32 else "ieee"
+
+
+def resolve_input_precision(dtype) -> str:
+    """``INPUT_PRECISION`` constexpr for a kernel whose dot operands have
+    ``dtype``. tl.dot only consults input_precision at fp32 operands;
+    half-precision callers keep the historical ``"tf32"`` constexpr so
+    their compiled kernels stay byte-identical."""
+    import torch
+    if dtype != torch.float32:
+        return "tf32"
+    return current_precision()
 
 
 @contextmanager
@@ -160,16 +183,17 @@ def precision_mode(mode: PrecisionMode):
     """Context manager scoping the tl.dot precision for the grouped path.
 
     Example:
-        with precision_mode("ieee"):
+        with precision_mode("tf32"):
             out = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(...)
-        # back to default ("tf32") outside the block
+        # back to "default" outside the block (= follow the torch
+        # allow_tf32 global; IEEE under factory settings)
 
     No effect on the per-triplet kernel (which doesn't use tl.dot).
     No effect at fp16/bf16 inputs (those always use mma at their dtype's
-    native precision; ``input_precision="ieee"`` is only meaningful at
-    fp32 inputs).
+    native precision; ``input_precision`` is only meaningful at fp32
+    inputs).
     """
-    if mode not in ("default", "ieee"):
+    if mode not in ("default", "ieee", "tf32"):
         raise ValueError(f"unknown precision mode: {mode!r}")
     prev = _state["precision"]
     _state["precision"] = mode
