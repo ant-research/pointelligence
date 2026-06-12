@@ -92,7 +92,6 @@ _LEGACY_RENAMES = {
     "force_grouped_cutlass_mvmr": "force_fsg_cutlass_mvmr",
     "force_grouped_cutlass_mvmr_vvor": "force_fsg_cutlass_mvmr_vvor",
     "force_fused_conv": "force_fsg_fused",
-    "force_smig": "force_tig",
 }
 
 DispatchMode = Literal[
