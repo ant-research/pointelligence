@@ -246,7 +246,12 @@ def test_generation_from_one_autodetect():
             out, _ = conv(x, m, sites=sites)
     finally:
         _tig._tig_flat_fi1_kernel = real
-    assert fi1_spy[0] == 1, "auto must route the FI1 forward"
+    # FI1 routing is ARCH-GATED (wins on sm_8x, keeps the regular path on
+    # Hopper): assert the route matches the gate, not unconditionally.
+    expected = 1 if _tig._fi1_wins_here() else 0
+    assert fi1_spy[0] == expected, (
+        f"auto FI1 routing must follow the arch gate "
+        f"(expected {expected}, got {fi1_spy[0]})")
 
     with dispatch_mode("force_pt"):
         out_ref, _ = conv(x, m, sites=sites)
