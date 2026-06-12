@@ -37,7 +37,13 @@ _GROUPED_MIN_TRIPLETS_PER_K = 16
 # crossover from the PointConv3d engine bench PTv3 stage profile
 # matches MVMR's: grouped beats per_triplet starting at C=128 (fp16/bf16,
 # tied at fp32) and dominates at C ≥ 256.
-_GROUPED_MIN_DIM = 128
+#
+# Lowered 128 → 64 (June 2026), in lockstep with
+# mvmr_triton._GROUPED_MIN_C (see the rationale there). This is the grad_a
+# (dW) leg of the same eager convs; at the generative deconv cells the
+# min(M,C)=64 stages misrouted to per_triplet and cost up to 1.9x f+b vs
+# force_fsg on Hopper (generative-shapes operator bench, sm_89 + sm_90).
+_GROUPED_MIN_DIM = 64
 
 
 def _try_grouped_dispatch(
@@ -180,6 +186,10 @@ def sparse_vector_vector_outer_product_reduction(
     o = torch.zeros((n_o, G, M, C), dtype=torch.float32, device=a.device)
 
     if not _try_grouped_dispatch(a, a_idx, b, b_idx, o, o_idx, T, G, M, C, n_o):
+        if current_mode() == "auto":  # PT advisory (once per shape)
+            from ._dispatch_override import warn_pt_fallback
+            warn_pt_fallback("vvor", "below the grouped floors or unsorted",
+                             K=n_o, G=G, C=C, M=M)
         grid = lambda META: (
             triton.cdiv(T, META["L"])
             * triton.cdiv(G, META["BLOCK_SIZE_G"])

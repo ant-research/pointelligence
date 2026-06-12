@@ -100,7 +100,7 @@ DispatchMode = Literal[
     "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
     "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
     "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
-    "force_tig", "force_tig",
+    "force_tig",
 ]
 
 # ── tl.dot input precision for the grouped path ──
@@ -141,7 +141,7 @@ def dispatch_mode(mode: DispatchMode):
         "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
         "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
         "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
-        "force_tig", "force_tig",
+        "force_tig",
     ):
         if mode in _LEGACY_RENAMES:
             raise ValueError(
@@ -178,3 +178,31 @@ def precision_mode(mode: PrecisionMode):
         yield
     finally:
         _state["precision"] = prev
+
+
+# ── PT-fallback advisory ─────────────────────────────────────────────────
+# Per-triplet is the correctness fallback, not a performance path: under
+# "auto" every production route prefers TIG (sorted) or the grouped
+# engine. Landing on PT under "auto" therefore signals an optimization
+# opportunity (unsorted triplets, or a shape below the grouped floors).
+# Warn ONCE per (site, shape) — a set guard, so the hot path pays a dict
+# lookup, not a warnings-module filter scan.
+_PT_FALLBACK_SEEN: set = set()
+
+
+def warn_pt_fallback(site: str, reason: str, **ctx) -> None:
+    """Advise (once per site+shape) that 'auto' landed on the per-triplet
+    engine. Suppress globally with
+    ``warnings.filterwarnings("ignore", message=".*per-triplet fallback.*")``."""
+    key = (site, tuple(sorted(ctx.items())))
+    if key in _PT_FALLBACK_SEEN:
+        return
+    _PT_FALLBACK_SEEN.add(key)
+    import warnings
+    detail = ", ".join(f"{k}={v}" for k, v in sorted(ctx.items()))
+    warnings.warn(
+        f"[{site}] 'auto' routed to the per-triplet fallback engine "
+        f"({reason}; {detail}). This is correct but likely not optimal — "
+        f"k-sorted triplets engage the TIG path; the grouped engine covers "
+        f"C/M >= 64.",
+        RuntimeWarning, stacklevel=3)

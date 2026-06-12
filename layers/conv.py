@@ -169,7 +169,14 @@ class GeneralConv(Module):
         n: int,
         weight: Tensor,
         bias: Optional[Tensor],
+        *,
+        tig_hint: Optional[dict] = None,
     ) -> Tensor:
+        # `tig_hint` is a caller-asserted structure contract (e.g.
+        # GenerativePointConv3d's stamp rulebook): k-sortedness by
+        # construction (skips the is_sorted D2H sync) and optionally
+        # `uniform_seg_len` (closed-form TIG index — no searchsorted, no
+        # cumsum). Default None — every existing caller byte-unchanged.
         # weight is already in (K, G, in/G, out/G) layout —
         # the historical per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (~390 μs at sm_89 enc4) is
@@ -261,20 +268,33 @@ class GeneralConv(Module):
                                  k.numel())
         )
         _use_fused = _fused_safe and _mode == "force_fsg_fused"
-        # TIG preconditions: submanifold (N_in == N_out — TIG's
-        # grad_input is submanifold-scoped; generative / strided convs
-        # fall to the eager op below) for BOTH auto and force_tig (a
-        # network-wide force_tig must not crash on downsample layers —
-        # same correctness-over-speed fallback philosophy as
-        # force_fsg's unsorted-index fallback); plus, for auto only,
-        # k-sorted triplets (the build_triplets contract, memoized
+        # TIG precondition (the submanifold gate is RETIRED): grad_input
+        # is sized by the index's n_in, so generative / strided convs
+        # (N_in != N_out: partition stem, fan-in-1 deconv,
+        # GenerativePointConv3d) route TIG too. The decision tables
+        # (sm_89, real ScanNet, all dtypes) have generative TIG best f+b
+        # at EVERY generative cell — stem 0.57-0.71x the per-triplet
+        # path, deconv 0.55-0.74x FSG at half precision (fp32 marginal
+        # at two cells, still >= the legacy route). Remaining gate, auto
+        # only: k-sorted triplets (the build_triplets contract, memoized
         # check — force_tig keeps its explicit assume_sorted contract).
-        _submanifold = input_3d.shape[0] == n
         if _mode == "auto":
-            from sparse_engines._seg_offs import is_sorted_cached
-            _use_tig = _submanifold and is_sorted_cached(k)
+            if tig_hint is not None:  # sorted by caller contract
+                _use_tig = True
+            else:
+                from sparse_engines._seg_offs import is_sorted_cached
+                _use_tig = is_sorted_cached(k)
+                if not _use_tig:
+                    # Unsorted triplets forfeit TIG AND the grouped path
+                    # — the eager op will land on the per-triplet path.
+                    from sparse_engines._dispatch_override import (
+                        warn_pt_fallback)
+                    warn_pt_fallback(
+                        "PointConv3d", "triplets are not k-sorted",
+                        K=weight.shape[0], C=self.in_channels,
+                        M=self.out_channels, G=self.groups)
         else:
-            _use_tig = _mode == "force_tig" and _submanifold
+            _use_tig = _mode == "force_tig"
         if _use_fused:
             from sparse_engines.mvmr_cutlass import FusedPointConv3d
 
@@ -290,7 +310,12 @@ class GeneralConv(Module):
             from sparse_engines.tig import TigIndex, tig_mvmr
 
             idx = TigIndex(i, j, k, n, weight.shape[0],
-                            build_hybrid=False, assume_sorted=True)
+                            build_hybrid=False, assume_sorted=True,
+                            n_in=input_3d.shape[0],
+                            uniform_seg_len=(tig_hint or {}).get(
+                                "uniform_seg_len"),
+                            exact_cover_out=(tig_hint or {}).get(
+                                "exact_cover_out", False))
             output = tig_mvmr(
                 weight, input_3d.view(input_3d.shape[0], -1), idx,
                 input_precision=current_precision(),
@@ -427,7 +452,18 @@ class GenerativePointConv3d(GeneralConv):
         if sites is None:
             sites = self.generator(m)
         sites.validate()
+        # The stamp rulebook is k-sorted by construction with uniform
+        # per-tap segments — hand the contract to the dispatch so the
+        # TIG index path goes closed-form (no sync/searchsorted/cumsum).
+        # Generation-from-one (dedup merged nothing) additionally
+        # engages the FI1 plain-store forward — the subdivision-upsample
+        # mode.
+        hint = None
+        if sites.uniform_seg_len is not None or sites.exact_cover_out:
+            hint = dict(uniform_seg_len=sites.uniform_seg_len,
+                        exact_cover_out=sites.exact_cover_out)
         x = self._conv_forward(
-            input, sites.i, sites.j, sites.k, sites.n_out, self.weight, self.bias
+            input, sites.i, sites.j, sites.k, sites.n_out, self.weight,
+            self.bias, tig_hint=hint,
         )
         return x, sites.to_metadata(parent=m)

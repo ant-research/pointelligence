@@ -38,7 +38,19 @@ from ._dispatch_override import current_mode, current_precision
 # Production threshold: grouped at C ≥ 128. fp32-C=128 is a wash but other
 # dtypes win meaningfully there. Picking dtype-specific thresholds adds
 # complexity for no measurable improvement at the wash point.
-_GROUPED_MIN_C = 128
+#
+# Lowered 128 → 64 (June 2026). Post-v1.2.0, submanifold+sorted
+# production convs route TIG before this gate fires, so its jurisdiction is
+# the GENERATIVE shapes (strided partition / fan-in-1 deconv) + their
+# backward legs + unsorted callers (which fall at the sortedness check
+# regardless of C). At that population, measured on real ScanNet at both
+# sm_89 and sm_90 (generative-shapes operator bench): the
+# grouped path wins the C=64 fan-in-1 deconv cells by 1.4-1.9x f+b — the
+# old C=64 row above was (a) a submanifold 3^3 shape this gate no longer
+# governs and (b) measured before the v1.2.0 native-dtype mma work.
+# The grad_b leg (transposed weight: gate-C = M) inherits the same floor,
+# which is what un-misroutes the 128->64-channel deconv backward.
+_GROUPED_MIN_C = 64
 
 # Minimum triplets-per-kernel-offset (sm_80+ tensor-core mma needs ≥ 16
 # rows). Below this the grouped kernel is also wrong (M_inner < 16 in
@@ -183,6 +195,10 @@ def sparse_matrix_vector_multiplication_reduction(
     o = torch.zeros((n_o, G, M), dtype=torch.float32, device=a.device)
 
     if not _try_grouped_dispatch(a, a_idx, b, b_idx, o, o_idx, T, G, M, C):
+        if current_mode() == "auto":  # PT advisory (once per shape)
+            from ._dispatch_override import warn_pt_fallback
+            warn_pt_fallback("mvmr", "below the grouped floors or unsorted",
+                             K=a.shape[0], G=G, C=C, M=M)
         grid = lambda META: (
             triton.cdiv(T, META["L"])
             * triton.cdiv(G, META["BLOCK_SIZE_G"])

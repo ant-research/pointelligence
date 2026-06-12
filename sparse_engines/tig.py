@@ -129,6 +129,144 @@ def _tig_flat_kernel(
 
 
 @triton.jit
+def _tig_flat_bisect_kernel(
+    a, b, b_idx, o_idx, o32, seg_offs, cum_chunks,
+    K_offsets, M, C, G,
+    stride_wk, stride_wg, stride_wc, stride_wm,
+    INPUT_PRECISION: tl.constexpr,
+    L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
+):
+    """``_tig_flat_kernel`` with the pid_chunk -> k map done by
+    BINARY SEARCH over a precomputed cumulative-chunk table instead of the
+    linear K-segment scan. At large tap counts (K = 8^3 = 512, a
+    generative-stem shape) the linear scan runs 512 iterations in EVERY
+    program and dominates the forward (~1 ms on Ada (sm_89) at N=165k);
+    bisection is ~9 loads. Routed only at
+    K > _BISECT_MIN_K — the production K=27 path keeps the scan kernel
+    byte-unchanged. ``cum_chunks`` is (K+1,) int32, cum_chunks[k] = total
+    chunks of segments < k (per this L); built once per (orientation, L)
+    and cached on the TigIndex."""
+    num_pid_m = tl.cdiv(M, BM)
+    pid = tl.program_id(axis=0)
+    pid_m = pid % num_pid_m
+    pid_g = (pid // num_pid_m) % G
+    pid_chunk = pid // (num_pid_m * G)
+
+    total = tl.load(cum_chunks + K_offsets).to(tl.int32)
+    if pid_chunk >= total:
+        return
+
+    # largest k with cum_chunks[k] <= pid_chunk (duplicates from empty
+    # segments converge past the empties — chunk ranges there are empty)
+    lo = 0
+    hi = K_offsets
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        cm = tl.load(cum_chunks + mid).to(tl.int32)
+        if cm <= pid_chunk:
+            lo = mid
+        else:
+            hi = mid
+    k_offset = lo
+    chunk_idx_within_k = pid_chunk - tl.load(cum_chunks + lo).to(tl.int32)
+    seg_start_k = tl.load(seg_offs + lo).to(tl.int32)
+    seg_end_k = tl.load(seg_offs + lo + 1).to(tl.int32)
+
+    l_offsets = seg_start_k + chunk_idx_within_k * L + tl.arange(0, L)
+    l_mask = l_offsets < seg_end_k
+
+    m_offsets = pid_m * BM + tl.arange(0, BM)
+    m_mask = m_offsets < M
+
+    bj = tl.load(b_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+    oi = tl.load(o_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+
+    acc = tl.zeros((L, BM), dtype=tl.float32)
+    for c0 in range(0, C, BC):
+        c_offsets = c0 + tl.arange(0, BC)
+        c_mask = c_offsets < C
+        x = tl.load(b + bj[:, None] * (G * C) + pid_g * C
+                    + c_offsets[None, :],
+                    mask=l_mask[:, None] & c_mask[None, :], other=0.0)
+        w = tl.load(a + k_offset.to(tl.int64) * stride_wk
+                    + pid_g * stride_wg
+                    + c_offsets[:, None] * stride_wc
+                    + m_offsets[None, :] * stride_wm,
+                    mask=c_mask[:, None] & m_mask[None, :], other=0.0)
+        acc = tl.dot(x, w, acc, input_precision=INPUT_PRECISION)
+
+    tl.atomic_add(o32 + oi[:, None] * (G * M) + pid_g * M
+                  + m_offsets[None, :], acc,
+                  mask=l_mask[:, None] & m_mask[None, :])
+
+
+@triton.jit
+def _tig_flat_fi1_kernel(
+    a, b, b_idx, o_idx, o, seg_offs, cum_chunks,
+    K_offsets, M, C, G,
+    stride_wk, stride_wg, stride_wc, stride_wm,
+    INPUT_PRECISION: tl.constexpr,
+    L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
+):
+    """The fan-in-1 (exactly-once scatter) flat kernel — plain
+    ``tl.store`` into a NATIVE-dtype uninitialized output instead of
+    fp32-zeros + atomicAdd + cast (3 output passes -> 1). Legal ONLY when
+    every output row receives exactly one triplet (the disjoint builders'
+    contract: deconv forward, partition grad_input) — routed via the
+    TigIndex ``exact_cover_*`` caller flags, never inferred. Chunk map by
+    bisection (any K)."""
+    num_pid_m = tl.cdiv(M, BM)
+    pid = tl.program_id(axis=0)
+    pid_m = pid % num_pid_m
+    pid_g = (pid // num_pid_m) % G
+    pid_chunk = pid // (num_pid_m * G)
+
+    total = tl.load(cum_chunks + K_offsets).to(tl.int32)
+    if pid_chunk >= total:
+        return
+    lo = 0
+    hi = K_offsets
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        cm = tl.load(cum_chunks + mid).to(tl.int32)
+        if cm <= pid_chunk:
+            lo = mid
+        else:
+            hi = mid
+    k_offset = lo
+    chunk_idx_within_k = pid_chunk - tl.load(cum_chunks + lo).to(tl.int32)
+    seg_start_k = tl.load(seg_offs + lo).to(tl.int32)
+    seg_end_k = tl.load(seg_offs + lo + 1).to(tl.int32)
+
+    l_offsets = seg_start_k + chunk_idx_within_k * L + tl.arange(0, L)
+    l_mask = l_offsets < seg_end_k
+
+    m_offsets = pid_m * BM + tl.arange(0, BM)
+    m_mask = m_offsets < M
+
+    bj = tl.load(b_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+    oi = tl.load(o_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+
+    acc = tl.zeros((L, BM), dtype=tl.float32)
+    for c0 in range(0, C, BC):
+        c_offsets = c0 + tl.arange(0, BC)
+        c_mask = c_offsets < C
+        x = tl.load(b + bj[:, None] * (G * C) + pid_g * C
+                    + c_offsets[None, :],
+                    mask=l_mask[:, None] & c_mask[None, :], other=0.0)
+        w = tl.load(a + k_offset.to(tl.int64) * stride_wk
+                    + pid_g * stride_wg
+                    + c_offsets[:, None] * stride_wc
+                    + m_offsets[None, :] * stride_wm,
+                    mask=c_mask[:, None] & m_mask[None, :], other=0.0)
+        acc = tl.dot(x, w, acc, input_precision=INPUT_PRECISION)
+
+    tl.store(o + oi[:, None] * (G * M) + pid_g * M + m_offsets[None, :],
+             acc.to(o.dtype.element_ty),
+             mask=l_mask[:, None] & m_mask[None, :])
+
+
+@triton.jit
 def _tig_flat_packed_kernel(
     a, b, b_idx, o_idx, o32, seg_offs,
     K_offsets, G,
@@ -317,6 +455,68 @@ def _tig_wgrad_kernel(
 
 
 @triton.jit
+def _tig_wgrad_bisect_kernel(
+    x, go, b_idx, o_idx, gw32, seg_offs, cum_chunks,
+    K_offsets, M, C, G,
+    INPUT_PRECISION: tl.constexpr,
+    L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
+):
+    """``_tig_wgrad_kernel`` with the binary-search chunk map
+    (see ``_tig_flat_bisect_kernel``) — routed at K > _BISECT_MIN_K."""
+    num_pid_c = tl.cdiv(C, BC)
+    num_pid_m = tl.cdiv(M, BM)
+    pid = tl.program_id(axis=0)
+    pid_m = pid % num_pid_m
+    pid = pid // num_pid_m
+    pid_c = pid % num_pid_c
+    pid = pid // num_pid_c
+    pid_g = pid % G
+    pid_chunk = pid // G
+
+    total = tl.load(cum_chunks + K_offsets).to(tl.int32)
+    if pid_chunk >= total:
+        return
+    lo = 0
+    hi = K_offsets
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        cm = tl.load(cum_chunks + mid).to(tl.int32)
+        if cm <= pid_chunk:
+            lo = mid
+        else:
+            hi = mid
+    k_offset = lo
+    chunk_idx_within_k = pid_chunk - tl.load(cum_chunks + lo).to(tl.int32)
+    seg_start_k = tl.load(seg_offs + lo).to(tl.int32)
+    seg_end_k = tl.load(seg_offs + lo + 1).to(tl.int32)
+
+    l_offsets = seg_start_k + chunk_idx_within_k * L + tl.arange(0, L)
+    l_mask = l_offsets < seg_end_k
+
+    c_offsets = pid_c * BC + tl.arange(0, BC)
+    m_offsets = pid_m * BM + tl.arange(0, BM)
+    c_mask = c_offsets < C
+    m_mask = m_offsets < M
+
+    bj = tl.load(b_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+    oi = tl.load(o_idx + l_offsets, mask=l_mask, other=0).to(tl.int64)
+
+    xb = tl.load(x + bj[:, None] * (G * C) + pid_g * C
+                 + c_offsets[None, :],
+                 mask=l_mask[:, None] & c_mask[None, :], other=0.0)
+    gb = tl.load(go + oi[:, None] * (G * M) + pid_g * M
+                 + m_offsets[None, :],
+                 mask=l_mask[:, None] & m_mask[None, :], other=0.0)
+    acc = tl.dot(tl.trans(xb), gb, input_precision=INPUT_PRECISION,
+                 out_dtype=tl.float32)
+
+    tl.atomic_add(gw32 + k_offset.to(tl.int64) * (G * C * M)
+                  + pid_g * (C * M)
+                  + c_offsets[:, None] * M + m_offsets[None, :], acc,
+                  mask=c_mask[:, None] & m_mask[None, :])
+
+
+@triton.jit
 def _tig_wgrad_packed_kernel(
     x, go, b_idx, o_idx, gw32, seg_offs,
     K_offsets, G,
@@ -474,9 +674,27 @@ class TigIndex:
 
     def __init__(self, i: torch.Tensor, j: torch.Tensor, k: torch.Tensor,
                  n_out: int, num_kernel_offsets: int = 27,
-                 build_hybrid: bool = True, assume_sorted: bool = False):
+                 build_hybrid: bool = True, assume_sorted: bool = False,
+                 n_in: Optional[int] = None,
+                 exact_cover_out: bool = False,
+                 exact_cover_in: bool = False,
+                 uniform_seg_len: Optional[int] = None):
         dev = i.device
+        # caller-asserted exactly-once-scatter contracts (the
+        # disjoint builders own them; NEVER inferred — verification would
+        # cost a device sync). exact_cover_out: every output row receives
+        # exactly one triplet (fan-in-1 deconv forward) -> the FI1 plain-
+        # store forward. exact_cover_in: every input row appears in
+        # exactly one triplet (partition fan-out-1) -> FI1 grad_input.
+        self.exact_cover_out = bool(exact_cover_out)
+        self.exact_cover_in = bool(exact_cover_in)
         self.N = int(n_out)
+        # input-side row count, used to size
+        # grad_input. Defaults to n_out — the submanifold case — so every
+        # existing caller is byte-unchanged. For generative convs
+        # (N_in != N_out: strided partition / fan-in-1 deconv) pass the
+        # input point count explicitly.
+        self.N_in = int(n_in) if n_in is not None else self.N
         self.K = int(num_kernel_offsets)
         self.T = int(i.numel())
         i = i.long()
@@ -493,7 +711,20 @@ class TigIndex:
         # as-is (no .int() copy; T-length copies cost ~0.1 ms at enc0)
         self.flat_i = i
         self.flat_j = j
-        self.flat_seg = kernel_offset_segments(k, self.K)
+        # uniform segments (caller contract — e.g. the stamp
+        # generator's k-sorted rulebook has EXACTLY uniform_seg_len
+        # triplets per tap): seg_offs is closed-form, no searchsorted.
+        self.uniform_seg_len = (int(uniform_seg_len)
+                                if uniform_seg_len is not None else None)
+        if self.uniform_seg_len is not None:
+            assert self.uniform_seg_len * self.K == self.T, (
+                f"uniform_seg_len {self.uniform_seg_len} * K {self.K} "
+                f"!= T {self.T}")
+            self.flat_seg = (torch.arange(self.K + 1, device=dev,
+                                          dtype=torch.int64)
+                             * self.uniform_seg_len)
+        else:
+            self.flat_seg = kernel_offset_segments(k, self.K)
 
         self._tilemask_cache: dict = {}
         self._chunks_cache: dict = {}
@@ -526,14 +757,40 @@ class TigIndex:
             self._mbits_sorted = mbits[perm]
             self.has_hybrid = True
 
+    def chunk_table(self, which: str, L: int) -> torch.Tensor:
+        """(K+1,) int32 cumulative chunk table for the bisect
+        kernel — cum[k] = sum over k' < k of ceil(seg_len_k' / L). Built
+        device-side (no D2H sync) once per (orientation, L) and cached."""
+        key = ("cumtab", which, L)
+        t = self._chunks_cache.get(key)
+        if t is None:
+            if which == "flat" and self.uniform_seg_len is not None:
+                # uniform-segment closed form — ceil(uniform/L) chunks per
+                # segment, one arange, no cumsum chain.
+                per = -(-self.uniform_seg_len // L)
+                t = (torch.arange(self.K + 1, device=self.flat_seg.device,
+                                  dtype=torch.int32) * per)
+            else:
+                seg = self.flat_seg if which == "flat" else self.res_seg
+                lens = seg[1:] - seg[:-1]
+                ch = torch.div(lens + (L - 1), L, rounding_mode="floor")
+                t = torch.zeros(seg.numel(), dtype=torch.int32,
+                                device=seg.device)
+                t[1:] = torch.cumsum(ch, 0).to(torch.int32)
+            self._chunks_cache[key] = t
+        return t
+
     def chunks(self, which: str, L: int) -> int:
         """Host-side chunk count for the flat kernel grid, cached so the
         per-call D2H sync happens once per (orientation, L)."""
         key = (which, L)
         n = self._chunks_cache.get(key)
         if n is None:
-            seg = self.flat_seg if which == "flat" else self.res_seg
-            n = _chunks(seg, L)
+            if which == "flat" and self.uniform_seg_len is not None:
+                n = self.K * -(-self.uniform_seg_len // L)  # closed form
+            else:
+                seg = self.flat_seg if which == "flat" else self.res_seg
+                n = _chunks(seg, L)
             self._chunks_cache[key] = n
         return n
 
@@ -553,6 +810,29 @@ class TigIndex:
             self._tilemask_cache[b1] = tm
         return tm
 
+
+# above this K the flat kernels' linear pid_chunk->k scan (K
+# iterations in EVERY program) dominates and the bisect variant routes
+# instead. 27 (3^3) and 125 (5^3) stay on the proven scan kernel; 512
+# (8^3, a generative stem) bisects. Threshold is structural, not tuned.
+_BISECT_MIN_K = 64
+
+_FI1_CC_CACHE: dict = {}
+
+
+def _fi1_wins_here() -> bool:
+    """Measured verdict: the FI1 plain-store forward wins on Ada (sm_89)
+    (1.6-2.7x fwd at the fan-in-1 deconv stages) but LOSES to the regular
+    atomic path on Hopper (sm_90) (up to 2.3x slower fwd — fp32 atomics +
+    bandwidth make the zeros/cast passes near-free). Honor the caller's
+    exact_cover flags only where the data says FI1 is the right engine;
+    per-arch, cached once per device."""
+    dev = torch.cuda.current_device()
+    hit = _FI1_CC_CACHE.get(dev)
+    if hit is None:
+        hit = torch.cuda.get_device_capability(dev) < (9, 0)
+        _FI1_CC_CACHE[dev] = hit
+    return hit
 
 # ── config buckets (channel-keyed only — never N/T) ─────────────────────────
 
@@ -660,6 +940,10 @@ def tig_forward(
         K, C, M = weight.shape
         G = 1
     assert K == index.K and feat.size(1) == G * C
+    # feat rows are the input side (gathered by j); for
+    # generative indices this differs from the output count index.N.
+    assert feat.size(0) == index.N_in, (
+        f"feat rows {feat.size(0)} != index.N_in {index.N_in}")
     weight = weight.contiguous()
     feat = feat.contiguous()
     N = index.N
@@ -671,6 +955,25 @@ def tig_forward(
 
     o32 = torch.zeros(N, G * M, device=feat.device, dtype=torch.float32)
     num_pid_m_of = lambda BM: triton.cdiv(M, BM)
+
+    if mode == "flat" and index.exact_cover_out and _fi1_wins_here():
+        # exactly-once scatter — single pass, native dtype,
+        # no fp32 staging buffer, no atomics, no cast pass. Arch-gated
+        # (sm_89 wins / sm_90 loses — see _fi1_wins_here).
+        cfg = dict(_flat_cfg(C, M), **(flat_cfg or {}))
+        w = cfg.pop("num_warps")
+        out = torch.empty(N, G * M, device=feat.device, dtype=feat.dtype)
+        if index.T:
+            grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
+                    * num_pid_m_of(cfg["BM"]),)
+            _tig_flat_fi1_kernel[grid](
+                weight, feat, index.flat_j, index.flat_i, out,
+                index.flat_seg, index.chunk_table("flat", cfg["L"]),
+                K, M, C, G, G * C * M, C * M, M, 1,
+                INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+        else:
+            out.zero_()
+        return out
 
     if mode == "flat":
         gp = _packed_gp(G, C, M) if flat_cfg is None else None
@@ -690,10 +993,18 @@ def tig_forward(
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * num_pid_m_of(cfg["BM"]),)
         if index.T:
-            _tig_flat_kernel[grid](
-                weight, feat, index.flat_j, index.flat_i, o32, index.flat_seg,
-                K, M, C, G, G * C * M, C * M, M, 1,
-                INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+            if K > _BISECT_MIN_K:  # large-K (e.g. 8^3 stem): bisect
+                _tig_flat_bisect_kernel[grid](
+                    weight, feat, index.flat_j, index.flat_i, o32,
+                    index.flat_seg, index.chunk_table("flat", cfg["L"]),
+                    K, M, C, G, G * C * M, C * M, M, 1,
+                    INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+            else:
+                _tig_flat_kernel[grid](
+                    weight, feat, index.flat_j, index.flat_i, o32,
+                    index.flat_seg,
+                    K, M, C, G, G * C * M, C * M, M, 1,
+                    INPUT_PRECISION=input_precision, num_warps=w, **cfg)
     elif mode == "hybrid":
         l0 = dict(_l0_cfg(C, M), **(l0_cfg or {}))
         w0 = l0.pop("num_warps")
@@ -740,15 +1051,38 @@ def tig_grad_input(
 ) -> torch.Tensor:
     """grad_feat[j] += grad_out[i] @ W[k]^T — the SAME flat kernel with
     gather/scatter roles swapped and the weight transposed via strides
-    (zero-copy, no staging). Scope: N_in == N_out (submanifold)."""
+    (zero-copy, no staging). Sized by ``index.N_in`` so generative
+    convs (N_in != N_out) get a correctly-shaped grad; for submanifold
+    indices N_in == N (unchanged behavior)."""
     if weight.dim() == 4:
         K, G, C, M = weight.shape
     else:
         K, C, M = weight.shape
         G = 1
+    assert grad_out.size(0) == index.N, (
+        f"grad_out rows {grad_out.size(0)} != index.N {index.N}")
     weight = weight.contiguous()
     grad_out = grad_out.contiguous()
-    N = index.N
+    N = index.N_in
+    if index.exact_cover_in and _fi1_wins_here():
+        # each input row appears in exactly one triplet
+        # (partition fan-out-1) — grad_input is a pure exactly-once
+        # scatter: single pass, native dtype, no fp32 buffer/atomics/cast.
+        cfg = dict(_gi_cfg(C, M), **(flat_cfg or {}))
+        w = cfg.pop("num_warps")
+        out = torch.empty(N, G * C, device=grad_out.device,
+                          dtype=grad_out.dtype)
+        if index.T:
+            grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
+                    * triton.cdiv(C, cfg["BM"]),)
+            _tig_flat_fi1_kernel[grid](
+                weight, grad_out, index.flat_i, index.flat_j, out,
+                index.flat_seg, index.chunk_table("flat", cfg["L"]),
+                K, C, M, G, G * C * M, C * M, 1, M,
+                INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+        else:
+            out.zero_()
+        return out
     # roles per group: INW=M (gather grad_out rows by i), OUTW=C (scatter
     # by j); logical W'[k, g, m, c] = W[k, g, c, m] -> wc-stride 1, wm-stride M
     o32 = torch.zeros(N, G * C, device=grad_out.device, dtype=torch.float32)
@@ -768,10 +1102,18 @@ def tig_grad_input(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BM"]),)
-        _tig_flat_kernel[grid](
-            weight, grad_out, index.flat_i, index.flat_j, o32, index.flat_seg,
-            K, C, M, G, G * C * M, C * M, 1, M,
-            INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+        if K > _BISECT_MIN_K:  # large-K: bisect (see tig_forward)
+            _tig_flat_bisect_kernel[grid](
+                weight, grad_out, index.flat_i, index.flat_j, o32,
+                index.flat_seg, index.chunk_table("flat", cfg["L"]),
+                K, C, M, G, G * C * M, C * M, 1, M,
+                INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+        else:
+            _tig_flat_kernel[grid](
+                weight, grad_out, index.flat_i, index.flat_j, o32,
+                index.flat_seg,
+                K, C, M, G, G * C * M, C * M, 1, M,
+                INPUT_PRECISION=input_precision, num_warps=w, **cfg)
     return o32.to(grad_out.dtype)
 
 
@@ -821,9 +1163,18 @@ def tig_grad_weight(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BC"]) * triton.cdiv(M, cfg["BM"]),)
-        _tig_wgrad_kernel[grid](
-            feat, grad_out, index.flat_j, index.flat_i, gw32, index.flat_seg,
-            K, M, C, G, INPUT_PRECISION=input_precision, num_warps=w, **cfg)
+        if K > _BISECT_MIN_K:  # large-K: bisect (see tig_forward)
+            _tig_wgrad_bisect_kernel[grid](
+                feat, grad_out, index.flat_j, index.flat_i, gw32,
+                index.flat_seg, index.chunk_table("flat", cfg["L"]),
+                K, M, C, G, INPUT_PRECISION=input_precision,
+                num_warps=w, **cfg)
+        else:
+            _tig_wgrad_kernel[grid](
+                feat, grad_out, index.flat_j, index.flat_i, gw32,
+                index.flat_seg,
+                K, M, C, G, INPUT_PRECISION=input_precision,
+                num_warps=w, **cfg)
     gw = gw32.to(feat.dtype)
     return (gw.view(weight_shape) if len(weight_shape) == 4
             else gw.view(K, C, M))
@@ -851,7 +1202,7 @@ def tig_backward_fused(
     grad_out = grad_out.contiguous()
     c = dict(_wgrad_cfg(C, M, feat.dtype), **(cfg or {}))
     w = c.pop("num_warps")
-    gx32 = torch.zeros(index.N, G * C, device=feat.device,
+    gx32 = torch.zeros(index.N_in, G * C, device=feat.device,
                        dtype=torch.float32)
     gw32 = torch.zeros(K, G, C, M, device=feat.device, dtype=torch.float32)
     if index.T:

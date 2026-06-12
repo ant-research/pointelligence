@@ -1216,15 +1216,16 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
     and G in {1, 4}.
     """
 
-    def _run_stage(self, C_in, C_out, mode, groups=1):
+    def _run_stage(self, C_in, C_out, mode, groups=1, n_b=200, n_o=200):
         """One PointConv3d fwd+bwd at (C_in,C_out,groups) under `mode`;
-        returns (out, grad_w, grad_x, fused_calls, tig_calls)."""
+        returns (out, grad_w, grad_x, fused_calls, tig_calls).
+        n_b != n_o exercises the GENERATIVE route."""
         import sparse_engines.mvmr_cutlass as _mc
         import sparse_engines.tig as _tig
         from layers.conv import PointConv3d
 
         device = "cuda"
-        N_b, N_o, K_offsets, T = 200, 200, 27, 1_700
+        N_b, N_o, K_offsets, T = n_b, n_o, 27, 1_700
 
         torch.manual_seed(0)
         x0 = (torch.randn(N_b, C_in, device=device,
@@ -1296,6 +1297,38 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                 ga = _rel_err(gw_a, gw_ref)
                 gb = _rel_err(gx_a, gx_ref)
                 print(f"  AUTO-ROUTER [{label}] tig=YES fused=no "
+                      f"fwd={fwd:.3e} grad_a={ga:.3e} grad_b={gb:.3e}")
+                self.assertLess(fwd, 1e-2, f"{label}: fwd {fwd:.3e}")
+                self.assertLess(ga, 1e-2, f"{label}: grad_a {ga:.3e}")
+                self.assertLess(gb, 1e-2, f"{label}: grad_b {gb:.3e}")
+
+        # GENERATIVE cells (N_in != N_out) — the submanifold gate is
+        # retired; "auto" must route TIG here too, grad_x must be
+        # INPUT-sided, and parity vs the independent force_fsg reference
+        # must hold (this is the exact class that crashed under the
+        # submanifold-gated router: "_TigMvmrBackward returned an
+        # invalid gradient").
+        GEN_STAGES = [
+            (64, 256, 1, 400, 120, "generative down (stem-like)"),
+            (256, 64, 1, 120, 400, "generative up (deconv-like)"),
+        ]
+        for C_in, C_out, G, n_b, n_o, label in GEN_STAGES:
+            with self.subTest(stage=label):
+                out_ref, gw_ref, gx_ref, nf_ref, nt_ref = self._run_stage(
+                    C_in, C_out, "force_fsg", groups=G, n_b=n_b, n_o=n_o)
+                self.assertEqual(nt_ref, 0)
+                out_a, gw_a, gx_a, nf_auto, nt_auto = self._run_stage(
+                    C_in, C_out, "auto", groups=G, n_b=n_b, n_o=n_o)
+                self.assertEqual(nf_auto, 0, f"{label}: fused under auto")
+                self.assertEqual(nt_auto, 1,
+                    f"{label}: 'auto' MUST route TIG on the generative "
+                    f"shape (spy={nt_auto})")
+                self.assertEqual(gx_a.shape, (n_b, C_in),
+                    f"{label}: grad_x must be input-sided")
+                fwd = _rel_err(out_a, out_ref)
+                ga = _rel_err(gw_a, gw_ref)
+                gb = _rel_err(gx_a, gx_ref)
+                print(f"  AUTO-ROUTER-GEN [{label}] tig=YES "
                       f"fwd={fwd:.3e} grad_a={ga:.3e} grad_b={gb:.3e}")
                 self.assertLess(fwd, 1e-2, f"{label}: fwd {fwd:.3e}")
                 self.assertLess(ga, 1e-2, f"{label}: grad_a {ga:.3e}")
