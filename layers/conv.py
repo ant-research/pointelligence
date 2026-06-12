@@ -309,17 +309,48 @@ class GeneralConv(Module):
             # above via the memoized check, so assume_sorted holds).
             from sparse_engines.tig import TigIndex, tig_mvmr
 
-            idx = TigIndex(i, j, k, n, weight.shape[0],
-                            build_hybrid=False, assume_sorted=True,
-                            n_in=input_3d.shape[0],
-                            uniform_seg_len=(tig_hint or {}).get(
-                                "uniform_seg_len"),
-                            exact_cover_out=(tig_hint or {}).get(
-                                "exact_cover_out", False))
-            output = tig_mvmr(
-                weight, input_3d.view(input_3d.shape[0], -1), idx,
-                input_precision=current_precision(),
-            ).view(-1, self.groups, self.out_channels // self.groups)
+            _eco = (tig_hint or {}).get("exact_cover_out", False)
+            if not _eco and tig_hint is None and k.numel() == n:
+                from sparse_engines._seg_offs import exact_cover_cached
+                _eco = exact_cover_cached(i, n)
+            # The input-side twin: fan-out-1 (every input row in exactly
+            # one triplet — the disjoint-partition stem class). T == N_in
+            # is the free host gate (submanifold and deconv shapes fail
+            # it); the same memoized bincount proof on j then sets
+            # exact_cover_in (FI1 grad_input where that wins) and, at
+            # large K, routes the dense-GEMM partition engine (measured
+            # 3-8x at the K>=512 patchify-stem shapes on both Ada and
+            # Hopper; the dense z is ~(1/occupancy)*input bytes —
+            # hard-capped at 256 MB).
+            _n_in_rows = input_3d.shape[0]
+            _eci = (tig_hint or {}).get("exact_cover_in", False)
+            if (not _eci and tig_hint is None
+                    and k.numel() == _n_in_rows and k.numel() != n):
+                from sparse_engines._seg_offs import exact_cover_cached
+                _eci = exact_cover_cached(j, _n_in_rows)
+            _K = weight.shape[0]
+            if (_eci and self.groups == 1 and _K > 64
+                    and n * _K * self.in_channels * input.element_size()
+                    <= 256 * 2 ** 20):
+                from sparse_engines.partition_gemm import (
+                    partition_dense_mvmr)
+
+                output = partition_dense_mvmr(
+                    weight, input_3d.view(_n_in_rows, -1), i, j, k, n,
+                ).view(-1, self.groups, self.out_channels // self.groups)
+            else:
+                idx = TigIndex(i, j, k, n, _K,
+                                build_hybrid=False, assume_sorted=True,
+                                n_in=_n_in_rows,
+                                uniform_seg_len=(tig_hint or {}).get(
+                                    "uniform_seg_len"),
+                                exact_cover_out=_eco,
+                                exact_cover_in=_eci)
+                output = tig_mvmr(
+                    weight, input_3d.view(_n_in_rows, -1), idx,
+                    input_precision=current_precision(),
+                ).view(-1, self.groups,
+                       self.out_channels // self.groups)
         else:
             output = sparse_matrix_vector_multiplication_reduction(weight, k, input_3d, j, i, n)
 
@@ -357,8 +388,14 @@ class PointConv3d(GeneralConv):
             **factory_kwargs,
         )
 
-    def forward(self, input: Tensor, i: Tensor, j: Tensor, k: Tensor, n: int) -> Tensor:
-        return self._conv_forward(input, i, j, k, n, self.weight, self.bias)
+    def forward(self, input: Tensor, i: Tensor, j: Tensor, k: Tensor, n: int,
+                tig_hint: Optional[dict] = None) -> Tensor:
+        # Forward the caller's structure contract (e.g. exact_cover_out
+        # for an exact 2**3 octant deconv) to the dispatcher so `auto`
+        # reaches the single-pass store + native-fp16 grad paths. None
+        # (the default) preserves prior behavior bit-for-bit.
+        return self._conv_forward(input, i, j, k, n, self.weight, self.bias,
+                                  tig_hint=tig_hint)
 
 
 def conv_with_stride(

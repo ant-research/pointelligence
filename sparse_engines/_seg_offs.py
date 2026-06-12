@@ -157,3 +157,29 @@ def total_chunks_for_lchunks(
         ((seg_lens + lc - 1) // lc).sum() for lc in l_chunk_options
     ])
     return tuple(int(x) for x in sums.cpu().tolist())
+
+_EXACT_COVER_CACHE: dict = {}
+_EXACT_COVER_CACHE_MAX = 256
+
+
+def exact_cover_cached(idx, n: int) -> bool:
+    """Exactly-once-scatter proof with a verdict memo (the is_sorted_cached
+    pattern): True iff ``idx`` is a permutation of ``[0, n)``. Callers gate
+    on the FREE host check ``idx.numel() == n`` first — with that, a
+    bincount max of 1 proves every output row is written exactly once
+    (counts sum to n with every count <= 1 => all counts == 1). Used by the
+    dispatcher to route exactly-once fast paths WITHOUT trusting a caller
+    contract; one device reduction + host sync per fresh rulebook.
+    """
+    if idx.numel() != n:
+        return False
+    key = (idx.data_ptr(), idx._version, n)
+    hit = _EXACT_COVER_CACHE.get(key)
+    if hit is not None:
+        return hit
+    import torch
+    verdict = bool((torch.bincount(idx.long(), minlength=n).max() <= 1).item())
+    if len(_EXACT_COVER_CACHE) >= _EXACT_COVER_CACHE_MAX:
+        _EXACT_COVER_CACHE.pop(next(iter(_EXACT_COVER_CACHE)))
+    _EXACT_COVER_CACHE[key] = verdict
+    return verdict

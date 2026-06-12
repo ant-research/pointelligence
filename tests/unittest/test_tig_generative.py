@@ -324,3 +324,120 @@ def test_submanifold_default_unchanged():
     out = tig_mvmr(w, x, idx, mode="flat")
     out.sum().backward()
     assert x.grad.shape == (n, c) and out.shape == (n, m)
+
+
+def test_pc_auto_deconv_fast_paths():
+    """pc-auto fix: exact-cover deconvs through PLAIN PointConv3d.forward
+    must reach the single-pass store and native-fp16 grad paths under `auto` — (a) via an explicit
+    tig_hint, (b) via dispatcher AUTO-DETECTION (T == n + bincount(i)
+    proves exact-cover; no caller trust), and (c) a same-T non-exact-cover
+    rulebook must NOT detect (the silent-corruption safety case)."""
+    import sparse_engines.tig as _tig
+    from layers.conv import PointConv3d
+    from sparse_engines._dispatch_override import dispatch_mode
+
+    torch.manual_seed(0)
+    n_in, n_out, kk, c, m = 7800, 31000, 8, 64, 64
+    i, j, k, n_o, n_i = _fanin1_triplets(n_out, kk, n_in)
+    conv = PointConv3d(c, m, kernel_size=2, bias=False, device=device,
+                       dtype=torch.float16)
+    x = torch.randn(n_i, c, device=device, dtype=torch.float16)
+
+    def run(hint, mutate_i=None):
+        ii = i if mutate_i is None else mutate_i
+        spy = [0]
+        real = _tig.tig_mvmr
+        def spy_fn(w, f, idx, **kw):
+            spy[0] += int(idx.exact_cover_out)
+            return real(w, f, idx, **kw)
+        _tig.tig_mvmr = spy_fn
+        try:
+            xg = x.clone().requires_grad_(True)
+            with dispatch_mode("auto"):
+                out = conv(xg, ii, j, k, n_o, tig_hint=hint)
+                out.sum().backward()
+        finally:
+            _tig.tig_mvmr = real
+        return out.detach(), xg.grad, conv.weight.grad.clone(), spy[0]
+
+    out_ref, gx_ref, gw_ref, flag_ref = run(None, mutate_i=None)  # baseline first
+    # (a) explicit hint routes the fast paths
+    out_h, gx_h, gw_h, flag_h = run(dict(exact_cover_out=True))
+    assert flag_h == 1, "hint must reach the dispatcher (plumb-through)"
+    assert _rel(out_h, out_ref) == 0.0, "FI1/regular fwd must be bit-equal"
+    assert _rel(gx_h, gx_ref) <= 5e-3
+    # (b) AUTO-DETECT: plain call, no hint — dispatcher must prove
+    # exact-cover itself (T == n + permutation) and set the flag
+    assert flag_ref == 1, (
+        "auto-detect must set exact_cover_out for a provable exact-cover "
+        f"deconv through plain forward (got flag={flag_ref})")
+    # (c) safety: same T == n but one output covered twice -> NOT exact
+    # cover -> must NOT detect
+    i_bad = i.clone()
+    i_bad[0] = i_bad[1]  # duplicate one output row, another now uncovered
+    _, _, _, flag_bad = run(None, mutate_i=i_bad)
+    assert flag_bad == 0, "non-exact-cover rulebook must never detect"
+
+
+def test_pc_auto_partition_dense_route():
+    """Sweep follow-up: the dense-GEMM partition path (the partition stem's 4-8x
+    engine) must be reachable from PLAIN PointConv3d.forward under `auto`
+    — auto-detected fan-out-1 (T == N_in + bincount(j) proof) at large K
+    routes partition_dense_mvmr; small-K fan-out-1 sets exact_cover_in
+    (the FI1 grad_input contract) but does NOT take the dense route."""
+    import sparse_engines.partition_gemm as pg
+    from layers.conv import PointConv3d
+    from sparse_engines._dispatch_override import dispatch_mode
+
+    torch.manual_seed(0)
+    # stem-shaped: K=512 partition, every input exactly one triplet
+    i, j, k, n_out, n_in = _partition_triplets(80000, 512, 1900)
+    conv = PointConv3d(7, 256, kernel_size=8, bias=False, device=device,
+                       dtype=torch.float16)
+    x = torch.randn(n_in, 7, device=device, dtype=torch.float16)
+
+    spy = [0]
+    real = pg.partition_dense_mvmr
+    def spy_fn(*a, **kw):
+        spy[0] += 1
+        return real(*a, **kw)
+    import layers.conv as lc
+    pg.partition_dense_mvmr = spy_fn
+    try:
+        xg = x.clone().requires_grad_(True)
+        with dispatch_mode("auto"):
+            out = conv(xg, i, j, k, n_out)
+            out.sum().backward()
+    finally:
+        pg.partition_dense_mvmr = real
+    assert spy[0] >= 1, (
+        f"plain-forward stem must auto-route the dense partition path "
+        f"(spy={spy[0]})")
+    assert out.shape == (n_out, 256) and xg.grad.shape == (n_in, 7)
+
+    # parity vs the suppressed (generic TIG) route
+    xg2 = x.clone().requires_grad_(True)
+    conv.weight.grad = None
+    gw_dense = None
+    with dispatch_mode("auto"):
+        out2 = conv(xg2, i, j, k, n_out,
+                    tig_hint=dict(exact_cover_out=False))  # hint suppresses detection
+        out2.sum().backward()
+    assert _rel(out, out2) <= 5e-3
+    assert _rel(xg.grad, xg2.grad) <= 5e-3
+
+    # small-K fan-out-1: no dense route (K gate), grads still correct
+    i2, j2, k2, n_o2, n_i2 = _partition_triplets(4000, 27, 300)
+    conv2 = PointConv3d(16, 32, kernel_size=3, bias=False, device=device,
+                        dtype=torch.float16)
+    x2 = torch.randn(n_i2, 16, device=device, dtype=torch.float16)
+    spy[0] = 0
+    pg.partition_dense_mvmr = spy_fn
+    try:
+        xg3 = x2.clone().requires_grad_(True)
+        with dispatch_mode("auto"):
+            conv2(xg3, i2, j2, k2, n_o2).sum().backward()
+    finally:
+        pg.partition_dense_mvmr = real
+    assert spy[0] == 0, "small-K fan-out-1 must NOT take the dense route"
+    assert xg3.grad.shape == (n_i2, 16)
