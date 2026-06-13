@@ -160,7 +160,7 @@ def radius_search_lookup(
     num_points, num_queries = points.shape[0], queries.shape[0]
 
     shift_on_points = num_points < num_queries
-    
+
     p_grid_inds = compute_grid_indices(points, 2 * radius, sample_inds, with_shifts=shift_on_points)
     q_grid_inds = compute_grid_indices(
         queries, 2 * radius, query_sample_inds, with_shifts=not shift_on_points
@@ -178,7 +178,7 @@ def radius_search_lookup(
         lookup_struct, q_lookup_inds = build_lookup_struct(q_grid_inds)
         del q_grid_inds
         p_lookup_inds, p_mask = query_lookup_struct(lookup_struct, p_grid_inds)
-        del p_grid_inds 
+        del p_grid_inds
     lookup_struct_size = lookup_struct.size()
     del lookup_struct
 
@@ -500,6 +500,8 @@ def radius_search(
     query_sample_sizes=None,
     distance_type="ball",
     tiled_batch_threshold=20000,
+    grid_size=None,
+    tiled_radius_multiplier_threshold=4.5,
 ):
     """Top-level entry point for fixed-radius neighbor search.
 
@@ -540,7 +542,9 @@ def radius_search(
 
     # Choose backend based on per-batch size
     use_tiled = False
-    if sample_inds is not None and tiled_batch_threshold > 0:
+    if grid_size is not None and (radius / grid_size) >= tiled_radius_multiplier_threshold:
+        use_tiled = True
+    elif sample_inds is not None and tiled_batch_threshold > 0:
         _sample_sizes = (
             sample_sizes if sample_sizes is not None else torch.bincount(sample_inds)
         )
@@ -549,10 +553,12 @@ def radius_search(
             if query_sample_sizes is not None
             else torch.bincount(query_sample_inds)
         )
-        max_batch = max(
-            _sample_sizes.max().item(),
-            _query_sample_sizes.max().item(),
-        )
+        # One D2H sync for the backend-select scalar instead of two: the
+        # builders are host-bound (per-stage dispatch), so each .item() is a
+        # hard host↔GPU serialization that idles the GPU under CPU contention.
+        # max(a.max(), b.max()) == max(stack(a.max(), b.max())) — bit-identical.
+        max_batch = int(torch.maximum(
+            _sample_sizes.max(), _query_sample_sizes.max()).item())
         use_tiled = max_batch <= tiled_batch_threshold
     elif sample_inds is None:
         use_tiled = point_num <= tiled_batch_threshold

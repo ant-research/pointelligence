@@ -9,6 +9,7 @@ from functools import partial
 from typing import Tuple, Callable, Optional
 
 import math
+import weakref
 import torch
 
 from torch import Tensor
@@ -17,9 +18,89 @@ from torch.nn.modules.utils import _triple
 
 from internals.neighbors import radius_search
 from internals.indexing import cumsum_exclusive, repeat_interleave_indices
+from internals.triplet_cache import _active_cache, triplet_key
 
 from .metadata import MetaData
 from .downsample import downsample
+from .contract import TripletContract
+
+
+def _build_triplets_from_neighbor_pairs(
+    points: Tensor,
+    query_points: Tensor,
+    neighbor_indices: Tensor,
+    num_neighbors: Tensor,
+    kernel_indexer: Callable,
+    neighbor_radius: float,
+    radius_scaler: float,
+    sort_by: str,
+    return_num_neighbors: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Shared post-radius-search triplet construction.
+
+    ``build_triplets`` (which calls ``radius_search``) hands off to this
+    helper for the cumsum + repeat_interleave + offset + kernel_indexer +
+    sort + dtype-norm steps. Behavior matches the original inlined logic
+    in ``build_triplets`` line-for-line.
+
+    Internally wraps in ``torch.no_grad()`` — caller does NOT need
+    to be inside a no_grad block.
+    """
+    with torch.no_grad():
+        assert torch.min(num_neighbors) > 0, (
+            "Neighborhood search failed for some points, consider increase the neighbor_radius. "
+            "It is likely that this happens in an *upsample* phase, "
+            "where the *query_points* are not a subset of the *points*."
+        )
+
+        num_neighbors_cumsum, repeats_sum = cumsum_exclusive(
+            num_neighbors, return_sum=True
+        )
+        center_indices = repeat_interleave_indices(
+            repeats_cumsum=num_neighbors_cumsum, output_size=repeats_sum
+        )
+
+        offsets = (points[neighbor_indices] - query_points[center_indices])
+
+        i = center_indices
+        j = neighbor_indices
+        k = kernel_indexer(points=offsets, grid_size=neighbor_radius / radius_scaler)
+
+        if "i" == sort_by:
+            pass
+        elif "j" == sort_by:
+            j, sorter = torch.sort(j)
+            i = i[sorter]
+            k = k[sorter]
+        elif "k" == sort_by:
+            k, sorter = torch.sort(k)
+            i = i[sorter]
+            j = j[sorter]
+        else:
+            assert (
+                False
+            ), f'Unknown sort_by argument "{sort_by}", it should be i, j, or k!'
+
+        # Normalize all triplet indices to a consistent dtype.
+        # The upstream code paths produce mixed dtypes (i: int64 from cumsum,
+        # j: int32 from radius_search, k: int64 from torch.sum promotion).
+        # Triton's autotuner keys on pointer dtypes, so mixed dtypes cause
+        # redundant cache entries and mid-training autotune stalls.
+        # Use int32 when safe, int64 otherwise. We check point counts
+        # (already CPU ints) as upper bounds instead of calling .max().item()
+        # which would force GPU→CPU syncs.
+        _INT32_MAX = 2147483647
+        max_possible = max(query_points.shape[0], points.shape[0])
+        idx_dtype = torch.int32 if max_possible <= _INT32_MAX else torch.int64
+        i = i.to(idx_dtype)
+        j = j.to(idx_dtype)
+        k = k.to(idx_dtype)
+
+        if return_num_neighbors:
+            return i, j, k, num_neighbors
+        else:
+            return i, j, k, None
+
 
 def voxelize_3d(
     kernel_size: _size_3_t,
@@ -50,7 +131,7 @@ def build_triplets(
     query_sample_sizes: Optional[Tensor] = None,
     sort_by: str = "k",
     return_num_neighbors=False,
-    radius_scaler: float=None,
+    radius_scaler: Optional[float] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor | None]:
     with torch.no_grad():
         # They have to be all None, or all not None
@@ -66,6 +147,23 @@ def build_triplets(
             query_sample_inds = sample_inds
             query_sample_sizes = sample_sizes
 
+        cache = _active_cache()
+        key = None
+        if cache is not None:
+            key = triplet_key(
+                points, query_points, neighbor_radius, radius_scaler,
+                sort_by, return_num_neighbors, sample_inds,
+                query_sample_inds, kernel_indexer,
+            )
+            if key is not None:           # None => uncacheable indexer; just build
+                hit = cache.get(key)
+                if hit is not None:
+                    cached_out, pref = hit
+                    if pref() is not None:   # keyed tensor alive => addr not recycled
+                        return cached_out
+                    # stale (data_ptr recycled): fall through, rebuild, overwrite
+
+        grid_size = neighbor_radius / radius_scaler if radius_scaler is not None else None
         neighbor_indices, num_neighbors = radius_search(
             points=points,
             query_points=query_points,
@@ -74,68 +172,33 @@ def build_triplets(
             sample_sizes=sample_sizes,
             query_sample_inds=query_sample_inds,
             query_sample_sizes=query_sample_sizes,
+            grid_size=grid_size,
         )
 
-        assert torch.min(num_neighbors) > 0, (
-            "Neighborhood search failed for some points, consider increase the neighbor_radius. "
-            "It is likely that this happens in an *upsample* phase, "
-            "where the *query_points* are not a subset of the *points*."
-        )
-
-        num_neighbors_cumsum, repeats_sum = cumsum_exclusive(
-            num_neighbors, return_sum=True
-        )
-        center_indices = repeat_interleave_indices(
-            repeats_cumsum=num_neighbors_cumsum, output_size=repeats_sum
-        )
-
-        # Calculate actual offsets (not normalized)
-        # The voxelize_3d function will handle normalization internally
-        offsets = (points[neighbor_indices] - query_points[center_indices])
-
-        i = center_indices
-        j = neighbor_indices
-        k = kernel_indexer(points=offsets, grid_size=neighbor_radius / radius_scaler)
-
-        if "i" == sort_by:
-            # The indices from radius_search are already sorted by i,
-            # so the sorting could be skipped here.
-            pass
-            # i, sorter = torch.sort(i)
-            # j = j[sorter]
-            # k = k[sorter]
-        elif "j" == sort_by:
-            j, sorter = torch.sort(j)
-            i = i[sorter]
-            k = k[sorter]
-        elif "k" == sort_by:
-            k, sorter = torch.sort(k)
-            i = i[sorter]
-            j = j[sorter]
-        else:
-            assert (
-                False
-            ), f'Unknown sort_by argument "{sort_by}", it should be i, j, or k!'
-
-        # Normalize all triplet indices to a consistent dtype.
-        # The upstream code paths produce mixed dtypes (i: int64 from cumsum,
-        # j: int32 from radius_search, k: int64 from torch.sum promotion).
-        # Triton's autotuner keys on pointer dtypes, so mixed dtypes cause
-        # redundant cache entries and mid-training autotune stalls.
-        # Use int32 when safe, int64 otherwise. We check point counts
-        # (already CPU ints) as upper bounds instead of calling .max().item()
-        # which would force GPU→CPU syncs.
-        _INT32_MAX = 2147483647
-        max_possible = max(query_points.shape[0], points.shape[0])
-        idx_dtype = torch.int32 if max_possible <= _INT32_MAX else torch.int64
-        i = i.to(idx_dtype)
-        j = j.to(idx_dtype)
-        k = k.to(idx_dtype)
-
-    if return_num_neighbors:
-        return i, j, k, num_neighbors
-    else:
-        return i, j, k, None
+    out = _build_triplets_from_neighbor_pairs(
+        points=points,
+        query_points=query_points,
+        neighbor_indices=neighbor_indices,
+        num_neighbors=num_neighbors,
+        kernel_indexer=kernel_indexer,
+        neighbor_radius=neighbor_radius,
+        radius_scaler=radius_scaler,
+        sort_by=sort_by,
+        return_num_neighbors=return_num_neighbors,
+    )
+    if cache is not None and key is not None:
+        # Weakref the primary keyed tensor `points`; on a hit a dead weakref is
+        # treated as a miss, closing the freed-then-recycled-address window.
+        # We guard ONLY `points`, not the other data_ptr-keyed tensors
+        # (sample_inds / query / query_sample_inds): every builder here stores
+        # those on the SAME MetaData (or its parent chain) as `points`, so they
+        # share a lifetime and are co-pinned for the whole forward scope — a live
+        # `points` implies its companions are live. A public-API caller pairing a
+        # persistent `points` with a transient, recycled `sample_inds` of
+        # different contents would be the only way to defeat this; such a caller
+        # should weakref-guard all keyed tensors.
+        cache[key] = (out, weakref.ref(points))
+    return out
 
 
 def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler: float = 1.0, distance_type: str = "ball"):
@@ -145,8 +208,8 @@ def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler
     span. kernel_size controls the fineness of the weight grid (e.g., 3^3 or
     5^3 kernel cells), while receptive_field_scaler controls how much physical
     space the search sphere covers, as a volume multiplier of the kernel_size^3
-    cube. This decoupling allows using a fine kernel (large kernel_size) over a
-    small region, or a coarse kernel over a large region, independently.
+    cube. This decoupling allows using a fine kernel (large kernel_size) over
+    a small region, or a coarse kernel over a large region, independently.
 
     The returned radius_scaler is used as:
         neighbor_radius = grid_size * radius_scaler
@@ -193,7 +256,7 @@ def handle_stride_and_build_triplets(
 ) -> MetaData:
     with torch.no_grad():
         if stride != 1:
-            if (m.parent is not None and 
+            if (m.parent is not None and
                 m.parent.points.shape == m.points.shape and
                 m.parent.grid_size == m.grid_size and
                 torch.equal(m.parent.points, m.points) and
@@ -254,4 +317,15 @@ def handle_stride_and_build_triplets(
                 radius_scaler=radius_scaler,
             )
 
+    # Submanifold / strided (overlapping) rulebook: variable per-tap neighbour
+    # counts (T != n, T != n_in) ⇒ neither exact cover, not uniform. The
+    # k_sorted flag is HONEST about the requested sort: conv builders pass the
+    # default sort_by="k" (→ submanifold(), k_sorted=True), but max_pool3d calls
+    # this with sort_by="i" — its triplets are i-sorted, so stamping
+    # k_sorted=True would be a dishonest contract (a conv consuming it would
+    # silently route the assume-k-sorted TIG path on i-sorted data). max_pool3d
+    # feeds indexed_segment_reduce, never a conv (contract.py), so this is
+    # latent today; deriving k_sorted from sort_by keeps the contract truthful
+    # if that ever changes. Structural constant — no host reduction.
+    m.contract = TripletContract(k_sorted=(sort_by == "k"))
     return m

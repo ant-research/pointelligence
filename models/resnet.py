@@ -13,12 +13,14 @@ from torch import Tensor
 from functools import partial
 
 from sparse_engines.ops import large_segment_reduce
+from internals.triplet_cache import triplet_cache_scope
 from layers import (
     max_pool3d,
     voxelize_3d,
     build_triplets,
     conv_with_stride,
     radius_scaler_for_kernel_size,
+    TripletContract,
 )
 from layers import (
     MetaData,
@@ -104,8 +106,13 @@ class BasicBlock(nn.Module):
                 radius_scaler=radius_scaler_for_kernel_size(kernel_size=3),
                 return_num_neighbors=False,
             )
+            m.contract = TripletContract.submanifold()
 
-        out = self.conv2(out, m.i, m.j, m.k, m.num_points())
+        # conv2 is the in-place 3^3 submanifold conv (sort_by="k", T != n)
+        # — pass the submanifold contract so the conv traces under
+        # torch.compile without a per-forward sortedness sync.
+        out = self.conv2(out, m.i, m.j, m.k, m.num_points(),
+                         contract=TripletContract.submanifold())
         out = self.bn2(out, m.sample_sizes)
 
         if self.downsample is not None:
@@ -330,6 +337,7 @@ class ResNet(nn.Module):
 
         return x
 
+    @triplet_cache_scope()
     def forward(
         self,
         x: Tensor,

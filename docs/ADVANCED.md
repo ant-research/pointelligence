@@ -147,3 +147,86 @@ features_out, m_out = conv_with_stride(conv, features, m, stride=2)
 ```
 
 For full architecture examples, see `models/resnet.py`.
+
+### torch.compile and the triplet contract
+
+`PointConv3d.forward(input, i, j, k, n, contract=None)` takes an optional
+`TripletContract` (`layers/contract.py`) describing the index's structural
+facts — k-sortedness, exact-cover, uniform segments. The triplet builders
+produce it (`MetaData._build_triplets`, `handle_stride*`, and
+`GeneratedSites.to_contract()` all attach one to the `MetaData`), and
+`conv_with_stride` threads `m.contract` through automatically — so the common
+path needs no change. Because the forward READS these facts instead of
+re-deriving them with host syncs (`.item()`), a `PointConv3d` traces cleanly
+under `torch.compile(fullgraph=True)`:
+
+```python
+contract = m.contract                       # produced by the builder
+compiled = torch.compile(conv, fullgraph=True)
+out = compiled(features, m.i, m.j, m.k, m.num_points(), contract=contract)
+```
+
+`contract=None` defaults to `TripletContract.submanifold()` (k-sorted, no
+exact cover) — the conv-path invariant. A caller that hand-builds
+genuinely-**unsorted** triplets must pass `TripletContract(k_sorted=False)` to
+opt into the eager per-triplet path (or use the `force_pt` dispatch mode);
+a bare unsorted `MetaData` is otherwise treated as sorted. Set
+`POINTELLIGENCE_DEBUG_CONTRACTS=1` to re-validate a contract against its data in eager.
+
+## Caching triplets — the forward-scoped ambient cache (`internals/triplet_cache.py`)
+
+Submanifold triplets `(i, j, k)` are a pure function of a point set's geometry,
+search radius, kernel, query set, and sort order. Within a single forward the
+*same* geometry+kernel recurs, and rebuilding the triplets each time repeats the
+host-bound `radius_search` (the dominant preprocessing cost). The recurrences:
+
+- **U-Net encoder/decoder cascade** — each resolution level is visited descending
+  and again ascending (the decoder's `Upsample` restores `m.points` to the *exact*
+  encoder-level tensor object via the `m.parent` chain), so the stride-1
+  submanifold build at each level recurs.
+- **Consecutive same-scale convs within a stage** — every stride-1 block in an
+  encoder stage builds on the same un-reassigned `m.points`.
+- **A stem that descends from, and a head that ascends back to, the input
+  resolution** — the entry-scale build recurs on the way back up.
+
+A **forward-scoped ambient cache** captures all of these with no per-call
+plumbing. `triplet_cache_scope()` (a re-entrant context manager that also works as
+the `@triplet_cache_scope()` decorator) installs a thread-local, per-forward dict;
+`build_triplets` consults it directly. Opt a model in with one line on its
+`forward`:
+
+```python
+from internals.triplet_cache import triplet_cache_scope
+
+class MyBackbone(nn.Module):
+    @triplet_cache_scope()                  # one fresh cache per forward call
+    def forward(self, data_dict):
+        ...
+```
+
+**Key.** Each entry is keyed on the full output determinant of `build_triplets`:
+`points`/`sample_inds`/query identities (by `data_ptr`), `neighbor_radius`,
+`radius_scaler`, `sort_by`, `return_num_neighbors`, and a kernel descriptor.
+`data_ptr` identity is sound *within* a forward (the dict is fresh per scope and
+the keyed tensors stay alive on the activation/`parent` graph); the entry stores a
+`weakref` to `points`, and a hit whose weakref is dead is treated as a miss —
+closing the freed-then-recycled-address window. `sample_inds` is keyed by
+`data_ptr`, not a value fingerprint, because `tolist()` would force a D2H sync and
+defeat the host-bound win.
+
+**Transparency.** The cache is numerically identical to no caching: a miss runs
+the unchanged build; a hit returns exactly a prior identical-key build (the key is
+a complete determinant, so it can never conflate different batch partitions,
+radii, or kernels). Outside any scope the cache is off (build every call — the
+default for code that doesn't opt in). Set `POINTELLIGENCE_DISABLE_TRIPLET_CACHE=1`
+to disable it even inside a scope (clean A/B + debug).
+
+**Scope of effect.** The consult lives inside `build_triplets`, so only the
+submanifold-search path is cached. The strided/downsample builds
+(`handle_stride_and_build_triplets`), the disjoint-partition patchify
+(`grid_sample_filter`, no radius search), the `max_pool3d` build, and the
+attention-context builders are *separate* code paths and are not cached (by
+design — each produces a unique result per call). A backbone benefits only when it
+actually revisits a scale through `build_triplets`; one whose reuse is
+attention-only or already served by cached upsample edges sees few or no hits, and
+opting in is harmless either way.

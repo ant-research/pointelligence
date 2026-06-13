@@ -1,5 +1,6 @@
 from .conv import conv_with_stride, PointConv3d, GenerativePointConv3d
 from .metadata import MetaData
+from .contract import TripletContract
 from .triplets import voxelize_3d, build_triplets, radius_scaler_for_kernel_size
 from .generative import (
     GeneratedSites,

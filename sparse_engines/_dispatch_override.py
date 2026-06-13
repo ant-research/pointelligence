@@ -29,9 +29,9 @@ from typing import Literal
 
 # ── Dispatch path (grouped vs per-triplet) ──
 #   "auto"           — production threshold-based dispatch (default)
-#   "force_fsg"  — grouped Triton at ANY G (native G>1, one group per
-#                      program or BSG>1 multi-group blocks); still falls
-#                      back if `a_idx`/`o_idx` not sorted
+#   "force_fsg"  — grouped Triton at ANY G (native G>1, one
+#                      group per program or BSG>1 multi-group blocks);
+#                      still falls back if `a_idx`/`o_idx` not sorted
 #                      (correctness > speed)
 #   "force_pt" — skip grouped, always use legacy kernel
 #   "force_fsg_wmma_vvor" — vvor-only: route through the hand-CUDA
@@ -50,8 +50,8 @@ from typing import Literal
 #                      fall back to the existing Triton-grouped path —
 #                      no SM80 fp32-input tensor-core atom of this shape.
 #                      vvor stays on whatever Triton routing applies.
-#   "force_fsg_cutlass_mvmr_vvor" — combined mode:
-#                      route mvmr fwd+grad_b → CUTLASS mvmr AND
+#   "force_fsg_cutlass_mvmr_vvor" — combined mode: route mvmr fwd+grad_b
+#                      → CUTLASS mvmr AND
 #                      vvor grad_a → CUTLASS vvor *simultaneously* in the
 #                      same forward/backward. The single-mode modes are
 #                      mutually exclusive: under
@@ -60,10 +60,10 @@ from typing import Literal
 #                      leaves mvmr on Triton — so having CUTLASS mvmr
 #                      fwd+grad_b AND CUTLASS vvor grad_a active together
 #                      is inexpressible without this. Composes the two
-#                      component routings under one label; each keeps its
-#                      own dtype gating (both mvmr AND vvor CUTLASS
-#                      accept fp16 OR bf16; fp32 / mixed-dtype pairs
-#                      fall back — mvmr to Triton-grouped, vvor to
+#                      already-proven component routings under one label;
+#                      each keeps its own dtype gating (both mvmr AND vvor
+#                      CUTLASS now accept fp16 OR bf16; fp32 / mixed-dtype
+#                      pairs fall back — mvmr to Triton-grouped, vvor to
 #                      scalar-FMA).
 #   "force_fsg_fused" — route PointConv3d's mvmr+autograd
 #                      through the single `FusedPointConv3d` Function
@@ -80,9 +80,9 @@ from typing import Literal
 #                      byte-unchanged when this mode is not set (the
 #                      routing site short-circuits only on this string).
 
-# v1.2.0 PT/FSG/TIG taxonomy: canonical dispatch strings are
-# generation-prefixed. The pre-rename strings are NOT aliased (clean
-# break) — they raise with the replacement named.
+# v1.2.0 PT/FSG/TIG taxonomy: canonical dispatch
+# strings are generation-prefixed. The pre-rename strings are NOT aliased
+# (clean break, user decision) — they raise with the replacement named.
 _LEGACY_RENAMES = {
     "force_per_triplet": "force_pt",
     "force_grouped": "force_fsg",
@@ -92,6 +92,7 @@ _LEGACY_RENAMES = {
     "force_grouped_cutlass_mvmr": "force_fsg_cutlass_mvmr",
     "force_grouped_cutlass_mvmr_vvor": "force_fsg_cutlass_mvmr_vvor",
     "force_fused_conv": "force_fsg_fused",
+    "force_smig": "force_tig",
 }
 
 DispatchMode = Literal[
@@ -226,6 +227,6 @@ def warn_pt_fallback(site: str, reason: str, **ctx) -> None:
     warnings.warn(
         f"[{site}] 'auto' routed to the per-triplet fallback engine "
         f"({reason}; {detail}). This is correct but likely not optimal — "
-        f"k-sorted triplets engage the TIG path; the grouped engine covers "
+        f"k-sorted triplets engage TIG, and the grouped engine covers "
         f"C/M >= 64.",
         RuntimeWarning, stacklevel=3)

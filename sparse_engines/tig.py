@@ -1,6 +1,7 @@
 """TIG — Triplet Implicit GEMM: the third execution generation for
 MVMR/VVOR (PT = per-triplet v1.0; FSG = full-segment grouped v1.1;
-TIG = triplet implicit GEMM v1.2) for the GENERAL PointConv3d mvmr.
+TIG = triplet implicit GEMM v1.2) for the GENERAL
+PointConv3d mvmr.
 
 Computes ``out[i] += feat[j] @ W[k]`` over a triplet rulebook
 ``(i, j, k)`` with variable fan-in (the general, point-native operator —
@@ -18,16 +19,17 @@ epilogue (fp32 global accumulation buffer + final cast):
   gray-sorted compacted rows with tile-level tap skipping; the ragged
   residual (fan-in ≥ 2) goes through the flat kernel on top.
 
-Memory contract: no T×C / im2col materialization; index structures are
-O(T + N·27 bytes) like the existing rulebook; the only transient is the
-fp32 accumulation buffer (N×M×4B, freed after the cast).
+Memory contract: no T×C / im2col
+materialization; index structures are O(T + N·27 bytes) like the
+existing rulebook; the only transient is the fp32 accumulation buffer
+(N×M×4B, freed after the cast).
 
-Config selection is bucketed on channel sizes only — NEVER on N or T.
-Point-cloud N/T vary every iteration; any N/T-keyed config selection
-(or autotune key) would re-trigger tuning on every fresh point cloud.
+Config selection is bucketed on channel sizes only — NEVER on N or T
+(CLAUDE.md Triton-autotune hard rule).
 
-Earlier revisions were forward-only G==1. As of v1.2.0, ALL kernels
-(flat, hybrid masked, wgrad, fused backward) carry the group axis natively
+T2 scope was forward-only G==1; backward landed in T3, production
+dispatch wiring in T4. v1.2.0 squeeze week: ALL kernels (flat, hybrid
+masked, wgrad, fused backward) carry the group axis natively
 (block-diagonal, grid-axis G + per-group pointer offsets), and the
 small-per-group cells route group-PACKED kernels (GP adjacent groups
 per block-diagonal dot tile — dense x/out accesses, fewer dots vs
@@ -43,6 +45,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from torch import Tensor
+from torch.library import triton_op, wrap_triton
 
 from ._dispatch_override import resolve_input_precision
 from ._seg_offs import kernel_offset_segments
@@ -144,10 +148,9 @@ def _tig_flat_bisect_kernel(
 ):
     """``_tig_flat_kernel`` with the pid_chunk -> k map done by
     BINARY SEARCH over a precomputed cumulative-chunk table instead of the
-    linear K-segment scan. At large tap counts (K = 8^3 = 512, a
-    generative-stem shape) the linear scan runs 512 iterations in EVERY
-    program and dominates the forward (~1 ms on Ada (sm_89) at N=165k);
-    bisection is ~9 loads. Routed only at
+    linear K-segment scan. At the generative stem shape (K = 8^3 = 512) the
+    linear scan runs 512 iterations in EVERY program and dominates the
+    forward (~1 ms on Ada at N=165k); bisection is ~9 loads. Routed only at
     K > _BISECT_MIN_K — the production K=27 path keeps the scan kernel
     byte-unchanged. ``cum_chunks`` is (K+1,) int32, cum_chunks[k] = total
     chunks of segments < k (per this L); built once per (orientation, L)
@@ -673,8 +676,8 @@ def _tig_bwd_fused_kernel(
 
 
 class TigIndex:
-    """Reusable TIG rulebook built once per (triplets, K) — the
-    warm-cache analog of FlexGEMM's neighbor_cache.
+    """Reusable TIG rulebook built once per (triplets, K) — the warm
+    analog of a sparse-conv indice cache / FlexGEMM's neighbor_cache.
 
     Holds BOTH orientations: the flat k-sorted arrays (shared with the
     existing production path) and the hybrid split (level-0 ``nbr0``
@@ -700,7 +703,7 @@ class TigIndex:
         self.exact_cover_out = bool(exact_cover_out)
         self.exact_cover_in = bool(exact_cover_in)
         self.N = int(n_out)
-        # input-side row count, used to size
+        # generative: input-side row count, used to size
         # grad_input. Defaults to n_out — the submanifold case — so every
         # existing caller is byte-unchanged. For generative convs
         # (N_in != N_out: strided partition / fan-in-1 deconv) pass the
@@ -776,7 +779,7 @@ class TigIndex:
         t = self._chunks_cache.get(key)
         if t is None:
             if which == "flat" and self.uniform_seg_len is not None:
-                # uniform-segment closed form — ceil(uniform/L) chunks per
+                # closed form — ceil(uniform/L) chunks per
                 # segment, one arange, no cumsum chain.
                 per = -(-self.uniform_seg_len // L)
                 t = (torch.arange(self.K + 1, device=self.flat_seg.device,
@@ -805,6 +808,72 @@ class TigIndex:
             self._chunks_cache[key] = n
         return n
 
+    @classmethod
+    def from_flat(cls, flat_i: torch.Tensor, flat_j: torch.Tensor,
+                  flat_seg: torch.Tensor, n_out: int, n_in: int,
+                  num_kernel_offsets: int, exact_cover_out: bool,
+                  exact_cover_in: bool, uniform_seg_len: int):
+        """Rebuild a FLAT-only TigIndex directly from the prebuilt flat
+        arrays — no ``k`` re-derivation, no hybrid build. Used by the
+        ``tig_mvmr`` triton_op, whose schema carries the flat tensors +
+        scalars (a TigIndex object can't be a custom-op arg). Populates
+        exactly the attrs the flat forward + both grads read
+        (flat_i/flat_j/flat_seg/N/N_in/K/T/exact_cover_*/uniform_seg_len +
+        the chunk_table/chunks caches); ``has_hybrid=False`` so the
+        hybrid branch is never taken (production builds build_hybrid=False
+        anyway). ``__init__`` is bypassed via ``__new__`` because its
+        signature takes raw (i,j,k) and re-derives flat_seg from k, which
+        we deliberately do not recompute (the flats are already canonical
+        and k-sorted by contract)."""
+        self = cls.__new__(cls)
+        self.flat_i = flat_i
+        self.flat_j = flat_j
+        self.flat_seg = flat_seg
+        self.N = int(n_out)
+        self.N_in = int(n_in)
+        self.K = int(num_kernel_offsets)
+        self.T = int(flat_i.numel())
+        self.exact_cover_out = bool(exact_cover_out)
+        self.exact_cover_in = bool(exact_cover_in)
+        self.uniform_seg_len = (int(uniform_seg_len)
+                                if uniform_seg_len >= 0 else None)
+        self._tilemask_cache = {}
+        self._chunks_cache = {}
+        self.has_hybrid = False
+        return self
+
+    @classmethod
+    def from_hybrid(cls, flat_i: torch.Tensor, flat_j: torch.Tensor,
+                    flat_seg: torch.Tensor, nbr0: torch.Tensor,
+                    rows_sorted: torch.Tensor, mbits_sorted: torch.Tensor,
+                    res_i: torch.Tensor, res_j: torch.Tensor,
+                    res_seg: torch.Tensor, n_out: int, n_in: int,
+                    num_kernel_offsets: int, res_T: int,
+                    exact_cover_out: bool, exact_cover_in: bool,
+                    uniform_seg_len: int):
+        """Rebuild a HYBRID TigIndex from prebuilt flat + hybrid arrays — the
+        hybrid analogue of ``from_flat``. Used by the
+        ``sparse_engines::tig_mvmr_hybrid`` custom_op, whose schema carries the
+        hybrid forward tensors (nbr0 / rows_sorted / _mbits_sorted / res_*)
+        AND the flat tensors the backward reads (flat_i / flat_j / flat_seg) —
+        a TigIndex object can't be a custom-op arg. Reuses ``from_flat`` for
+        the flat attrs (read by tig_grad_weight/input), then attaches the
+        hybrid attrs the masked+residual forward reads; ``has_hybrid=True``.
+        The tilemask is recomputed on demand from ``_mbits_sorted`` (its only
+        input), so it is NOT carried in the schema."""
+        self = cls.from_flat(
+            flat_i, flat_j, flat_seg, n_out, n_in, num_kernel_offsets,
+            exact_cover_out, exact_cover_in, uniform_seg_len)
+        self.nbr0 = nbr0
+        self.rows_sorted = rows_sorted
+        self._mbits_sorted = mbits_sorted
+        self.res_i = res_i
+        self.res_j = res_j
+        self.res_seg = res_seg
+        self.res_T = int(res_T)
+        self.has_hybrid = True
+        return self
+
     def tilemask(self, b1: int) -> torch.Tensor:
         tm = self._tilemask_cache.get(b1)
         if tm is None:
@@ -822,19 +891,19 @@ class TigIndex:
         return tm
 
 
-# above this K the flat kernels' linear pid_chunk->k scan (K
+# Above this K the flat kernels' linear pid_chunk->k scan (K
 # iterations in EVERY program) dominates and the bisect variant routes
 # instead. 27 (3^3) and 125 (5^3) stay on the proven scan kernel; 512
-# (8^3, a generative stem) bisects. Threshold is structural, not tuned.
+# (8^3, the generative stem) bisects. Threshold is structural, not tuned.
 _BISECT_MIN_K = 64
 
 _FI1_CC_CACHE: dict = {}
 
 
 def _fi1_wins_here() -> bool:
-    """Measured verdict: the FI1 plain-store forward wins on Ada (sm_89)
+    """H200 verdict: the FI1 plain-store forward wins on sm_89
     (1.6-2.7x fwd at the fan-in-1 deconv stages) but LOSES to the regular
-    atomic path on Hopper (sm_90) (up to 2.3x slower fwd — fp32 atomics +
+    atomic path on sm_90 (up to 2.3x slower fwd — Hopper's fp32 atomics +
     bandwidth make the zeros/cast passes near-free). Honor the caller's
     exact_cover flags only where the data says FI1 is the right engine;
     per-arch, cached once per device."""
@@ -850,27 +919,27 @@ def _fi1_wins_here() -> bool:
 
 def _packed_ok(G: int, C: int, M: int) -> bool:
     """WGRAD-only packed route: GP=2 at exactly the Cg==Mg==8 shape
-    (G even), measured on the real c64 G=8 fp16 cell (the cell where
-    TIG previously lost to the per-triplet path). A follow-up probe
-    re-measured the wider shapes for wgrad and found NO win
-    (Cg=Mg=16 GP=2: 0.177 vs 0.180 ms wash; Cg=Mg=8 GP=4: no win vs
-    the GP=2 default) — wgrad keeps this shape only. fwd/grad_input
-    route more widely: see ``_packed_gp``."""
+    (G even), measured on the real c64 G=8 fp16 cell (the former
+    TIG-loses-to-PT cell). The 2026-06 lever probe re-measured the wider
+    shapes for wgrad and found NO win (Cg=Mg=16 GP=2: 0.177 vs 0.180 ms
+    wash; Cg=Mg=8 GP=4: no win vs the GP=2 default) — wgrad keeps this
+    shape only. fwd/grad_input route more widely: see ``_packed_gp``."""
     return G % 2 == 0 and C == 8 and M == 8
 
 
 def _packed_gp(G: int, C: int, M: int):
     """GP for the fwd/grad_input packed route (None = unpacked flat).
-    Probe-verified on a real c64 ScanNet-scene fp16 protocol: packing
-    wins at Cg==Mg==16 too — the earlier assumption that "Cg>=16 tiles
-    are already dense (no packing win)" did not hold; the measured
-    truth is GP=2 @ Cg=Mg=16 (c64 G=4 cell, correct to 1.07e-7 vs the
-    fp64 oracle) beats the routed 16-wide default fwd 0.775->0.529,
-    gi 0.766->0.555 ms, and GP=4 @ Cg=Mg=8 (c64 G=8 cell, 9.4e-8)
-    beats the GP=2 default ~13% (fwd 0.660->0.570, gi 0.651->0.564 ms).
-    GP*Cg=32-wide tiles stay tl.dot-legal; the dense x/out accesses +
-    fewer dots win despite the block-diagonal flop waste. Cg<8 would
-    need GP=8 (unmeasured); non-power-of-2 Cg is not tl.arange-legal."""
+    Probe-verified on the real c64 ScanNet scene0011_00 fp16 protocol
+    (2026-06): packing wins at Cg==Mg==16 too — the prior claim that
+    "Cg>=16 tiles are already dense (no packing win)" is REFUTED; the
+    measured truth is GP=2 @ Cg=Mg=16 (c64 G=4 cell, correct to 1.07e-7
+    vs the fp64 oracle) beats the routed 16-wide default fwd
+    0.775->0.529, gi 0.766->0.555 ms, and GP=4 @ Cg=Mg=8 (c64 G=8 cell,
+    9.4e-8) beats the shipped GP=2 default ~13% (fwd 0.660->0.570,
+    gi 0.651->0.564 ms). GP*Cg=32-wide tiles stay tl.dot-legal; the
+    dense x/out accesses + fewer dots win despite the block-diagonal
+    flop waste. Cg<8 would need GP=8 (unmeasured); non-power-of-2 Cg is
+    not tl.arange-legal."""
     if C == 8 and M == 8 and G % 2 == 0:
         return 4 if G % 4 == 0 else 2
     if C == 16 and M == 16 and G % 2 == 0:
@@ -879,9 +948,9 @@ def _packed_gp(G: int, C: int, M: int):
 
 
 # packed-kernel launch configs, bucketed on (Cg, GP) — channel-keyed
-# only, never N/T. (8, 2): original sweep on real c64 G=8 fp16
+# only, never N/T. (8, 2): original v1.2.0 sweep on real c64 G=8 fp16
 # (L=256/w=4 best of {64,128,256,512} x {2,4,8}). (16, 2) / (8, 4):
-# follow-up probe winners — fwd L=256/w=8 at both shapes; gi
+# 2026-06 lever probe winners — fwd L=256/w=8 at both shapes; gi
 # L=128/w=4 at Cg=16, L=256/w=8 at Cg=8/GP=4.
 _PACKED_FWD = {(8, 2): dict(L=256, num_warps=4),
                (8, 4): dict(L=256, num_warps=8),
@@ -894,7 +963,7 @@ _PACKED_WG = dict(L=256, num_warps=4)
 
 def _flat_cfg(C: int, M: int):
     if C <= 16 and M <= 16:
-        # v1.2.0 (Cg<=16 grouped cells): 16-wide dot tiles — the
+        # v1.2.0 squeeze (Cg<=16 grouped cells): 16-wide dot tiles — the
         # sm_8x tl.dot minimum — instead of the 32-wide floor, which
         # padded Cg=8 4x in BOTH dot dims (real c64 G=8 fp16 fwd:
         # 3.15 -> 0.93 ms). An fma (no-dot) micro-path measured WORSE
@@ -980,7 +1049,7 @@ def tig_forward(
         if index.T:
             grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                     * num_pid_m_of(cfg["BM"]),)
-            _tig_flat_fi1_kernel[grid](
+            wrap_triton(_tig_flat_fi1_kernel)[grid](
                 weight, feat, index.flat_j, index.flat_i, out,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
                 K, M, C, G, G * C * M, C * M, M, 1,
@@ -996,7 +1065,7 @@ def tig_forward(
                 pcfg = _PACKED_FWD[(C, gp)]
                 grid = ((triton.cdiv(index.T, pcfg["L"]) + K)
                         * (G // gp),)
-                _tig_flat_packed_kernel[grid](
+                wrap_triton(_tig_flat_packed_kernel)[grid](
                     weight, feat, index.flat_j, index.flat_i, o32,
                     index.flat_seg, K, G, G * C * M, C * M, M, 1,
                     INPUT_PRECISION=input_precision, CG=C, MG=M, GP=gp,
@@ -1007,14 +1076,14 @@ def tig_forward(
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * num_pid_m_of(cfg["BM"]),)
         if index.T:
-            if K > _BISECT_MIN_K:  # large-K (e.g. 8^3 stem): bisect
-                _tig_flat_bisect_kernel[grid](
+            if K > _BISECT_MIN_K:  # large-K (e.g. 8^3 stem)
+                wrap_triton(_tig_flat_bisect_kernel)[grid](
                     weight, feat, index.flat_j, index.flat_i, o32,
                     index.flat_seg, index.chunk_table("flat", cfg["L"]),
                     K, M, C, G, G * C * M, C * M, M, 1,
                     INPUT_PRECISION=input_precision, num_warps=w, **cfg)
             else:
-                _tig_flat_kernel[grid](
+                wrap_triton(_tig_flat_kernel)[grid](
                     weight, feat, index.flat_j, index.flat_i, o32,
                     index.flat_seg,
                     K, M, C, G, G * C * M, C * M, M, 1,
@@ -1026,7 +1095,7 @@ def tig_forward(
         tm = index.tilemask(l0["B1"])
         grid0 = (triton.cdiv(nrows, l0["B1"]) * G * num_pid_m_of(l0["BM"]),)
         if nrows:
-            _tig_masked_kernel[grid0](
+            wrap_triton(_tig_masked_kernel)[grid0](
                 index.nbr0, index.rows_sorted, feat, weight, o32, tm,
                 nrows, M, C, G, INPUT_PRECISION=input_precision,
                 KV=K, num_warps=w0, **l0)
@@ -1035,7 +1104,7 @@ def tig_forward(
             w = cfg.pop("num_warps")
             grid = ((triton.cdiv(index.res_T, cfg["L"]) + K) * G
                     * num_pid_m_of(cfg["BM"]),)
-            _tig_flat_kernel[grid](
+            wrap_triton(_tig_flat_kernel)[grid](
                 weight, feat, index.res_j, index.res_i, o32, index.res_seg,
                 K, M, C, G, G * C * M, C * M, M, 1,
                 INPUT_PRECISION=input_precision, num_warps=w, **cfg)
@@ -1046,9 +1115,9 @@ def tig_forward(
 
 
 def _gi_cfg(C_out: int, M_in: int):
-    """grad_input configs — swept on real ScanNet stages; small-channel
-    branch from the v1.2.0 grouped-cell tuning (c64 G=8 fp16 gi:
-    3.10 -> 0.92 ms)."""
+    """grad_input configs — T4a sweep on real ScanNet (tig_t4_bwd_sweep);
+    small-channel branch from the v1.2.0 grouped squeeze (c64 G=8 fp16
+    gi: 3.10 -> 0.92 ms)."""
     if C_out <= 16 and M_in <= 16:
         return dict(L=128, BM=16, BC=16, num_warps=4)
     if C_out >= 64:
@@ -1065,9 +1134,9 @@ def tig_grad_input(
 ) -> torch.Tensor:
     """grad_feat[j] += grad_out[i] @ W[k]^T — the SAME flat kernel with
     gather/scatter roles swapped and the weight transposed via strides
-    (zero-copy, no staging). Sized by ``index.N_in`` so generative
-    convs (N_in != N_out) get a correctly-shaped grad; for submanifold
-    indices N_in == N (unchanged behavior)."""
+    (zero-copy, no staging). Sized by ``index.N_in`` so
+    generative convs (N_in != N_out) get a correctly-shaped grad; for
+    submanifold indices N_in == N (unchanged behavior)."""
     if input_precision is None:
         input_precision = resolve_input_precision(grad_out.dtype)
     if weight.dim() == 4:
@@ -1091,7 +1160,7 @@ def tig_grad_input(
         if index.T:
             grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                     * triton.cdiv(C, cfg["BM"]),)
-            _tig_flat_fi1_kernel[grid](
+            wrap_triton(_tig_flat_fi1_kernel)[grid](
                 weight, grad_out, index.flat_i, index.flat_j, out,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
                 K, C, M, G, G * C * M, C * M, 1, M,
@@ -1102,15 +1171,17 @@ def tig_grad_input(
     # roles per group: INW=M (gather grad_out rows by i), OUTW=C (scatter
     # by j); logical W'[k, g, m, c] = W[k, g, c, m] -> wc-stride 1, wm-stride M
     #
-    # Native-fp16 accumulation: under the disjoint-builder contract
-    # (exact_cover_out forward; per-tap parent-injectivity => fan-in <= K
-    # partials per output element) the fp32 staging buffer + final cast
-    # pass are the dominant grad_input cost — accumulating atomically in
-    # NATIVE fp16 measures 1.7-2.4x faster on Ada (sm_89) at relative
-    # error 5e-4-8e-4 (each partial is a full fp32-register C-reduction;
-    # only the <= K inter-partial adds round at fp16). bf16 is EXCLUDED
-    # (measured slower AND error to 7.5e-3 — 8 mantissa bits). Routed on
-    # all arches: 1.7-2.4x on Ada (sm_89), 1.4-1.7x on Hopper (sm_90).
+    # Native-fp16 accumulation (the deconv grad_input squeeze, from the
+    # 2026-06-12 handoff probes): under the disjoint-builder contract
+    # (exact_cover_out forward; per-k j-injective => fan-in <= K partials
+    # per output element) the fp32 staging buffer + final cast pass are
+    # the dominant cost — accumulating atomically in NATIVE fp16 measured
+    # gin 1.7-2.4x faster on sm_89 at relerr 5e-4-8e-4 (each partial is a
+    # full fp32-register C-reduction; only the <= K inter-partial adds
+    # round at fp16). bf16 is EXCLUDED (measured slower AND relerr to
+    # 7.5e-3 — 8 mantissa bits). Routed on ALL arches: unlike the FI1
+    # forward, the sm_90 re-stamp is POSITIVE (1.41-1.65x at the
+    # production deconv cells, relerr <= 1e-3).
     _native = (index.exact_cover_out and grad_out.dtype == torch.float16
                and G == 1)
     acc_dtype = grad_out.dtype if _native else torch.float32
@@ -1120,7 +1191,7 @@ def tig_grad_input(
         if index.T:
             pcfg = _PACKED_GI[(C, gp)]
             grid = ((triton.cdiv(index.T, pcfg["L"]) + K) * (G // gp),)
-            _tig_flat_packed_kernel[grid](
+            wrap_triton(_tig_flat_packed_kernel)[grid](
                 weight, grad_out, index.flat_i, index.flat_j, o32,
                 index.flat_seg, K, G, G * C * M, C * M, 1, M,
                 INPUT_PRECISION=input_precision, CG=M, MG=C, GP=gp,
@@ -1131,14 +1202,14 @@ def tig_grad_input(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BM"]),)
-        if K > _BISECT_MIN_K:  # large-K: bisect (see tig_forward)
-            _tig_flat_bisect_kernel[grid](
+        if K > _BISECT_MIN_K:  # (see tig_forward)
+            wrap_triton(_tig_flat_bisect_kernel)[grid](
                 weight, grad_out, index.flat_i, index.flat_j, o32,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
                 K, C, M, G, G * C * M, C * M, 1, M,
                 INPUT_PRECISION=input_precision, num_warps=w, **cfg)
         else:
-            _tig_flat_kernel[grid](
+            wrap_triton(_tig_flat_kernel)[grid](
                 weight, grad_out, index.flat_i, index.flat_j, o32,
                 index.flat_seg,
                 K, C, M, G, G * C * M, C * M, 1, M,
@@ -1147,21 +1218,23 @@ def tig_grad_input(
 
 
 def _wgrad_cfg(C: int, M: int, dtype: torch.dtype = torch.float16):
-    """wgrad configs — swept on real ScanNet stages: long chunks win
-    (Split-K granularity vs atomic traffic); fp32 operands double smem
-    so the chunk halves. Small-channel branch from the v1.2.0
-    grouped-cell tuning (c64 G=8 fp16 wgrad: 1.55 -> 0.39 ms; L=256
-    measured over 512 at 16-wide tiles)."""
+    """wgrad configs — T4a sweep: long chunks win (Split-K granularity vs
+    atomic traffic); fp32 operands double smem so the chunk halves.
+    Small-channel branch from the v1.2.0 grouped squeeze (c64 G=8 fp16
+    wgrad: 1.55 -> 0.39 ms; L=256 measured over 512 at 16-wide tiles)."""
     if C <= 16 and M <= 16:
         L = 128 if dtype == torch.float32 else 256
         return dict(L=L, BM=16, BC=16, num_warps=4)
     if C >= 128 and (dtype != torch.float32 or _fi1_wins_here()):
-        # A 128-wide C tile beats the 64-wide bucket by 1.2-1.3x at
-        # C >= 128 (measured at deconv and submanifold shapes, fp16/bf16;
-        # 1.23x at fp32). fp32 stays at L=128 — the L=256 variant exceeds
-        # the shared-memory limit in some specializations. Half precision
-        # wins on both Ada and Hopper and routes everywhere; fp32 wins on
-        # Ada only and keeps the wide tile there (parity-identical).
+        # T8 follow-up (2026-06-12, sm_89-measured at deconv + submanifold
+        # cells, parity <=4e-4 / 1e-6 fp32): a 128-wide C tile beats the
+        # 64-wide bucket by 1.2-1.3x (fp16/bf16) and 1.23x at fp32.
+        # fp32 stays at L=128: the L=256/BC=128 fp32 variant measured ~2x
+        # in one specialization but OutOfResources-es on shared memory in
+        # others (196 KB > the 99 KB SM limit) — not robust. sm_90
+        # re-stamp: half precision WINS there too (1.06-1.27x) -> routed
+        # on all arches; fp32 LOSES on Hopper (0.92-0.96x) -> the fp32
+        # wide tile stays sm_8x-only (pure-config, parity-identical).
         L = 128 if dtype == torch.float32 else 512
         return dict(L=L, BM=64, BC=128, num_warps=8)
     L = 128 if dtype == torch.float32 else 512
@@ -1191,7 +1264,7 @@ def tig_grad_weight(
     if wgrad_cfg is None and _packed_ok(G, C, M):
         if index.T:
             grid = ((triton.cdiv(index.T, _PACKED_WG["L"]) + K) * (G // 2),)
-            _tig_wgrad_packed_kernel[grid](
+            wrap_triton(_tig_wgrad_packed_kernel)[grid](
                 feat, grad_out, index.flat_j, index.flat_i, gw32,
                 index.flat_seg, K, G, INPUT_PRECISION=input_precision,
                 CG=C, MG=M, GP=2, **_PACKED_WG)
@@ -1203,14 +1276,14 @@ def tig_grad_weight(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BC"]) * triton.cdiv(M, cfg["BM"]),)
-        if K > _BISECT_MIN_K:  # large-K: bisect (see tig_forward)
-            _tig_wgrad_bisect_kernel[grid](
+        if K > _BISECT_MIN_K:  # (see tig_forward)
+            wrap_triton(_tig_wgrad_bisect_kernel)[grid](
                 feat, grad_out, index.flat_j, index.flat_i, gw32,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
                 K, M, C, G, INPUT_PRECISION=input_precision,
                 num_warps=w, **cfg)
         else:
-            _tig_wgrad_kernel[grid](
+            wrap_triton(_tig_wgrad_kernel)[grid](
                 feat, grad_out, index.flat_j, index.flat_i, gw32,
                 index.flat_seg,
                 K, M, C, G, INPUT_PRECISION=input_precision,
@@ -1250,7 +1323,7 @@ def tig_backward_fused(
     if index.T:
         grid = ((triton.cdiv(index.T, c["L"]) + K) * G
                 * triton.cdiv(C, c["BC"]) * triton.cdiv(M, c["BM"]),)
-        _tig_bwd_fused_kernel[grid](
+        wrap_triton(_tig_bwd_fused_kernel)[grid](
             weight, feat, grad_out, index.flat_j, index.flat_i, gx32, gw32,
             index.flat_seg, K, M, C, G,
             INPUT_PRECISION=input_precision, num_warps=w, **c)
@@ -1260,31 +1333,62 @@ def tig_backward_fused(
     return gw, gx32.to(feat.dtype)
 
 
-class _TigMvmr(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, weight, feat, index, mode, input_precision):
-        out = tig_forward(weight, feat, index, mode=mode,
-                           input_precision=input_precision)
-        ctx.save_for_backward(weight, feat)
-        ctx.index = index
-        ctx.precision = input_precision
-        return out
+@triton_op("sparse_engines::tig_mvmr", mutates_args={})
+def _tig_mvmr_op(
+    weight: Tensor, feat: Tensor,
+    flat_i: Tensor, flat_j: Tensor, flat_seg: Tensor,
+    n_out: int, n_in: int, num_kernel_offsets: int,
+    exact_cover_out: bool, exact_cover_in: bool, uniform_seg_len: int,
+    input_precision: str,
+) -> Tensor:
+    """Compile-safe TIG mvmr forward (flat path). The TigIndex is flattened
+    into its flat tensors+scalars so this is a dispatcher-registered custom op
+    (torch.compile-traceable; the kernels launch via wrap_triton inside
+    tig_forward). register_autograd below wires the backward. The public
+    ``tig_mvmr`` shim reconstructs the schema from a TigIndex so call sites are
+    unchanged."""
+    index = TigIndex.from_flat(
+        flat_i, flat_j, flat_seg, n_out, n_in, num_kernel_offsets,
+        exact_cover_out, exact_cover_in, uniform_seg_len)
+    return tig_forward(weight, feat, index, mode="flat",
+                       input_precision=input_precision)
 
-    @staticmethod
-    def backward(ctx, grad_out):
-        weight, feat = ctx.saved_tensors
-        index, prec = ctx.index, ctx.precision
-        grad_w = grad_f = None
-        # Measured verdict: split beats the fused one-pass backward at
-        # EVERY real stage on sm_89 (the per-m-tile gx atomics dominate);
-        # tig_backward_fused is retained for sm_90-class re-testing.
-        if ctx.needs_input_grad[0]:
-            grad_w = tig_grad_weight(feat, grad_out, index, weight.shape,
-                                      input_precision=prec)
-        if ctx.needs_input_grad[1]:
-            grad_f = tig_grad_input(weight, grad_out, index,
-                                     input_precision=prec)
-        return grad_w, grad_f, None, None, None
+
+def _tig_mvmr_setup_context(ctx, inputs, output):
+    (weight, feat, flat_i, flat_j, flat_seg, n_out, n_in, K,
+     exact_cover_out, exact_cover_in, uniform_seg_len, input_precision) = inputs
+    ctx.save_for_backward(weight, feat, flat_i, flat_j, flat_seg)
+    ctx.n_out = n_out
+    ctx.n_in = n_in
+    ctx.K = K
+    ctx.exact_cover_out = exact_cover_out
+    ctx.exact_cover_in = exact_cover_in
+    ctx.uniform_seg_len = uniform_seg_len
+    ctx.precision = input_precision
+
+
+def _tig_mvmr_backward(ctx, grad_out):
+    weight, feat, flat_i, flat_j, flat_seg = ctx.saved_tensors
+    index = TigIndex.from_flat(
+        flat_i, flat_j, flat_seg, ctx.n_out, ctx.n_in, ctx.K,
+        ctx.exact_cover_out, ctx.exact_cover_in, ctx.uniform_seg_len)
+    prec = ctx.precision
+    grad_w = grad_f = None
+    # T4a sweep verdict: split beats the fused one-pass backward at EVERY real
+    # stage on sm_89 (the per-m-tile gx atomics dominate); tig_backward_fused
+    # is retained for an H200 re-test only.
+    if ctx.needs_input_grad[0]:
+        grad_w = tig_grad_weight(feat, grad_out, index, weight.shape,
+                                  input_precision=prec)
+    if ctx.needs_input_grad[1]:
+        grad_f = tig_grad_input(weight, grad_out, index, input_precision=prec)
+    # grads align to the 12-arg op schema: weight, feat, then None for the
+    # flat tensors + every scalar (non-differentiable).
+    return grad_w, grad_f, None, None, None, None, None, None, None, None, None, None
+
+
+_tig_mvmr_op.register_autograd(
+    _tig_mvmr_backward, setup_context=_tig_mvmr_setup_context)
 
 
 def tig_mvmr(weight: torch.Tensor, feat: torch.Tensor, index: TigIndex,
@@ -1292,7 +1396,113 @@ def tig_mvmr(weight: torch.Tensor, feat: torch.Tensor, index: TigIndex,
     """Differentiable TIG mvmr: one autograd node for fwd + both grads
     (3 kernel launches total on the flat path, zero weight staging).
     Precision resolves once here, so forward and backward stay
-    consistent even if the global tf32 knob flips mid-step."""
+    consistent even if the global tf32 knob flips mid-step.
+
+    Both paths route through a custom op (compile-safe, register_autograd) — a
+    TigIndex object can't be a custom-op arg, so each unpacks its tensors +
+    scalars here. FLAT (``sparse_engines::tig_mvmr``) is the production path
+    (build_hybrid=False). HYBRID (``sparse_engines::tig_mvmr_hybrid``,
+    build_hybrid=True, bench/test only) carries the masked+residual forward
+    tensors plus the flat tensors its (flat-path) backward reads; it is never
+    compile-reached, but the custom op keeps it a registered leaf rather than an
+    autograd.Function graph break."""
     if input_precision is None:
         input_precision = resolve_input_precision(feat.dtype)
-    return _TigMvmr.apply(weight, feat, index, mode, input_precision)
+    flat_mode = mode
+    if flat_mode == "auto":
+        flat_mode = "hybrid" if (index.has_hybrid and weight.shape[-1] <= 64) else "flat"
+    if flat_mode == "hybrid" and index.has_hybrid:
+        return _tig_mvmr_hybrid_op(
+            weight, feat, index.flat_i, index.flat_j, index.flat_seg,
+            index.nbr0, index.rows_sorted, index._mbits_sorted,
+            index.res_i, index.res_j, index.res_seg,
+            index.N, index.N_in, index.K, index.res_T,
+            index.exact_cover_out, index.exact_cover_in,
+            index.uniform_seg_len if index.uniform_seg_len is not None else -1,
+            input_precision)
+    return _tig_mvmr_op(
+        weight, feat, index.flat_i, index.flat_j, index.flat_seg,
+        index.N, index.N_in, index.K,
+        index.exact_cover_out, index.exact_cover_in,
+        index.uniform_seg_len if index.uniform_seg_len is not None else -1,
+        input_precision)
+
+
+@torch.library.custom_op("sparse_engines::tig_mvmr_hybrid", mutates_args={})
+def _tig_mvmr_hybrid_op(
+    weight: Tensor, feat: Tensor,
+    flat_i: Tensor, flat_j: Tensor, flat_seg: Tensor,
+    nbr0: Tensor, rows_sorted: Tensor, mbits_sorted: Tensor,
+    res_i: Tensor, res_j: Tensor, res_seg: Tensor,
+    n_out: int, n_in: int, num_kernel_offsets: int, res_T: int,
+    exact_cover_out: bool, exact_cover_in: bool, uniform_seg_len: int,
+    input_precision: str,
+) -> Tensor:
+    """Compile-safe TIG mvmr forward (HYBRID flat+masked path; build_hybrid=
+    True, bench/test only). The masked level-0 + ragged-residual forward reads
+    the hybrid tensors (nbr0/rows_sorted/_mbits_sorted/res_*); the backward
+    (register_autograd below) is the SAME flat-path grad as ``tig_mvmr`` — it
+    reconstructs a flat TigIndex from flat_i/flat_j/flat_seg and calls
+    tig_grad_weight/tig_grad_input. Both representations are unpacked into the
+    schema because a TigIndex object can't be a custom-op arg. A ``custom_op``
+    (not an autograd.Function): the body runs eager (the data-dependent host
+    work — rows_sorted.numel(), the tilemask build — stays legal), and Dynamo
+    keeps it a registered leaf rather than graph-breaking. Never
+    compile-reached in production (build_hybrid=False → the flat op)."""
+    index = TigIndex.from_hybrid(
+        flat_i, flat_j, flat_seg, nbr0, rows_sorted, mbits_sorted,
+        res_i, res_j, res_seg, n_out, n_in, num_kernel_offsets, res_T,
+        exact_cover_out, exact_cover_in, uniform_seg_len)
+    return tig_forward(weight, feat, index, mode="hybrid",
+                       input_precision=input_precision)
+
+
+@_tig_mvmr_hybrid_op.register_fake
+def _tig_mvmr_hybrid_fake(
+    weight, feat, flat_i, flat_j, flat_seg, nbr0, rows_sorted, mbits_sorted,
+    res_i, res_j, res_seg, n_out, n_in, num_kernel_offsets, res_T,
+    exact_cover_out, exact_cover_in, uniform_seg_len, input_precision,
+):
+    # Output is the (n_out, G*M) accumulation buffer cast to feat.dtype — a
+    # pure function of weight's group/M dims and n_out (no data-dependence).
+    G = weight.shape[1] if weight.dim() == 4 else 1
+    M = weight.shape[-1]
+    return feat.new_empty((n_out, G * M))
+
+
+def _tig_mvmr_hybrid_setup_context(ctx, inputs, output):
+    (weight, feat, flat_i, flat_j, flat_seg, _nbr0, _rows_sorted,
+     _mbits_sorted, _res_i, _res_j, _res_seg, n_out, n_in, num_kernel_offsets,
+     _res_T, exact_cover_out, exact_cover_in, uniform_seg_len,
+     input_precision) = inputs
+    # Backward is the flat-path grad: save only the flat tensors + scalars
+    # (the hybrid tensors are forward-only).
+    ctx.save_for_backward(weight, feat, flat_i, flat_j, flat_seg)
+    ctx.n_out = n_out
+    ctx.n_in = n_in
+    ctx.K = num_kernel_offsets
+    ctx.exact_cover_out = exact_cover_out
+    ctx.exact_cover_in = exact_cover_in
+    ctx.uniform_seg_len = uniform_seg_len
+    ctx.precision = input_precision
+
+
+def _tig_mvmr_hybrid_backward(ctx, grad_out):
+    weight, feat, flat_i, flat_j, flat_seg = ctx.saved_tensors
+    index = TigIndex.from_flat(
+        flat_i, flat_j, flat_seg, ctx.n_out, ctx.n_in, ctx.K,
+        ctx.exact_cover_out, ctx.exact_cover_in, ctx.uniform_seg_len)
+    prec = ctx.precision
+    grad_w = grad_f = None
+    if ctx.needs_input_grad[0]:
+        grad_w = tig_grad_weight(feat, grad_out, index, weight.shape,
+                                  input_precision=prec)
+    if ctx.needs_input_grad[1]:
+        grad_f = tig_grad_input(weight, grad_out, index, input_precision=prec)
+    # grads align to the 19-arg op schema: weight, feat, then None for every
+    # flat/hybrid tensor + scalar (all non-differentiable).
+    return (grad_w, grad_f) + (None,) * 17
+
+
+_tig_mvmr_hybrid_op.register_autograd(
+    _tig_mvmr_hybrid_backward, setup_context=_tig_mvmr_hybrid_setup_context)

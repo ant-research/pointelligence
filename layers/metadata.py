@@ -12,6 +12,8 @@ from functools import partial
 import torch
 from torch import Tensor
 
+from .contract import TripletContract
+
 
 @dataclass(kw_only=True)
 class MetaData:
@@ -25,12 +27,18 @@ class MetaData:
     num_neighbors: Tensor = None
     downsample_indices: Tensor = None
 
+    # Structural contract for the (i, j, k) triplets — produced by the builder
+    # (which knows these construction-time facts), consumed by _conv_forward
+    # WITHOUT re-derivation, so the forward traces under torch.compile. None
+    # until triplets are built; nulled in dirty_triplets alongside i/j/k.
+    contract: Optional[TripletContract] = None
+
     i_upsample: Tensor = None
     j_upsample: Tensor = None
     k_upsample: Tensor = None
 
     parent: Optional['MetaData'] = None
-    
+
     kernel_size: Optional[Tuple[int, int, int]] = None
     receptive_field_scaler: float = 1.0
     sort_by: str = "k"
@@ -87,18 +95,23 @@ class MetaData:
             'return_num_neighbors': kwargs.get('return_num_neighbors', self.return_num_neighbors),
             'radius_scaler': radius_scaler,
         }
-        
+
         i, j, k, num_neighbors = build_triplets(**build_params)
-        
+
         self.i = i
         self.j = j
         self.k = k
         self.num_neighbors = num_neighbors
+        # Radius-search submanifold rulebook: k-sorted (sort_by="k"), variable
+        # per-tap neighbor counts (T != n, never uniform / exact-cover). No
+        # host reduction — the contract is a structural constant here.
+        self.contract = TripletContract.submanifold()
 
     def dirty_triplets(self):
         self.i = None
         self.j = None
         self.k = None
+        self.contract = None
 
     def empty_triplets(self):
         if self.i is None or self.j is None or self.k is None:

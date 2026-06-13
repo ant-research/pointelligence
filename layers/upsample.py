@@ -7,6 +7,7 @@ from functools import partial
 from layers.metadata import MetaData
 from layers.conv import PointConv3d
 from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kernel_size
+from layers.contract import TripletContract
 
 
 class Upsample(torch.nn.Module):
@@ -71,7 +72,7 @@ class Upsample(torch.nn.Module):
         self.distance_type = distance_type
         self.kernel_size = kernel_size
         self.straight_recover = straight_recover
-    
+
     def forward(
         self,
         x_low: Tensor,
@@ -88,8 +89,8 @@ class Upsample(torch.nn.Module):
         grid_size_high = m_low.parent.grid_size
 
         use_cached = self.straight_recover and (
-            m_low.parent.i_upsample is not None and 
-            m_low.parent.j_upsample is not None and 
+            m_low.parent.i_upsample is not None and
+            m_low.parent.j_upsample is not None and
             m_low.parent.k_upsample is not None
         )
 
@@ -134,7 +135,11 @@ class Upsample(torch.nn.Module):
                 radius_scaler=radius_scaler,
             )
 
-        x_high = self.conv(x_low, i_high, j_low, k, points_high.shape[0])
+        # build_triplets uses sort_by="k" (line above) and the upsample
+        # rulebook is submanifold-shaped (T != n_high) ⇒ the submanifold
+        # contract holds; pass it so the conv traces under torch.compile.
+        x_high = self.conv(x_low, i_high, j_low, k, points_high.shape[0],
+                            contract=TripletContract.submanifold())
 
         m_high = MetaData(
             points=points_high,
@@ -146,5 +151,5 @@ class Upsample(torch.nn.Module):
             k=k,
             parent=m_low.parent.parent if m_low.parent is not None else None,
         )
-        
+
         return x_high, m_high

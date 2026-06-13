@@ -56,18 +56,17 @@ def kernel_offset_segments_cached(
 ) -> Tensor:
     """Memoized ``kernel_offset_segments`` — the Triton grouped path
     rebuilds seg_offs 3x per training step (fwd mvmr, vvor grad_a,
-    grad_b mvmr) on the same triplet structure; the CUTLASS path
-    already shares it via the autograd ctx.
+    grad_b mvmr) on the same triplet structure; the CUTLASS path already
+    shares it via ctx.
 
     Key: ``(data_ptr, _version, numel, K)`` + a weakref liveness check
     on the SOURCE tensor (alive + same _version + same data_ptr, else
     evict-and-rebuild) — the weakref closes the recycled-data_ptr
-    aliasing hole a ptr/version-only key has (a new tensor allocated at
-    a recycled address could otherwise alias a stale entry; the same
-    hardening as the fold cache). ``inference_mode`` tensors (no
-    version counter) bypass the cache. Residual documented assumption:
-    version-bypassing writes (``.data`` / ``set_``) are invisible, as
-    everywhere else.
+    aliasing hole a ptr/version-only key has (deterministically hit by
+    the hw-tier fold cache's test suite; same hardening here).
+    ``inference_mode`` tensors (no version counter) bypass the cache.
+    Residual documented assumption: version-bypassing writes
+    (``.data`` / ``set_``) are invisible, as everywhere else.
     """
     try:
         ver = idx_sorted._version
@@ -92,9 +91,9 @@ def kernel_offset_segments_cached(
 
 def is_sorted_cached(idx: Tensor) -> bool:
     """Sortedness check with a verdict memo — removes the per-call host
-    sync from the grouped-dispatch hot path (the ``.item()`` here was
-    the last remaining per-call sync; measured -11% isolated / -34%
-    back-to-back at the C=512 regime).
+    sync from the grouped-dispatch hot path (the `.item()` here was the
+    last remaining per-call sync; measured -11% isolated / -34%
+    back-to-back at the c512 regime).
 
     Key: ``(data_ptr, _version, numel)``. ``_version`` increments on any
     in-place write, so a mutated tensor re-checks; a NEW tensor at a
@@ -157,6 +156,7 @@ def total_chunks_for_lchunks(
         ((seg_lens + lc - 1) // lc).sum() for lc in l_chunk_options
     ])
     return tuple(int(x) for x in sums.cpu().tolist())
+
 
 _EXACT_COVER_CACHE: dict = {}
 _EXACT_COVER_CACHE_MAX = 256

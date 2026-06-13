@@ -5,11 +5,23 @@ bucket indices, enabling O(1) lookup of candidate neighbors during
 radius search.
 """
 
+import os
+
 import torch
 import triton
 
 from .constants import Constants
 from .grid_hash_triton_kernel import grid_hash_kernel_4d
+
+# The grid-hash int64 overflow guard is a debug check: it recomputes the
+# stride cumprod in float64 and reads it to host (a D2H sync) on EVERY
+# reduce_indices_to_1d call. The builders are host-bound, so this per-call
+# sync stalls the GPU under contention. Gate it behind a flag (default off);
+# real grids never approach 2**63 (would need a ~2M-cell axis extent).
+# (Repo-wide building block → POINTELLIGENCE_ prefix, not PNT_ which denotes
+# the PNT architecture.)
+_GRID_OVERFLOW_CHECK = os.environ.get(
+    "POINTELLIGENCE_DEBUG_GRID_OVERFLOW", "0") == "1"
 
 
 def compute_overlapped_grid_indices(points, grid_size, overlap, dtype=torch.int32):
@@ -76,7 +88,8 @@ def reduce_indices_to_1d(inds, inds_min=None, inds_stride=None, dtype=None):
         if not (isinstance(inds_min, int) and 0 == inds_min):
             inds_step = inds_step.sub_(inds_min)
         inds_stride = inds_step.cumprod(dim=-1, dtype=torch.int64)
-        assert inds_step.cumprod(dim=-1, dtype=torch.float64)[0, -1] < 2**63 - 1
+        if _GRID_OVERFLOW_CHECK:
+            assert inds_step.cumprod(dim=-1, dtype=torch.float64)[0, -1] < 2**63 - 1
         dtype = torch.int64 if inds_stride[0, -1] > 2**31 - 1 else torch.int32
         inds_stride = inds_stride.to(dtype)
         inds_stride = inds_stride.roll(1, dims=-1)

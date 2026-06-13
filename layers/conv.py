@@ -22,6 +22,7 @@ from sparse_engines.ops import sparse_matrix_vector_multiplication_reduction
 from sparse_engines._dispatch_override import current_mode, resolve_input_precision
 
 from .metadata import MetaData
+from .contract import TripletContract
 from .triplets import (
     handle_stride_and_build_triplets,
     radius_scaler_for_kernel_size,
@@ -29,13 +30,44 @@ from .triplets import (
 from .generative import CoordinateGenerator, GeneratedSites, KernelStampGenerator
 
 
+# torch.compile contract — debug re-validation. When POINTELLIGENCE_DEBUG_CONTRACTS=1,
+# _conv_forward re-proves the builder-asserted TripletContract against the
+# actual triplet data (eager only — the .item()s here are exactly what we
+# moved OUT of the production path). Lets CI run the parity battery and assert
+# builder-asserted == data-true, catching any future builder that ships a wrong
+# flag (the one eager-numeric-drift surface). Default off; never runs under
+# torch.compile or in production.
+import os as _os
+_POINTELLIGENCE_DEBUG_CONTRACTS = _os.environ.get("POINTELLIGENCE_DEBUG_CONTRACTS", "0") == "1"
+
+
+def _assert_contract_matches_data(contract, i, j, k, n, n_in):
+    """Eager-only proof that a TripletContract matches its triplet data."""
+    from sparse_engines._seg_offs import is_sorted_cached, exact_cover_cached
+    if contract.k_sorted:
+        assert is_sorted_cached(k), (
+            "TripletContract.k_sorted=True but k is NOT sorted ascending")
+    if contract.exact_cover_out:
+        assert k.numel() == n and exact_cover_cached(i, n), (
+            "TripletContract.exact_cover_out=True but i is not a permutation "
+            f"of [0, n={n}) (T={k.numel()})")
+    if contract.exact_cover_in:
+        assert k.numel() == n_in and exact_cover_cached(j, n_in), (
+            "TripletContract.exact_cover_in=True but j is not a permutation "
+            f"of [0, n_in={n_in}) (T={k.numel()})")
+    if contract.uniform_seg_len is not None:
+        K = int(k.max().item()) + 1 if k.numel() else 0
+        assert contract.uniform_seg_len * K == k.numel(), (
+            f"TripletContract.uniform_seg_len={contract.uniform_seg_len} * "
+            f"K={K} != T={k.numel()}")
+
+
 # The production "auto" default is **TIG** at every (shape, G, dtype):
-# the decision tables (sm_89 + H200, real ScanNet cells) have TIG best
-# f+b at 25-26/30 cells on both arches (exceptions are near-ties at
-# half precision, <=1.02x; a few fp32 small-channel cells favor the
-# grouped path by up to 1.4x
-# force_fsg_fused tie), and TIG strictly beats the legacy auto routing
-# (Triton-grouped@C>=128 / fused@C>=512 / per-triplet) at every
+# the decision tables (sm_89 + H200, real ScanNet cells, user-approved)
+# have TIG best f+b at 25-26/30 cells on both arches (exceptions are
+# near-ties at half precision, <=1.02x; a few fp32 small-channel cells
+# favor the grouped path by up to 1.4x), and TIG strictly beats the
+# LEGACY auto (Triton-grouped@C>=128 / fused@C>=512 / PT) at every
 # measured cell including all fp32 cells. The fused-at-C>=512
 # auto-engagement is RETIRED with its constant (`force_fsg_fused`
 # remains as the explicit override; its half-precision wins are all
@@ -170,13 +202,27 @@ class GeneralConv(Module):
         weight: Tensor,
         bias: Optional[Tensor],
         *,
-        tig_hint: Optional[dict] = None,
+        contract: "Optional[TripletContract]" = None,
     ) -> Tensor:
-        # `tig_hint` is a caller-asserted structure contract (e.g.
-        # GenerativePointConv3d's stamp rulebook): k-sortedness by
-        # construction (skips the is_sorted D2H sync) and optionally
-        # `uniform_seg_len` (closed-form TIG index — no searchsorted, no
-        # cumsum). Default None — every existing caller byte-unchanged.
+        # `contract` is the triplet index's structural facts (k-sortedness,
+        # exact-cover, uniform segments), produced ONCE by the builder that
+        # made (i, j, k) and carried as DATA.
+        # The forward CONSUMES it without re-derivation, so it has no host sync
+        # and traces under torch.compile(fullgraph=True). This REPLACES the old
+        # per-forward `is_sorted_cached(k).item()` + `exact_cover_cached(i/j)`
+        # bincount auto-detection (those D2H syncs were the Dynamo graph break).
+        #
+        # k-sortedness is an UNCONDITIONAL INVARIANT of the conv path: every
+        # builder reaching here emits sort_by="k" (the only sort_by="i"
+        # builder, max_pool3d, feeds indexed_segment_reduce, never conv). So
+        # `contract=None` defaults to the submanifold contract (k-sorted, no
+        # cover). BACK-COMPAT DROP: an external caller that hand-builds
+        # genuinely-UNSORTED triplets on `auto` must now pass
+        # `TripletContract(k_sorted=False)` to opt into the eager per-triplet
+        # path — a bare unsorted MetaData is otherwise treated as sorted
+        # (force_pt mode remains the escape hatch). The env flag
+        # POINTELLIGENCE_DEBUG_CONTRACTS=1 re-validates the contract against the data
+        # (eager only) so CI proves builder-asserted == data-true.
         # weight is already in (K, G, in/G, out/G) layout —
         # the historical per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (~390 μs at sm_89 enc4) is
@@ -196,7 +242,7 @@ class GeneralConv(Module):
         # mvmr+autograd through the single `FusedPointConv3d` Function
         # (collapses the 3 @triton_op/autograd-graph boundaries + 2
         # seg_offs builds + the duplicate .contiguous() into one Function;
-        # forward S2 zero-copy via the no-op-collapse view; the CUTLASS
+        # forward S2 zero-copy via the no-op-collapse view; frozen CUTLASS
         # mvmr/vvor full kernels reused as-is; grad_b keeps its single
         # host-repack residual). Intercepted HERE — above
         # the @triton_op — so FusedPointConv3d's autograd is the sole
@@ -205,11 +251,11 @@ class GeneralConv(Module):
         # eager op. Every other mode/path is byte-unchanged: this branch
         # fires ONLY on the "force_fsg_fused" string.
         #
-        # Small-C crash-avoidance fallback. The fused path's CUTLASS mvmr
-        # full kernel hard-requires the weight's M and C to be tile
-        # multiples: `sparse_mvmr_cutlass_sm{80,90}_full` TORCH_CHECKs
-        # `M_full % TileM == 0` and `C_full % TileK == 0` (TileM=64,
-        # TileK=32 — `MvmrConfig`/`Sm90MvmrConfig` in
+        # Small-C crash-avoidance fallback (auto-router seed). The fused
+        # path's CUTLASS mvmr full kernel hard-requires the weight's M and
+        # C to be tile multiples: `sparse_mvmr_cutlass_sm{80,90}_full`
+        # TORCH_CHECKs `M_full % TileM == 0` and `C_full % TileK == 0`
+        # (TileM=64, TileK=32 — `MvmrConfig`/`Sm90MvmrConfig` in
         # extensions/sparse_engines_cuda/csrc/cuda/sparse_mvmr_cutlass_sm80.cu
         # lines 526-531, identical in sm90.cu:199-204; the pinned Python
         # mirrors are `M_TILE`/`C_TILE` in sparse_engines/mvmr_cutlass.py).
@@ -237,17 +283,15 @@ class GeneralConv(Module):
         # tables (sm_89 + H200, real ScanNet cells) have TIG best f+b at
         # 25-26/30 cells on BOTH arches (exceptions are near-ties at
         # half precision, <=1.02x; a few fp32 small-channel cells favor
-        # the grouped path by up to 1.4x; fused
-        # tie), and TIG strictly beats the legacy auto (grouped@C>=128 /
-        # fused@C>=512 / per-triplet) at every measured cell including
-        # all fp32 cells. Routing:
+        # the grouped path by up to 1.4x), and TIG strictly beats the
+        # LEGACY auto (grouped@C>=128 / fused@C>=512 / PT) at every
+        # measured cell including all fp32 cells. Routing:
         #   • "force_fsg_fused" (benches/tests): fused whenever
         #     `_fused_safe` — explicit override, unchanged.
         #   • "auto" (production default): TIG when the triplets are
         #     k-sorted (the build_triplets contract; memoized check) —
         #     all dtypes, all G. Unsorted (non-production callers) falls
-        #     to the eager op below, which re-checks and lands on the
-        #     per-triplet path.
+        #     to the eager op below, which re-checks and lands on PT.
         #   • "force_tig": TIG unconditionally (assume_sorted contract).
         #   • any other mode: → the eager op (those force_* modes are
         #     dispatched inside `sparse_matrix_vector_multiplication_
@@ -256,9 +300,8 @@ class GeneralConv(Module):
         # FusedPointConv3d is G-complete via fold-G-into-K (single launch
         # per leg at any G). The only extra gate at G>1 is fold legality
         # (int32 index ranges); unmet folds fall through to the eager
-        # composition below — never raise. The per-group tile check
-        # above already evaluates Mg/Cg (the weight layout is
-        # (K, G, Cg, Mg)).
+        # composition below — never raise. The per-group tile check above
+        # already evaluates Mg/Cg (the weight layout is (K, G, Cg, Mg)).
         from sparse_engines.mvmr_cutlass import fused_fold_legal
 
         _fused_safe = (
@@ -271,63 +314,67 @@ class GeneralConv(Module):
         # TIG precondition (the submanifold gate is RETIRED): grad_input
         # is sized by the index's n_in, so generative / strided convs
         # (N_in != N_out: partition stem, fan-in-1 deconv,
-        # GenerativePointConv3d) route TIG too. The decision tables
-        # (sm_89, real ScanNet, all dtypes) have generative TIG best f+b
-        # at EVERY generative cell — stem 0.57-0.71x the per-triplet
-        # path, deconv 0.55-0.74x FSG at half precision (fp32 marginal
-        # at two cells, still >= the legacy route). Remaining gate, auto
-        # only: k-sorted triplets (the build_triplets contract, memoized
-        # check — force_tig keeps its explicit assume_sorted contract).
+        # GenerativePointConv3d) route TIG too. The decision grids (sm_89,
+        # real ScanNet, all dtypes): generative TIG is best f+b at EVERY
+        # generative cell — stem 0.57-0.71x PT, deconv 0.55-0.74x FSG at
+        # half precision (fp32 marginal at two cells, still >= the legacy
+        # route). Remaining gate, auto only: k-sorted triplets (the
+        # build_triplets contract, memoized check — force_tig keeps its
+        # explicit assume_sorted contract).
+        # Resolve the triplet structural contract ONCE — no host sync.
+        # None defaults to the submanifold contract (k-sorted, no cover): the
+        # conv-path invariant. The structural flags below are READ from it,
+        # never re-derived from the tensors (that re-derivation was the old
+        # is_sorted_cached/exact_cover_cached .item() graph break).
+        if contract is None:
+            contract = TripletContract.submanifold()
+        # Optional eager-only re-validation (POINTELLIGENCE_DEBUG_CONTRACTS=1): prove the
+        # builder-asserted flags equal the data-true values. Skipped under
+        # torch.compile (the .item()s would break the trace) and off by
+        # default, so production never pays the sync.
+        if (_POINTELLIGENCE_DEBUG_CONTRACTS and k.numel() > 0
+                and not torch.compiler.is_compiling()):
+            _assert_contract_matches_data(contract, i, j, k, n,
+                                          input_3d.shape[0])
+
         if _mode == "auto":
-            if tig_hint is not None:  # sorted by caller contract
-                _use_tig = True
-            else:
-                from sparse_engines._seg_offs import is_sorted_cached
-                _use_tig = is_sorted_cached(k)
-                if not _use_tig:
-                    # Unsorted triplets forfeit TIG AND the grouped path
-                    # — the eager op will land on the per-triplet path.
-                    from sparse_engines._dispatch_override import (
-                        warn_pt_fallback)
-                    warn_pt_fallback(
-                        "PointConv3d", "triplets are not k-sorted",
-                        K=weight.shape[0], C=self.in_channels,
-                        M=self.out_channels, G=self.groups)
+            # k-sortedness is the conv-path invariant; trust the contract.
+            # Unsorted (external opt-out) forfeits TIG → the eager op lands on
+            # PT, exactly as before, just decided from data not a runtime sync.
+            _use_tig = contract.k_sorted
+            if not _use_tig:
+                from sparse_engines._dispatch_override import warn_pt_fallback
+                warn_pt_fallback(
+                    "PointConv3d", "triplets are not k-sorted (contract)",
+                    K=weight.shape[0], C=self.in_channels,
+                    M=self.out_channels, G=self.groups)
         else:
             _use_tig = _mode == "force_tig"
         if _use_fused:
-            from sparse_engines.mvmr_cutlass import FusedPointConv3d
+            from sparse_engines.mvmr_cutlass import fused_pointconv3d
 
-            output = FusedPointConv3d.apply(weight, k, input_3d, j, i, n)
+            output = fused_pointconv3d(weight, k, input_3d, j, i, n)
         elif _use_tig:
             # The TIG engine (flat orientation — the k-sorted triplets
-            # ARE the index, per-call index cost is one searchsorted;
-            # the hybrid mode needs the level-0 transform and is
-            # reserved for cached-topology use). One autograd node,
-            # 3 kernel launches f+b, zero weight staging.
-            # Also the automatic production default (sortedness verified
-            # above via the memoized check, so assume_sorted holds).
+            # ARE the index, per-call index cost is one searchsorted; the
+            # hybrid mode needs the level-0 transform and is reserved for
+            # cached-topology use). One autograd node, 3 kernel launches
+            # f+b, zero weight staging.
+            # Also the "auto" production default (k-sortedness is the
+            # contract invariant, so assume_sorted holds).
             from sparse_engines.tig import TigIndex, tig_mvmr
 
-            _eco = (tig_hint or {}).get("exact_cover_out", False)
-            if not _eco and tig_hint is None and k.numel() == n:
-                from sparse_engines._seg_offs import exact_cover_cached
-                _eco = exact_cover_cached(i, n)
-            # The input-side twin: fan-out-1 (every input row in exactly
-            # one triplet — the disjoint-partition stem class). T == N_in
-            # is the free host gate (submanifold and deconv shapes fail
-            # it); the same memoized bincount proof on j then sets
-            # exact_cover_in (FI1 grad_input where that wins) and, at
-            # large K, routes the dense-GEMM partition engine (measured
-            # 3-8x at the K>=512 patchify-stem shapes on both Ada and
-            # Hopper; the dense z is ~(1/occupancy)*input bytes —
-            # hard-capped at 256 MB).
+            # exactly-once-scatter fast paths (FI1 forward / FI1 grad_input /
+            # the dense-GEMM partition engine at large K). The flags are
+            # carried on the contract — PROVEN once at build time by the
+            # builder's bincount (in its @compiler.disable region), never
+            # re-derived here. exact_cover_out: the 2**3 octant deconv head
+            # (fan-in-1). exact_cover_in: the disjoint-partition stem
+            # (fan-out-1); dense z is ~(1/occupancy)*input bytes, hard-capped
+            # at 256 MB.
+            _eco = contract.exact_cover_out
+            _eci = contract.exact_cover_in
             _n_in_rows = input_3d.shape[0]
-            _eci = (tig_hint or {}).get("exact_cover_in", False)
-            if (not _eci and tig_hint is None
-                    and k.numel() == _n_in_rows and k.numel() != n):
-                from sparse_engines._seg_offs import exact_cover_cached
-                _eci = exact_cover_cached(j, _n_in_rows)
             _K = weight.shape[0]
             if (_eci and self.groups == 1 and _K > 64
                     and n * _K * self.in_channels * input.element_size()
@@ -342,8 +389,7 @@ class GeneralConv(Module):
                 idx = TigIndex(i, j, k, n, _K,
                                 build_hybrid=False, assume_sorted=True,
                                 n_in=_n_in_rows,
-                                uniform_seg_len=(tig_hint or {}).get(
-                                    "uniform_seg_len"),
+                                uniform_seg_len=contract.uniform_seg_len,
                                 exact_cover_out=_eco,
                                 exact_cover_in=_eci)
                 output = tig_mvmr(
@@ -389,13 +435,14 @@ class PointConv3d(GeneralConv):
         )
 
     def forward(self, input: Tensor, i: Tensor, j: Tensor, k: Tensor, n: int,
-                tig_hint: Optional[dict] = None) -> Tensor:
-        # Forward the caller's structure contract (e.g. exact_cover_out
-        # for an exact 2**3 octant deconv) to the dispatcher so `auto`
-        # reaches the single-pass store + native-fp16 grad paths. None
-        # (the default) preserves prior behavior bit-for-bit.
+                contract: "Optional[TripletContract]" = None) -> Tensor:
+        # Forward the triplet's structural contract (k-sorted / exact-cover
+        # / uniform segments — produced by the builder) so `auto` reaches the
+        # FI1 forward + native-fp16 grad_input fast paths WITHOUT a per-forward
+        # host sync. None defaults to the submanifold contract (the conv-path
+        # invariant); the forward then traces under torch.compile.
         return self._conv_forward(input, i, j, k, n, self.weight, self.bias,
-                                  tig_hint=tig_hint)
+                                  contract=contract)
 
 
 def conv_with_stride(
@@ -426,7 +473,7 @@ def conv_with_stride(
         m, stride, conv_op.kernel_size_3, receptive_field_scaler,
         distance_type=distance_type,
     )
-    x = conv_op(x, m.i, m.j, m.k, m.num_points())
+    x = conv_op(x, m.i, m.j, m.k, m.num_points(), contract=m.contract)
     return x, m
 
 
@@ -490,17 +537,13 @@ class GenerativePointConv3d(GeneralConv):
             sites = self.generator(m)
         sites.validate()
         # The stamp rulebook is k-sorted by construction with uniform
-        # per-tap segments — hand the contract to the dispatch so the
-        # TIG index path goes closed-form (no sync/searchsorted/cumsum).
-        # Generation-from-one (dedup merged nothing) additionally
-        # engages the FI1 plain-store forward — the subdivision-upsample
-        # mode.
-        hint = None
-        if sites.uniform_seg_len is not None or sites.exact_cover_out:
-            hint = dict(uniform_seg_len=sites.uniform_seg_len,
-                        exact_cover_out=sites.exact_cover_out)
+        # per-tap segments (and, for generation-from-one, fan-in-1 exact
+        # cover) — the generator already knows this, so it ships the same
+        # typed TripletContract every conv path uses (no parallel hint dict).
+        # The TIG index path then goes closed-form (no sync/searchsorted/cumsum)
+        # and the forward traces under torch.compile.
         x = self._conv_forward(
             input, sites.i, sites.j, sites.k, sites.n_out, self.weight,
-            self.bias, tig_hint=hint,
+            self.bias, contract=sites.to_contract(),
         )
         return x, sites.to_metadata(parent=m)
