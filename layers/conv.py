@@ -25,12 +25,13 @@ from .metadata import MetaData
 from .contract import TripletContract
 from .triplets import (
     handle_stride_and_build_triplets,
+    handle_stride_disjoint_and_build_triplets,
     radius_scaler_for_kernel_size,
 )
 from .generative import CoordinateGenerator, GeneratedSites, KernelStampGenerator
 
 
-# torch.compile contract — debug re-validation. When POINTELLIGENCE_DEBUG_CONTRACTS=1,
+#  torch.compile contract — debug re-validation. When POINTELLIGENCE_DEBUG_CONTRACTS=1,
 # _conv_forward re-proves the builder-asserted TripletContract against the
 # actual triplet data (eager only — the .item()s here are exactly what we
 # moved OUT of the production path). Lets CI run the parity battery and assert
@@ -62,13 +63,14 @@ def _assert_contract_matches_data(contract, i, j, k, n, n_in):
             f"K={K} != T={k.numel()}")
 
 
-# The production "auto" default is **TIG** at every (shape, G, dtype):
-# the decision tables (sm_89 + H200, real ScanNet cells, user-approved)
-# have TIG best f+b at 25-26/30 cells on both arches (exceptions are
+# an earlier cycle  — the production "auto" default is **TIG** at every (shape,
+# G, dtype): the  decision tables (sm_89 + H200, real ScanNet,
+# an internal benchmark,h200}.json, 
+# 2026-06-11) have TIG best f+b at 25-26/30 cells on both arches (exceptions are
 # near-ties at half precision, <=1.02x; a few fp32 small-channel cells
 # favor the grouped path by up to 1.4x), and TIG strictly beats the
 # LEGACY auto (Triton-grouped@C>=128 / fused@C>=512 / PT) at every
-# measured cell including all fp32 cells. The fused-at-C>=512
+# measured cell including all fp32 cells. The WS2.1 fused-at-C>=512
 # auto-engagement is RETIRED with its constant (`force_fsg_fused`
 # remains as the explicit override; its half-precision wins are all
 # <=1.02x over TIG — not worth a second default engine). FSG stays
@@ -116,8 +118,8 @@ class GeneralConv(Module):
         self.kernel_size = kernel_size
         self.groups = groups
 
-        # Weight layout: native (K, G, in/G, out/G). Eliminates the
-        # per-fwd `weight.reshape(...).permute(3,0,1,2)` +
+        #  / an earlier cycle  weight layout: native (K, G, in/G, out/G).
+        # Eliminates the per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (which allocated ~28 MB at enc4
         # per forward call, ~390 μs at sm_89). Backward-compat for legacy
         # (in, out/G, K) checkpoints is handled by _load_from_state_dict below.
@@ -152,11 +154,11 @@ class GeneralConv(Module):
         self, state_dict, prefix, local_metadata, strict,
         missing_keys, unexpected_keys, error_msgs,
     ):
-        # Backward-compat: detect legacy (in, out/G, K) weight
+        #  / the lane backward-compat: detect legacy (in, out/G, K) weight
         # checkpoints and reshape+permute to the new (K, G, in/G, out/G)
         # layout before assigning. Silent — load proceeds with the converted
-        # tensor, no warning (most legacy checkpoints match the old shape
-        # exactly).
+        # tensor, no warning (most legacy checkpoints are pre-Lane-Q and
+        # match the old shape exactly).
         weight_key = prefix + "weight"
         if weight_key in state_dict:
             w = state_dict[weight_key]
@@ -204,9 +206,9 @@ class GeneralConv(Module):
         *,
         contract: "Optional[TripletContract]" = None,
     ) -> Tensor:
-        # `contract` is the triplet index's structural facts (k-sortedness,
-        # exact-cover, uniform segments), produced ONCE by the builder that
-        # made (i, j, k) and carried as DATA.
+        #  torch.compile contract: `contract` is the triplet index's
+        # structural facts (k-sortedness, exact-cover, uniform segments),
+        # produced ONCE by the builder that made (i, j, k) and carried as DATA.
         # The forward CONSUMES it without re-derivation, so it has no host sync
         # and traces under torch.compile(fullgraph=True). This REPLACES the old
         # per-forward `is_sorted_cached(k).item()` + `exact_cover_cached(i/j)`
@@ -223,7 +225,7 @@ class GeneralConv(Module):
         # (force_pt mode remains the escape hatch). The env flag
         # POINTELLIGENCE_DEBUG_CONTRACTS=1 re-validates the contract against the data
         # (eager only) so CI proves builder-asserted == data-true.
-        # weight is already in (K, G, in/G, out/G) layout —
+        #  / the lane: weight is already in (K, G, in/G, out/G) layout —
         # the historical per-fwd `weight.reshape(...).permute(3,0,1,2)` +
         # implicit `.contiguous()` inside mvmr (~390 μs at sm_89 enc4) is
         # dropped. mvmr's internal `.contiguous()` is now a no-op.
@@ -238,20 +240,20 @@ class GeneralConv(Module):
         else:
             input_3d = input.contiguous()
 
-        # Under "force_fsg_fused" route the whole
+        # : under "force_fsg_fused" route the whole
         # mvmr+autograd through the single `FusedPointConv3d` Function
         # (collapses the 3 @triton_op/autograd-graph boundaries + 2
         # seg_offs builds + the duplicate .contiguous() into one Function;
         # forward S2 zero-copy via the no-op-collapse view; frozen CUTLASS
         # mvmr/vvor full kernels reused as-is; grad_b keeps its single
-        # host-repack residual). Intercepted HERE — above
+        # host-repack = the named  residual). Intercepted HERE — above
         # the @triton_op — so FusedPointConv3d's autograd is the sole
         # autograd boundary (not nested inside the op's registered
         # autograd). fp16-only; non-fp16 falls through to the unchanged
         # eager op. Every other mode/path is byte-unchanged: this branch
         # fires ONLY on the "force_fsg_fused" string.
-        #
-        # Small-C crash-avoidance fallback (auto-router seed). The fused
+        # : small-C crash-avoidance fallback (a later phase verdict-cell
+        # unblock + the gate  auto-router seed). The fused
         # path's CUTLASS mvmr full kernel hard-requires the weight's M and
         # C to be tile multiples: `sparse_mvmr_cutlass_sm{80,90}_full`
         # TORCH_CHECKs `M_full % TileM == 0` and `C_full % TileK == 0`
@@ -262,30 +264,33 @@ class GeneralConv(Module):
         # `weight` is (K, G=1, C, M) here, so the kernel's M_full is
         # weight.shape[3] and C_full is weight.shape[2]. At enc0-class
         # depth (C=32, M not a 64-multiple) the kernel raises a C++
-        # RuntimeError, which crashes the bench grid before any verdict
-        # JSON. So decide BY SHAPE *before* dispatch (not a fragile
-        # try/except around the kernel): when the tile constraints are
-        # unmet, fall through to EXACTLY the non-fused composition the
-        # `else` below takes when the mode is not "force_fsg_fused" —
-        # already correct & parity-tested. The decision is on the forward
-        # weight shape, invariant across fwd/bwd, so the whole step is
-        # owned by one path (no fwd/bwd mix). Constraint-MET shapes still
-        # take the fused path byte-unchanged. This is the crash-avoidance
-        # fallback only, NOT the perf-optimal "engage only where
-        # net-positive" router.
+        # RuntimeError;  a finding showed that crashes the a later phase bench
+        # grid before any verdict JSON. So decide BY SHAPE *before*
+        # dispatch (not a fragile try/except around the kernel): when the
+        # tile constraints are unmet, fall through to EXACTLY the
+        # non-fused composition the `else` below takes when the mode is
+        # not "force_fsg_fused" — already correct & parity-tested. The
+        # decision is on the forward weight shape, invariant across
+        # fwd/bwd, so the whole step is owned by one path (no fwd/bwd
+        # mix). Constraint-MET shapes still take the fused path
+        # byte-unchanged. This is the crash-avoidance fallback only, NOT
+        # the perf-optimal "engage only where net-positive" router (a
+        # graduation refinement, out of .5 scope).
         from sparse_engines.mvmr_cutlass import M_TILE, C_TILE
 
         _fused_tiles_ok = (
             weight.shape[3] % M_TILE == 0 and weight.shape[2] % C_TILE == 0
         )
-        # Auto-router (supersedes the fused-at-C>=512 rule): **TIG is the
-        # production default at every (shape, G, dtype)** — the decision
-        # tables (sm_89 + H200, real ScanNet cells) have TIG best f+b at
-        # 25-26/30 cells on BOTH arches (exceptions are near-ties at
-        # half precision, <=1.02x; a few fp32 small-channel cells favor
-        # the grouped path by up to 1.4x), and TIG strictly beats the
-        # LEGACY auto (grouped@C>=128 / fused@C>=512 / PT) at every
-        # measured cell including all fp32 cells. Routing:
+        # an earlier cycle  auto-router (, supersedes the
+        # WS2.1 fused-at-C>=512 rule): **TIG is the production default at
+        # every (shape, G, dtype)** — the  decision tables
+        # an internal benchmark,h200}.json) have TIG
+        # best f+b at 25-26/30 cells on BOTH arches (exceptions are
+        # near-ties at half precision, <=1.02x; a few fp32 small-channel
+        # cells favor the grouped path by up to 1.4x), and TIG strictly
+        # beats the LEGACY auto
+        # (grouped@C>=128 / fused@C>=512 / PT) at every measured cell
+        # including all fp32 cells. Routing:
         #   • "force_fsg_fused" (benches/tests): fused whenever
         #     `_fused_safe` — explicit override, unchanged.
         #   • "auto" (production default): TIG when the triplets are
@@ -297,11 +302,12 @@ class GeneralConv(Module):
         #     dispatched inside `sparse_matrix_vector_multiplication_
         #     reduction`); unchanged.
         _mode = current_mode()
-        # FusedPointConv3d is G-complete via fold-G-into-K (single launch
-        # per leg at any G). The only extra gate at G>1 is fold legality
-        # (int32 index ranges); unmet folds fall through to the eager
-        # composition below — never raise. The per-group tile check above
-        # already evaluates Mg/Cg (the weight layout is (K, G, Cg, Mg)).
+        # an earlier cycle : FusedPointConv3d is G-complete via fold-G-into-K
+        # (single launch per leg at any G). The only extra gate at G>1
+        # is fold legality (int32 index ranges); unmet folds fall
+        # through to the eager composition below — never raise. The
+        # per-group tile check above already evaluates Mg/Cg (the
+        # weight layout is (K, G, Cg, Mg)).
         from sparse_engines.mvmr_cutlass import fused_fold_legal
 
         _fused_safe = (
@@ -311,17 +317,17 @@ class GeneralConv(Module):
                                  k.numel())
         )
         _use_fused = _fused_safe and _mode == "force_fsg_fused"
-        # TIG precondition (the submanifold gate is RETIRED): grad_input
-        # is sized by the index's n_in, so generative / strided convs
-        # (N_in != N_out: partition stem, fan-in-1 deconv,
-        # GenerativePointConv3d) route TIG too. The decision grids (sm_89,
+        # TIG precondition (an earlier cycle  — the submanifold gate is RETIRED):
+        # grad_input is sized by the index's n_in, so generative /
+        # strided convs (N_in != N_out: partition stem, fan-in-1 deconv,
+        # GenerativePointConv3d) route TIG too. an earlier cycle grids (sm_89,
         # real ScanNet, all dtypes): generative TIG is best f+b at EVERY
         # generative cell — stem 0.57-0.71x PT, deconv 0.55-0.74x FSG at
         # half precision (fp32 marginal at two cells, still >= the legacy
         # route). Remaining gate, auto only: k-sorted triplets (the
         # build_triplets contract, memoized check — force_tig keeps its
         # explicit assume_sorted contract).
-        # Resolve the triplet structural contract ONCE — no host sync.
+        # : resolve the triplet structural contract ONCE — no host sync.
         # None defaults to the submanifold contract (k-sorted, no cover): the
         # conv-path invariant. The structural flags below are READ from it,
         # never re-derived from the tensors (that re-derivation was the old
@@ -355,12 +361,12 @@ class GeneralConv(Module):
 
             output = fused_pointconv3d(weight, k, input_3d, j, i, n)
         elif _use_tig:
-            # The TIG engine (flat orientation — the k-sorted triplets
-            # ARE the index, per-call index cost is one searchsorted; the
-            # hybrid mode needs the level-0 transform and is reserved for
-            # cached-topology use). One autograd node, 3 kernel launches
-            # f+b, zero weight staging.
-            # Also the "auto" production default (k-sortedness is the
+            # an earlier cycle: the TIG engine (flat orientation — the k-sorted
+            # triplets ARE the index, per-call index cost is one
+            # searchsorted; the hybrid mode needs the level-0 transform
+            # and is reserved for cached-topology use). One autograd
+            # node, 3 kernel launches f+b, zero weight staging.
+            # : also the "auto" production default (k-sortedness is the
             # contract invariant, so assume_sorted holds).
             from sparse_engines.tig import TigIndex, tig_mvmr
 
@@ -436,7 +442,7 @@ class PointConv3d(GeneralConv):
 
     def forward(self, input: Tensor, i: Tensor, j: Tensor, k: Tensor, n: int,
                 contract: "Optional[TripletContract]" = None) -> Tensor:
-        # Forward the triplet's structural contract (k-sorted / exact-cover
+        # : forward the triplet's structural contract (k-sorted / exact-cover
         # / uniform segments — produced by the builder) so `auto` reaches the
         # FI1 forward + native-fp16 grad_input fast paths WITHOUT a per-forward
         # host sync. None defaults to the submanifold contract (the conv-path
@@ -456,7 +462,9 @@ def conv_with_stride(
     """Standard strided convolution with radius-search-based triplet building.
 
     This is the general-purpose strided conv that works for all stride/kernel
-    combinations.
+    combinations. For the special case where input neighborhoods are guaranteed
+    to be disjoint (no-overlap regime), use ``conv_pooling_disjoint`` for
+    significantly faster performance (3.58-9.11x speedup on triplet building).
 
     Args:
         conv_op: PointConv3d instance (uses .kernel_size_3)
@@ -477,8 +485,57 @@ def conv_with_stride(
     return x, m
 
 
+def conv_with_stride_disjoint(
+    conv_op: Callable,
+    x: Tensor,
+    m: MetaData,
+    stride: float,
+) -> Tuple[Tensor, MetaData]:
+    """Strided conv as a true GRID PARTITION — the patchify operator.
+
+    Each input point is assigned to exactly one output cell (voxel) at
+    ``cell_size = stride * grid_size``; the output token sits at the cell
+    CENTER and the conv weight is indexed by the point's cell-grid-relative
+    sub-voxel slot (``[0, K**3)``, ``K = conv_op`` kernel size). Disjoint AND
+    covering: every input point contributes to exactly one token (no
+    orphaning), unlike a radius gather. This is the point analogue of a ViT
+    ``Conv2d(kernel=P, stride=P)`` patchify.
+
+    The partition's cached upsample edges make
+    ``Upsample(straight_recover=True, recompute_k=False)`` the exact inverse
+    (the unpatchify): every raw point is recovered from its cell-center token,
+    weighted by its sub-voxel slot. Together they are a lossless
+    patchify/unpatchify pair.
+
+    Args:
+        conv_op: PointConv3d instance (its ``kernel_size_3`` sets the K**3 slots).
+        x: Input features (N_in, C_in).
+        m: Input metadata (points at grid_size).
+        stride: Voxel ratio for downsampling (>1); cell_size = stride * grid_size.
+
+    Returns:
+        (output_features at N_tokens, output_metadata at cell centers).
+
+    Raises:
+        ValueError: If stride <= 1 or the kernel is non-cubic.
+
+    See Also:
+        handle_stride_disjoint_and_build_triplets: the partition triplet builder.
+        conv_with_stride: general overlapping strided conv (radius search).
+
+    NOTE: supersedes the prior ball-radius-search disjoint conv (a fast
+    no-overlap *gather* that matched ``conv_with_stride`` but only covered the
+    inscribed sphere of the cell, orphaning ~25-50% of points at the corners).
+    ``receptive_field_scaler`` / ``distance_type`` were removed (a partition has
+    no search radius).
+    """
+    m = handle_stride_disjoint_and_build_triplets(m, stride, conv_op.kernel_size_3)
+    x = conv_op(x, m.i, m.j, m.k, m.num_points(), contract=m.contract)
+    return x, m
+
+
 class GenerativePointConv3d(GeneralConv):
-    __doc__ = r"""Generative-expansion point convolution.
+    __doc__ = r"""Generative-expansion point convolution — a dense-output sparse convolution.
 
     Unlike :class:`PointConv3d` (submanifold: output sites ≡ input
     sites), this operator *invents* a denser output point set Y from the
@@ -492,8 +549,8 @@ class GenerativePointConv3d(GeneralConv):
     :class:`MetaData` carries the generated points and links back to the
     input as its ``parent``. A precomputed
     :class:`~layers.generative.GeneratedSites` may be passed as ``sites``
-    to reuse a rulebook across sibling generative convs (an explicit
-    rulebook-reuse handle).
+    to reuse a rulebook across sibling generative convs (the explicit
+    analog of a rulebook key).
     """
 
     def __init__(
@@ -536,7 +593,7 @@ class GenerativePointConv3d(GeneralConv):
         if sites is None:
             sites = self.generator(m)
         sites.validate()
-        # The stamp rulebook is k-sorted by construction with uniform
+        # : the stamp rulebook is k-sorted by construction with uniform
         # per-tap segments (and, for generation-from-one, fan-in-1 exact
         # cover) — the generator already knows this, so it ships the same
         # typed TripletContract every conv path uses (no parallel hint dict).

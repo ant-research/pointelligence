@@ -19,6 +19,7 @@ from torch.nn.modules.utils import _triple
 from internals.neighbors import radius_search
 from internals.indexing import cumsum_exclusive, repeat_interleave_indices
 from internals.triplet_cache import _active_cache, triplet_key
+from internals.grid_sample import grid_sample_filter
 
 from .metadata import MetaData
 from .downsample import downsample
@@ -38,10 +39,11 @@ def _build_triplets_from_neighbor_pairs(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor | None]:
     """Shared post-radius-search triplet construction.
 
-    ``build_triplets`` (which calls ``radius_search``) hands off to this
-    helper for the cumsum + repeat_interleave + offset + kernel_indexer +
-    sort + dtype-norm steps. Behavior matches the original inlined logic
-    in ``build_triplets`` line-for-line.
+    Both ``build_triplets`` (which calls ``radius_search``) and
+    the strided builder hand off to this helper for the
+    cumsum + repeat_interleave + offset + kernel_indexer + sort +
+    dtype-norm steps. Behavior matches the original inlined logic in
+    ``build_triplets`` line-for-line.
 
     Internally wraps in ``torch.no_grad()`` — caller does NOT need
     to be inside a no_grad block.
@@ -244,6 +246,37 @@ def radius_scaler_for_kernel_size(kernel_size: _size_3_t, receptive_field_scaler
     return radius_scaler
 
 
+def _no_overlap_check(
+    kernel_size: _size_3_t,
+    receptive_field_scaler: float,
+    distance_type: str,
+    stride: float,
+) -> float:
+    """Enforce the no-overlap invariant and return the computed radius_scaler.
+
+    Raises ``ValueError`` if ``2 * radius_scaler > stride`` — the
+    ball-disjoint contract required by ``conv_with_stride_disjoint`` and
+    ``handle_stride_disjoint_and_build_triplets``.
+    """
+    radius_scaler = radius_scaler_for_kernel_size(
+        kernel_size, receptive_field_scaler, distance_type
+    )
+    if 2 * radius_scaler > stride:
+        raise ValueError(
+            f"conv_with_stride_disjoint no-overlap violated: "
+            f"2 * radius_scaler ({2 * radius_scaler:.4f}) > stride ({stride:.4f}) "
+            f"with kernel_size={kernel_size}, "
+            f"receptive_field_scaler={receptive_field_scaler}, "
+            f"distance_type={distance_type!r}. "
+            f"Reduce receptive_field_scaler, increase stride, or use "
+            f"handle_stride_and_build_triplets / conv_with_stride for "
+            f"overlap-allowed strided conv."
+        )
+    return radius_scaler
+
+
+
+
 @torch.compiler.disable
 def handle_stride_and_build_triplets(
     m: MetaData,
@@ -328,4 +361,132 @@ def handle_stride_and_build_triplets(
     # latent today; deriving k_sorted from sort_by keeps the contract truthful
     # if that ever changes. Structural constant — no host reduction.
     m.contract = TripletContract(k_sorted=(sort_by == "k"))
+    return m
+
+
+@torch.compiler.disable
+def handle_stride_disjoint_and_build_triplets(
+    m: MetaData,
+    stride: float,
+    kernel_size: _size_3_t = _triple(3),
+    sort_by: str = "k",
+) -> MetaData:
+    """DISJOINT strided conv as a true GRID PARTITION (no radius search).
+
+    Each input point is assigned to exactly ONE output cell by integer
+    voxelization at ``cell_size = stride * grid_size`` — a tiling that is
+    disjoint *and* covering (every point lands in exactly one cell; no point is
+    orphaned). The output token sits at the **cell (voxel) center**
+    (``grid_sample_filter(reduction="center")``), and the kernel-bucket ``k`` is
+    the point's **cell-grid-relative sub-voxel slot**
+    ``floor((point - cell_origin)/cell_size * K) in [0, K)`` per axis (cubic
+    kernel ``K = kernel_size``), flattened to ``[0, K**3)``. The slot is bounded
+    by construction (no clamp / no aliasing) and decoupled from the token
+    coordinate: the slot answers "which sub-position within the patch", the cell
+    center answers "where is the patch".
+
+    This is the point analogue of a ViT ``Conv2d(kernel=P, stride=P)`` patchify:
+    a partition into non-overlapping cubic patches with the weight indexed by
+    the sub-position. The cached ``(i, j, k)_upsample`` edges are the exact
+    inverse map, so an ``Upsample(straight_recover=True, recompute_k=False)``
+    recovers EVERY raw point from its cell-center token (the unpatchify) with
+    full coverage — see ``layers/upsample.py``.
+
+    Supersedes the prior ball-radius-search disjoint conv, which only gathered
+    the inscribed sphere of the patch and orphaned ~25-50% of points at the
+    corners. ``receptive_field_scaler`` / ``distance_type`` no longer apply (a
+    partition has no search radius) and were removed from the signature.
+    """
+    if stride <= 1:
+        raise ValueError(
+            f"handle_stride_disjoint_and_build_triplets requires stride > 1 "
+            f"(downsample case); got stride={stride}."
+        )
+    ks = _triple(kernel_size)
+    if not (ks[0] == ks[1] == ks[2]):
+        raise ValueError(
+            f"partition disjoint conv requires a cubic kernel; got kernel_size={ks}")
+    K = int(ks[0])
+
+    with torch.no_grad():
+        if (m.parent is not None and
+            m.parent.points.shape == m.points.shape and
+            m.parent.grid_size == m.grid_size and
+            torch.equal(m.parent.points, m.points) and
+            torch.equal(m.parent.sample_inds, m.sample_inds)):
+            parent_meta = m.parent
+        else:
+            parent_meta = MetaData(
+                points=m.points,
+                sample_inds=m.sample_inds,
+                sample_sizes=m.sample_sizes,
+                grid_size=m.grid_size,
+                parent=m.parent,
+            )
+            m.parent = parent_meta
+
+        points_ = parent_meta.points
+        sample_inds_ = parent_meta.sample_inds
+        grid_size_ = parent_meta.grid_size
+        cell_size = stride * grid_size_
+
+        # Grid partition: each point -> its cell; token coord = cell CENTER.
+        # `mapping` (lookup_inds) is per-point -> token row, aligned with the
+        # returned cell-center coords (100% coverage by construction).
+        points_c, sample_inds_c, ds_indices, mapping = grid_sample_filter(
+            points=points_,
+            grid_size=cell_size,
+            sample_inds=sample_inds_,
+            reduction="center",
+            return_mapping=True,
+        )
+        # reduction="center" with sample_inds appends the batch index as a 4th
+        # column ((batch+0.5)*cell_size); keep only the xyz cell centers.
+        m.points = points_c[:, :3].contiguous()
+        m.sample_inds = sample_inds_c
+        m.grid_size = cell_size
+        m.sample_sizes = torch.bincount(sample_inds_c)
+        m.downsample_indices = ds_indices
+
+        # Cell-grid-relative sub-voxel slot, bounded [0, K) per axis. cell_vox via
+        # floor(pt/cell_size) matches grid_sample_filter's cell assignment
+        # (compute_grid_indices, with_shifts=False).
+        cell_vox = torch.div(points_, cell_size, rounding_mode="floor")
+        frac = points_ / cell_size - cell_vox                 # [0, 1) per axis
+        sub = torch.floor(frac * K).to(torch.long).clamp_(0, K - 1)
+        kk = (sub[:, 0] * K + sub[:, 1]) * K + sub[:, 2]      # [0, K**3)
+
+        n_pts = points_.shape[0]
+        idx = torch.arange(n_pts, device=points_.device)
+        if sort_by == "k":  # keep the k-ascending contract (cached k_upsample reuse)
+            order = torch.argsort(kk)
+            idx, kk = idx[order], kk[order]
+        m.i = mapping.to(torch.long)[idx]   # output token per edge (one edge / point)
+        m.j = idx                           # input point per edge
+        m.k = kk
+        m.num_neighbors = None
+
+        parent_meta.i_upsample = m.j
+        parent_meta.j_upsample = m.i
+        parent_meta.k_upsample = m.k
+
+    # Disjoint strided rulebook is the one builder that can be fan-out-1: each
+    # input point contributes to AT MOST one output cell, so when every input
+    # row appears in exactly one triplet (T == n_in) the partition-stem
+    # exact_cover_in contract holds (routes FI1 grad_input + the dense-GEMM
+    # partition engine). Prove it ONCE here with the same memoized bincount the
+    # old forward used — inside this @compiler.disable region the .item() is
+    # free and never traced (vs. per-forward in _conv_forward, which broke
+    # compile). Gate on the free host checks first (T == n_in and T != n),
+    # exactly mirroring the retired conv.py auto-detect. exact_cover_out stays
+    # False (deconv/strided is never fan-in-1 here); not uniform (radius search).
+    _eci = False
+    if m.k is not None and m.k.numel() > 0:
+        n_out = m.points.shape[0]
+        n_in = points_.shape[0]
+        if m.k.numel() == n_in and m.k.numel() != n_out:
+            from sparse_engines._seg_offs import exact_cover_cached
+            _eci = exact_cover_cached(m.j, n_in)
+    m.contract = TripletContract(k_sorted=True, exact_cover_out=False,
+                                 exact_cover_in=_eci, uniform_seg_len=None)
     return m
