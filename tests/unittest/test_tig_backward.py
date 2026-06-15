@@ -1,4 +1,4 @@
-"""Backward parity battery for the TIG engine.
+"""Backward parity battery for the TIG engine (an earlier cycle ).
 
 Oracle: analytic fp64 gradients of the mvmr op. Covers grad_input,
 grad_weight, the autograd Function end-to-end (incl. needs_input_grad
@@ -58,7 +58,7 @@ def ref_grads(weight, feat, go, i, j, k, n_out):
 
 
 @requires_cuda
-class TestTigBackwardPyref:
+class TestSmigBackwardPyref:
     @pytest.mark.parametrize("N,C,M,T", [
         (8, 32, 32, 64),
         (300, 32, 64, 4000),
@@ -98,7 +98,7 @@ class TestTigBackwardPyref:
 
 
 @requires_cuda
-class TestTigAutogradFunction:
+class TestSmigAutogradFunction:
     @pytest.mark.parametrize("mode", ["flat", "hybrid"])
     def test_function_end_to_end_fp32_ieee(self, mode):
         weight, feat, go, i, j, k = rand_problem(500, 64, 64, 8000, seed=11)
@@ -138,7 +138,7 @@ class TestTigAutogradFunction:
 
 
 @requires_cuda
-class TestTigBackwardVsProduction:
+class TestSmigBackwardVsProduction:
     def test_realistic_shape_grads_vs_production(self):
         from functools import partial
 
@@ -295,7 +295,7 @@ class TestTigGroups:
     @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5),
                                            (torch.float16, 1e-2)])
     def test_packed_new_routes_full_autograd(self, G, Cg, Mg, dtype, tol):
-        """Pins the packed-kernel routes: fwd + grad_input pack
+        """Pins the 2026-06 lever-probe routes: fwd + grad_input pack
         GP=2 at Cg==Mg==16 (G even) and GP=4 at Cg==Mg==8 (G%4==0);
         wgrad keeps its prior routing (unpacked at Cg=16, GP=2 at Cg=8).
         Full autograd (tig_mvmr) vs the fp64 block-diagonal oracle,
@@ -383,3 +383,106 @@ class TestTigGroups:
         assert rel_fro(out, ref) < 1e-4
         assert rel_fro(f2.grad, gref) < 1e-4
         assert rel_fro(pc.weight.grad, wref) < 1e-4
+
+
+@requires_cuda
+def test_seg_vvor_highK_matches_atomic_and_ref():
+    """an earlier cycle LOCK: the specialized no-atomic SEGMENT wgrad (routed for large-K
+    convs like the K=512 patchify stem) is parity with the generic atomic Split-K
+    AND matches the fp64 reference. Guards the 16x stem-wgrad win + its routing
+    (_tig_vvor_seg_kernel). Pre-fix the K=512 wgrad ran at 0.3% of peak via atomics;
+    this asserts the seg path is selected for the shape and is numerically correct."""
+    import triton
+    from sparse_engines.tig import (_seg_vvor_cfg, _SEG_VVOR_MIN_PROGRAMS,
+                                    _SEG_VVOR_MIN_C, _SEG_VVOR_MIN_M, _vvor_cfg)
+    N, C, M, T, Kbig = 4000, 256, 64, 80000, 512  # the patchify-stem shape
+    g = torch.Generator(device="cpu").manual_seed(7)
+    i = torch.randint(0, N, (T,), generator=g).to(device)
+    j = torch.randint(0, N, (T,), generator=g).to(device)
+    k = torch.randint(0, Kbig, (T,), generator=g).to(device)
+    feat = torch.randn(N, C, device=device)
+    go = torch.randn(N, M, device=device)
+    weight_shape = (Kbig, 1, C, M)
+    idx = TigIndex(i, j, k, N, num_kernel_offsets=Kbig)
+
+    # the seg path must be SELECTED for this shape (routing precondition)
+    scfg = _seg_vvor_cfg(C, M, feat.dtype)
+    n_prog = Kbig * 1 * triton.cdiv(C, scfg["BC"]) * triton.cdiv(M, scfg["BM"])
+    assert (C >= _SEG_VVOR_MIN_C and M >= _SEG_VVOR_MIN_M
+            and n_prog >= _SEG_VVOR_MIN_PROGRAMS), "seg routing precondition not met for K=512 stem"
+
+    gw_seg = tig_grad_weight(feat, go, idx, weight_shape, input_precision="ieee")
+    gw_atomic = tig_grad_weight(feat, go, idx, weight_shape, input_precision="ieee",
+                                wgrad_cfg=_vvor_cfg(C, M, feat.dtype))  # forces atomic path
+    _, gw_ref = ref_grads(torch.zeros(Kbig, 1, C, M, device=device),
+                          feat, go, i, j, k, N)
+    assert rel_fro(gw_seg, gw_atomic) < 1e-5, "seg wgrad != atomic Split-K wgrad"
+    assert rel_fro(gw_seg, gw_ref) < 1e-5, "seg wgrad != fp64 reference"
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype,prec,tol_atomic,tol_ref", [
+    (torch.float32, "ieee", 1e-5, 1e-5),   # true fp32
+    (torch.float32, "tf32", 5e-3, 3e-2),   # fp32 inputs, tf32 tensor cores ("bf32")
+    (torch.float16, "tf32", 5e-3, 3e-3),   # fp16
+    (torch.bfloat16, "tf32", 2e-2, 3e-2),  # bf16
+])
+def test_seg_vvor_precision_matrix(dtype, prec, tol_atomic, tol_ref):
+    """an earlier cycle: the no-atomic SEGMENT vvor is correctly wired across the full
+    precision matrix (fp32-ieee, fp32-tf32, fp16, bf16). For a seg-routed shape
+    (C>=128 & M>=64) assert seg == atomic Split-K (same numerics, dtype tol) AND
+    seg == fp64 reference (dtype tol). Confirms the README's fp32/fp16/bf16(/tf32)
+    support claim holds for the new backward kernel."""
+    N, C, M, T, K = 4000, 256, 128, 80000, 27   # seg-routed (C>=128, M>=64)
+    g = torch.Generator(device="cpu").manual_seed(11)
+    i = torch.randint(0, N, (T,), generator=g).to(device)
+    j = torch.randint(0, N, (T,), generator=g).to(device)
+    k = torch.randint(0, K, (T,), generator=g).to(device)
+    feat = torch.randn(N, C, device=device).to(dtype)
+    go = torch.randn(N, M, device=device).to(dtype)
+    ws = (K, 1, C, M)
+    idx = TigIndex(i, j, k, N, num_kernel_offsets=K)
+    from sparse_engines.tig import _vvor_cfg
+    gw_seg = tig_grad_weight(feat, go, idx, ws, input_precision=prec)             # seg
+    gw_at = tig_grad_weight(feat, go, idx, ws, input_precision=prec,
+                            wgrad_cfg=_vvor_cfg(C, M, feat.dtype))                 # atomic
+    _, gw_ref = ref_grads(torch.zeros(K, 1, C, M, device=device),
+                          feat.float(), go.float(), i, j, k, N)
+    assert rel_fro(gw_seg, gw_at) < tol_atomic, (dtype, prec, "seg!=atomic")
+    assert rel_fro(gw_seg.float(), gw_ref) < tol_ref, (dtype, prec, "seg!=fp64ref")
+
+
+@requires_cuda
+@pytest.mark.parametrize("N,C,M,T,Kk,fdt,gdt", [
+    # no-atomic SEG route (C>=128 & M>=64): all mixed directions fit its tiles
+    (4000, 256, 64, 80000, 512, torch.bfloat16, torch.float32),
+    (4000, 256, 64, 80000, 512, torch.float32, torch.bfloat16),
+    (4000, 256, 64, 80000, 512, torch.float16, torch.float32),
+    # atomic Split-K route (C<128): the go-not-larger direction (larger go on the
+    # large-L atomic tile is a non-reachable smem-config corner, not a dtype issue)
+    (1500, 64, 64, 20000, 27, torch.float32, torch.bfloat16),
+])
+def test_vvor_mixed_operand_dtype_no_crash(N, C, M, T, Kk, fdt, gdt):
+    """Parity with the mvmr-forward bf16 guard (`w.to(x.dtype)`): the vvor dots
+    contract feat against grad_out, so a caller whose feat/grad_out dtypes diverge
+    (an autocast-enrolled op, or a compiled cast inserted on one operand) would hit
+    `tl.dot: Both operands must be same dtype`. The `gb.to(xb.dtype)` cast makes the
+    vvor kernels robust; feat (xb) is the reference dtype (the host resolves
+    input_precision + casts the output from feat.dtype). Covers the no-atomic seg
+    kernel (all mixed directions) and the atomic Split-K kernel. No-op for matched
+    callers; this only locks the mixed edge against a future regression. NOTE: the
+    mixed case is not reached by today's AMP (the PointConv3d custom op is not
+    autocast-enrolled, so it stays fp32 -> operands match); this is parity hardening
+    that future-proofs autocast enrollment / compiled operand casts."""
+    g = torch.Generator(device="cpu").manual_seed(7)
+    i = torch.randint(0, N, (T,), generator=g).to(device)
+    j = torch.randint(0, N, (T,), generator=g).to(device)
+    k = torch.randint(0, Kk, (T,), generator=g).to(device)
+    feat = torch.randn(N, C, device=device)
+    go = torch.randn(N, M, device=device)
+    idx = TigIndex(i, j, k, N, num_kernel_offsets=Kk)
+    _, gw_ref = ref_grads(torch.zeros(Kk, 1, C, M, device=device),
+                          feat, go, i, j, k, N)
+    gw = tig_grad_weight(feat.to(fdt), go.to(gdt), idx, (Kk, 1, C, M))
+    assert gw.dtype == fdt, "wgrad output dtype must follow feat (the reference)"
+    assert rel_fro(gw, gw_ref) < 5e-2
