@@ -35,15 +35,15 @@ _GROUPED_MIN_TRIPLETS_PER_K = 16
 # tl.dot has shape `(M, L) @ (L, C) → (M, C)`. We require both M and C
 # ≥ 128 — i.e. the matmul tile must be deep on both axes for the tensor-
 # core throughput to overcome the per-program setup cost. Empirical
-# crossover from the PointConv3d engine bench PTv3 stage profile
-# matches MVMR's: grouped beats per_triplet starting at C=128 (fp16/bf16,
+# crossover from the stage-shape profile matches MVMR's: grouped beats
+# per_triplet starting at C=128 (fp16/bf16,
 # tied at fp32) and dominates at C ≥ 256.
 #
 # Lowered 128 → 64, in lockstep with
 # mvmr_triton._GROUPED_MIN_C (see the rationale there). This is the grad_a
 # (dW) leg of the same eager convs; at the generative deconv cells the
 # min(M,C)=64 stages misrouted to per_triplet and cost up to 1.9x f+b vs
-# force_fsg on Hopper (generative-shapes operator bench, sm_89 + sm_90).
+# force_fsg on H200 (bench_generative_shapes.py, sm_89 + sm_90).
 _GROUPED_MIN_DIM = 64
 
 
@@ -67,7 +67,7 @@ def _try_grouped_dispatch(
     traces under ``torch.compile``. This op is reached as mvmr's backward
     grad_a (``a_idx`` k-sorted → passed here as ``o_idx``), so a single
     forward-built seg_offs closes the {mvmr, vvor} dual sync-free.
-    ``None`` (default) keeps the exact pre-contract behavior.
+    ``None`` (default) keeps the exact earlier behavior.
     """
     mode = current_mode()
     if mode == "force_pt":
@@ -75,9 +75,9 @@ def _try_grouped_dispatch(
     K_offsets = n_o
     # Threshold checks before sortedness so auto-mode below-threshold calls
     # don't pay a CPU↔GPU sync just to fall through.
-    # The G==1 gate is lifted for force modes (kernel is G-generic, one
-    # group per program at BLOCK_SIZE_G=1); auto keeps G==1 until the
-    # routing decision lands.
+    # G==1 gate lifted for force modes (the kernel is G-generic,
+    # one group per program at BLOCK_SIZE_G=1); auto keeps G==1 until the
+    # group-routing decision lands.
     if mode == "auto":
         if G != 1:
             return False
@@ -91,7 +91,7 @@ def _try_grouped_dispatch(
             return False
         seg_offs = kernel_offset_segments_cached(o_idx, K_offsets)
     # else: caller-asserted sorted o_idx + precomputed seg_offs (compile path).
-    # Grid: sync-free UPPER BOUND on the chunk count (G>1
+    # Grid: sync-free UPPER BOUND on the chunk count (the G>1
     # squeeze — see the mvmr wrapper's comment). Programs past the true
     # chunk count exit early in the kernel.
     grid = lambda META: (
@@ -117,7 +117,7 @@ def sparse_vector_vector_outer_product_reduction(
     a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, o_idx: Tensor, n_o: int,
     seg_offs: "Optional[Tensor]" = None,
 ) -> Tensor:
-    # Gate 1: when the dispatch override is
+    # When the dispatch override is
     # "force_fsg_wmma_vvor", bypass the Triton path entirely and route
     # to the hand-CUDA WMMA-direct grouped kernel. Same autograd hooks
     # apply (registered on this @triton_op below), so the backward path
@@ -141,7 +141,8 @@ def sparse_vector_vector_outer_product_reduction(
     ):
         # Route to the Tier-2 CUTLASS
         # implicit-GEMM + K-mode IndexedGather vvor. fp16 OR bf16 (the
-        # bf16 atom was added later); fp32 falls back to scalar-FMA exactly
+        # bf16 atom was added later);
+        # fp32 falls back to scalar-FMA exactly
         # like the WMMA paths (no SM80 fp32-input tensor-core atom).
         # The combined "force_fsg_cutlass_mvmr_vvor" mode ALSO
         # routes vvor here. mvmr's backward computes grad_a via a vvor
@@ -149,18 +150,17 @@ def sparse_vector_vector_outer_product_reduction(
         # so under the combined mode grad_a hits CUTLASS vvor here while
         # mvmr fwd+grad_b hit CUTLASS mvmr in mvmr_triton.py.
         #
-        # The fallback must fire when the operands are not a
+        # AMP mixed-dtype fix: the fallback must fire when the operands are not a
         # matched CUTLASS-supported pair, not only when `a` is fp32. Under
         # `torch.autocast(fp16)` the conv weight Parameter stays fp32 at the
         # dispatch boundary, so grad_a arrives as a=fp16 (autocast-produced
         # grad) but b=fp32. The old `a.dtype == float32`-only guard let that
         # MIXED (a=fp16, b=fp32) pair through to the CUTLASS kernel, which
-        # raised and crashed every AMP step using this mode. The CUTLASS
-        # kernel now supports fp16 AND bf16 (matched operands), so the
-        # CUTLASS route is taken iff both operands share a dtype in
-        # {fp16, bf16}; any other pair (mixed, or fp32) takes the scalar-FMA
-        # fallback. No silent cast (that would change the user's autocast
-        # numerics).
+        # raised and crashed every AMP step using this mode. The CUTLASS kernel now
+        # supports fp16 AND bf16 (matched operands), so the CUTLASS route is
+        # taken iff both operands share a dtype in {fp16, bf16}; any other
+        # pair (mixed, or fp32) takes the scalar-FMA fallback. No silent cast
+        # (that would change the user's autocast numerics).
         #
         # The scalar fallback (`vvor_grouped_cuda`) itself requires a and b
         # to share a dtype (its CUDA kernel raises "expected Half but found
@@ -188,7 +188,7 @@ def sparse_vector_vector_outer_product_reduction(
             a, a_idx, b, b_idx, o_idx, n_o,
         )
 
-    # Mirrors mvmr_triton.py: the grouped kernel feeds
+    # T6b follow-up (mirrors mvmr_triton.py): the grouped kernel feeds
     # operands natively into tl.dot — a MIXED dtype pair (AMP boundary)
     # would CompilationError. Promote the narrower operand UP, lossless.
     if a.dtype != b.dtype:

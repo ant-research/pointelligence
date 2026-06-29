@@ -382,14 +382,14 @@ def test_single_point():
     assert m_out.num_points() == 27 and y.shape == (27, 6)
 
 
-# --------------------------------------------------- builder layout opts ----
+# --------------------------------------------------------- builder opts ----
 
 
 def test_builder_k_groups_contiguous():
-    """sort_by='k' yields contiguous, ascending k-groups.
+    """sort_by='k' yields contiguous, ascending k-groups (layout invariant).
 
-    The builder uses a deterministic (N,K)->(K,N) transpose permutation
-    rather than a structured `torch.sort(k)`. The MVMR grouped
+    The builder replaces the structured `torch.sort(k)` with a
+    deterministic (N,K)->(K,N) transpose permutation. The MVMR grouped
     tensor-core forward only needs same-k contiguity; lock it so a future
     edit can't silently break the layout the kernel dispatch assumes.
     """
@@ -410,11 +410,10 @@ def test_builder_k_groups_contiguous():
 def test_builder_coord_decode_matches_bruteforce():
     """The arithmetic key-decode equals the brute-force candidate min.
 
-    The builder decodes output voxel coords straight from the sorted
-    unique 1D keys instead of a first-occurrence scatter over the
-    (N*K,4) table. Verify the decoded coords equal an independent
-    brute-force build (group every candidate by its output index i, take
-    the shared voxel row).
+    The builder decodes output voxel coords straight from the sorted unique
+    1D keys instead of a first-occurrence scatter over the (N*K,4) table.
+    Verify the decoded coords equal an independent brute-force build (group
+    every candidate by its output index i, take the shared voxel row).
     """
     from layers.generative import _default_cube_stencil
 
@@ -435,4 +434,3 @@ def test_builder_coord_decode_matches_bruteforce():
     ref_vox[sites.i.long()] = cand  # any write per i; all are identical
     ref_pts = (ref_vox.to(m.points.dtype) + 0.5) * grid_out
     assert torch.equal(sites.points, ref_pts), "decoded coords must match brute force"
-

@@ -43,6 +43,23 @@ def _maxreldiff(x, y):
             / (y.float().abs().max() + 1e-6)).item()
 
 
+class TestV14AutoRoutePolicy(unittest.TestCase):
+    def test_c512_training_falls_back_but_eval_can_fuse(self):
+        from layers.conv import _auto_fused_gather_sum_width
+
+        self.assertTrue(_auto_fused_gather_sum_width(64, grad_enabled=True))
+        self.assertTrue(_auto_fused_gather_sum_width(128, grad_enabled=True))
+        self.assertTrue(_auto_fused_gather_sum_width(256, grad_enabled=True))
+        self.assertFalse(_auto_fused_gather_sum_width(512, grad_enabled=True))
+        self.assertTrue(_auto_fused_gather_sum_width(512, grad_enabled=False))
+
+    def test_force_fgs_is_short_for_force_fused_gather_sum(self):
+        from sparse_engines._dispatch_override import current_mode, dispatch_mode
+
+        with dispatch_mode("force_fgs"):
+            self.assertEqual(current_mode(), "force_fused_gather_sum")
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestFusedConvCompileSafety(unittest.TestCase):
     def _fsg_vs_tig(self, G, N, K, T, Cg, Mg, seed=0):

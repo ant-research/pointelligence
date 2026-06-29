@@ -1,7 +1,7 @@
 """TIG — Triplet Implicit GEMM: the third execution generation for
 MVMR/VVOR (PT = per-triplet v1.0; FSG = full-segment grouped v1.1;
 TIG = triplet implicit GEMM v1.2) for the GENERAL
-PointConv3d mvmr (an earlier cycle ).
+PointConv3d mvmr.
 
 Computes ``out[i] += feat[j] @ W[k]`` over a triplet rulebook
 ``(i, j, k)`` with variable fan-in (the general, point-native operator —
@@ -19,7 +19,7 @@ epilogue (fp32 global accumulation buffer + final cast):
   gray-sorted compacted rows with tile-level tap skipping; the ragged
   residual (fan-in ≥ 2) goes through the flat kernel on top.
 
-Memory contract (an earlier cycle user constraint): no T×C / im2col
+Memory contract (user constraint): no T×C / im2col
 materialization; index structures are O(T + N·27 bytes) like the
 existing rulebook; the only transient is the fp32 accumulation buffer
 (N×M×4B, freed after the cast).
@@ -27,8 +27,7 @@ existing rulebook; the only transient is the fp32 accumulation buffer
 Config selection is bucketed on channel sizes only — NEVER on N or T
 (CLAUDE.md Triton-autotune hard rule).
 
- scope was forward-only G==1; backward landed in , production
-dispatch wiring in . v1.2.0 a later pass: ALL kernels (flat, hybrid
+All kernels (flat, hybrid
 masked, wgrad, fused backward) carry the group axis natively
 (block-diagonal, grid-axis G + per-group pointer offsets), and the
 small-per-group cells route group-PACKED kernels (GP adjacent groups
@@ -152,7 +151,7 @@ def _tig_flat_bisect_kernel(
     INPUT_PRECISION: tl.constexpr,
     L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
 ):
-    """an earlier cycle : ``_tig_flat_kernel`` with the pid_chunk -> k map done by
+    """``_tig_flat_kernel`` with the pid_chunk -> k map done by
     BINARY SEARCH over a precomputed cumulative-chunk table instead of the
     linear K-segment scan. At the generative stem shape (K = 8^3 = 512) the
     linear scan runs 512 iterations in EVERY program and dominates the
@@ -232,7 +231,7 @@ def _tig_flat_fi1_kernel(
     INPUT_PRECISION: tl.constexpr,
     L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
 ):
-    """an earlier cycle : the fan-in-1 (exactly-once scatter) flat kernel — plain
+    """The fan-in-1 (exactly-once scatter) flat kernel — plain
     ``tl.store`` into a NATIVE-dtype uninitialized output instead of
     fp32-zeros + atomicAdd + cast (3 output passes -> 1). Legal ONLY when
     every output row receives exactly one triplet (the disjoint builders'
@@ -492,7 +491,7 @@ def _tig_vvor_bisect_kernel(
     INPUT_PRECISION: tl.constexpr,
     L: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
 ):
-    """an earlier cycle : ``_tig_vvor_kernel`` with the binary-search chunk map
+    """``_tig_vvor_kernel`` with the binary-search chunk map
     (see ``_tig_flat_bisect_kernel``) — routed at K > _BISECT_MIN_K."""
     num_pid_c = tl.cdiv(C, BC)
     num_pid_m = tl.cdiv(M, BM)
@@ -554,7 +553,7 @@ def _tig_vvor_seg_kernel(
     INPUT_PRECISION: tl.constexpr,
     BL: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr,
 ):
-    """an earlier cycle: SPECIALIZED weight-grad — per-offset FULL-segment contraction with a
+    """SPECIALIZED weight-grad — per-offset FULL-segment contraction with a
     SINGLE store (NO chunk-split, NO atomics). One program per
     (k_offset, c-tile, m-tile, g), so each gw element has exactly ONE writer ⇒ the
     store is plain (not atomic) and the result is DETERMINISTIC.
@@ -771,14 +770,12 @@ def _maybe_int(x):
 
 
 class TigIndex:
-    """Reusable TIG rulebook built once per (triplets, K) — the warm
-    analog of the sparse-conv baseline's indice_dict / FlexGEMM's neighbor_cache.
+    """Reusable TIG rulebook built once per (triplets, K).
 
     Holds BOTH orientations: the flat k-sorted arrays (shared with the
     existing production path) and the hybrid split (level-0 ``nbr0``
     [N, K] int32 with -1 sentinel + gray-sorted compacted rows + ragged
-    residual, k-sorted). Per-B1 tile masks are derived lazily and cached
-    (the FlexGEMM ``valid_kernel`` pattern).
+    residual, k-sorted). Per-B1 tile masks are derived lazily and cached.
     """
 
     def __init__(self, i: torch.Tensor, j: torch.Tensor, k: torch.Tensor,
@@ -789,7 +786,7 @@ class TigIndex:
                  exact_cover_in: bool = False,
                  uniform_seg_len: Optional[int] = None):
         dev = i.device
-        # an earlier cycle : caller-asserted exactly-once-scatter contracts (the
+        # Caller-asserted exactly-once-scatter contracts (the
         # disjoint builders own them; NEVER inferred — verification would
         # cost a device sync). exact_cover_out: every output row receives
         # exactly one triplet (fan-in-1 deconv forward) -> the FI1 plain-
@@ -798,7 +795,7 @@ class TigIndex:
         self.exact_cover_out = bool(exact_cover_out)
         self.exact_cover_in = bool(exact_cover_in)
         self.N = _maybe_int(n_out)
-        # an earlier cycle  (generative): input-side row count, used to size
+        # Generative: input-side row count, used to size
         # grad_input. Defaults to n_out — the submanifold case — so every
         # existing caller is byte-unchanged. For generative convs
         # (N_in != N_out: strided partition / fan-in-1 deconv) pass the
@@ -820,7 +817,7 @@ class TigIndex:
         # as-is (no .int() copy; T-length copies cost ~0.1 ms at enc0)
         self.flat_i = i
         self.flat_j = j
-        # an earlier cycle : uniform segments (caller contract — e.g. the stamp
+        # Uniform segments (caller contract — e.g. the stamp
         # generator's k-sorted rulebook has EXACTLY uniform_seg_len
         # triplets per tap): seg_offs is closed-form, no searchsorted.
         self.uniform_seg_len = (int(uniform_seg_len)
@@ -867,14 +864,14 @@ class TigIndex:
             self.has_hybrid = True
 
     def chunk_table(self, which: str, L: int) -> torch.Tensor:
-        """an earlier cycle : (K+1,) int32 cumulative chunk table for the bisect
+        """(K+1,) int32 cumulative chunk table for the bisect
         kernel — cum[k] = sum over k' < k of ceil(seg_len_k' / L). Built
         device-side (no D2H sync) once per (orientation, L) and cached."""
         key = ("cumtab", which, L)
         t = self._chunks_cache.get(key)
         if t is None:
             if which == "flat" and self.uniform_seg_len is not None:
-                # an earlier cycle : closed form — ceil(uniform/L) chunks per
+                # Closed form — ceil(uniform/L) chunks per
                 # segment, one arange, no cumsum chain.
                 per = -(-self.uniform_seg_len // L)
                 t = (torch.arange(self.K + 1, device=self.flat_seg.device,
@@ -986,7 +983,7 @@ class TigIndex:
         return tm
 
 
-# an earlier cycle : above this K the flat kernels' linear pid_chunk->k scan (K
+# Above this K the flat kernels' linear pid_chunk->k scan (K
 # iterations in EVERY program) dominates and the bisect variant routes
 # instead. 27 (3^3) and 125 (5^3) stay on the proven scan kernel; 512
 # (8^3, the generative stem) bisects. Threshold is structural, not tuned.
@@ -996,7 +993,7 @@ _FI1_CC_CACHE: dict = {}
 
 
 def _fi1_wins_here() -> bool:
-    """an earlier cycle  H200 verdict: the FI1 plain-store forward wins on sm_89
+    """H200 verdict: the FI1 plain-store forward wins on sm_89
     (1.6-2.7x fwd at the fan-in-1 deconv stages) but LOSES to the regular
     atomic path on sm_90 (up to 2.3x slower fwd — Hopper's fp32 atomics +
     bandwidth make the zeros/cast passes near-free). Honor the caller's
@@ -1118,7 +1115,7 @@ def tig_forward(
         K, C, M = weight.shape
         G = 1
     assert K == index.K and feat.size(1) == G * C
-    # an earlier cycle : feat rows are the input side (gathered by j); for
+    # Feat rows are the input side (gathered by j); for
     # generative indices this differs from the output count index.N.
     assert feat.size(0) == index.N_in, (
         f"feat rows {feat.size(0)} != index.N_in {index.N_in}")
@@ -1135,7 +1132,7 @@ def tig_forward(
     num_pid_m_of = lambda BM: triton.cdiv(M, BM)
 
     if mode == "flat" and index.exact_cover_out and _fi1_wins_here():
-        # an earlier cycle : exactly-once scatter — single pass, native dtype,
+        # Exactly-once scatter — single pass, native dtype,
         # no fp32 staging buffer, no atomics, no cast pass. Arch-gated
         # (sm_89 wins / sm_90 loses — see _fi1_wins_here).
         cfg = dict(_flat_cfg(C, M), **(flat_cfg or {}))
@@ -1171,7 +1168,7 @@ def tig_forward(
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * num_pid_m_of(cfg["BM"]),)
         if index.T:
-            if K > _BISECT_MIN_K:  # an earlier cycle : large-K (e.g. 8^3 stem)
+            if K > _BISECT_MIN_K:  # large-K (e.g. 8^3 stem)
                 wrap_triton(_tig_flat_bisect_kernel)[grid](
                     weight, feat, index.flat_j, index.flat_i, o32,
                     index.flat_seg, index.chunk_table("flat", cfg["L"]),
@@ -1210,7 +1207,7 @@ def tig_forward(
 
 
 def _gi_cfg(C_out: int, M_in: int):
-    """grad_input configs —  sweep on real ScanNet (an internal bench);
+    """grad_input configs — tuned on real ScanNet;
     small-channel branch from the v1.2.0 grouped squeeze (c64 G=8 fp16
     gi: 3.10 -> 0.92 ms)."""
     if C_out <= 16 and M_in <= 16:
@@ -1229,7 +1226,7 @@ def tig_grad_input(
 ) -> torch.Tensor:
     """grad_feat[j] += grad_out[i] @ W[k]^T — the SAME flat kernel with
     gather/scatter roles swapped and the weight transposed via strides
-    (zero-copy, no staging). Sized by ``index.N_in`` (an earlier cycle ) so
+    (zero-copy, no staging). Sized by ``index.N_in`` so
     generative convs (N_in != N_out) get a correctly-shaped grad; for
     submanifold indices N_in == N (unchanged behavior)."""
     if input_precision is None:
@@ -1245,7 +1242,7 @@ def tig_grad_input(
     grad_out = grad_out.contiguous()
     N = index.N_in
     if index.exact_cover_in and _fi1_wins_here():
-        # an earlier cycle : each input row appears in exactly one triplet
+        # Each input row appears in exactly one triplet
         # (partition fan-out-1) — grad_input is a pure exactly-once
         # scatter: single pass, native dtype, no fp32 buffer/atomics/cast.
         cfg = dict(_gi_cfg(C, M), **(flat_cfg or {}))
@@ -1297,7 +1294,7 @@ def tig_grad_input(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BM"]),)
-        if K > _BISECT_MIN_K:  # an earlier cycle  (see tig_forward)
+        if K > _BISECT_MIN_K:  # (see tig_forward)
             wrap_triton(_tig_flat_bisect_kernel)[grid](
                 weight, grad_out, index.flat_i, index.flat_j, o32,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
@@ -1313,7 +1310,7 @@ def tig_grad_input(
 
 
 def _vvor_cfg(C: int, M: int, dtype: torch.dtype = torch.float16):
-    """wgrad configs —  sweep: long chunks win (Split-K granularity vs
+    """wgrad configs — tuning: long chunks win (Split-K granularity vs
     atomic traffic); fp32 operands double smem so the chunk halves.
     Small-channel branch from the v1.2.0 grouped squeeze (c64 G=8 fp16
     wgrad: 1.55 -> 0.39 ms; L=256 measured over 512 at 16-wide tiles)."""
@@ -1321,7 +1318,7 @@ def _vvor_cfg(C: int, M: int, dtype: torch.dtype = torch.float16):
         L = 128 if dtype == torch.float32 else 256
         return dict(L=L, BM=16, BC=16, num_warps=4)
     if C >= 128 and (dtype != torch.float32 or _fi1_wins_here()):
-        #  follow-up (2026-06-12, sm_89-measured at deconv + submanifold
+        # Follow-up (2026-06-12, sm_89-measured at deconv + submanifold
         # cells, parity <=4e-4 / 1e-6 fp32): a 128-wide C tile beats the
         # 64-wide bucket by 1.2-1.3x (fp16/bf16) and 1.23x at fp32.
         # fp32 stays at L=128: the L=256/BC=128 fp32 variant measured ~2x
@@ -1337,7 +1334,7 @@ def _vvor_cfg(C: int, M: int, dtype: torch.dtype = torch.float16):
                 num_warps=8 if C >= 64 else 4)
 
 
-# an earlier cycle: route the no-atomic SEGMENT vvor by CHANNEL size, not program count. The
+# Route the no-atomic SEGMENT vvor by CHANNEL size, not program count. The
 # seg kernel does one full-segment GEMM per (offset, c-tile, m-tile); it wins when
 # that per-offset GEMM tile is large enough to be tensor-core-efficient and amortize
 # the lower (offset-only) parallelism — empirically C>=128 AND M>=64 across real
@@ -1424,7 +1421,7 @@ def tig_grad_weight(
         gw = gw32.to(feat.dtype)
         return (gw.view(weight_shape) if len(weight_shape) == 4
                 else gw.view(K, C, M))
-    # SPECIALIZED no-atomic segment vvor (an earlier cycle): one program loops each k-offset's
+    # SPECIALIZED no-atomic segment vvor: one program loops each k-offset's
     # whole k-sorted segment and stores ONCE — no atomic Split-K. Deterministic. Wins
     # when segments are short enough that the big per-offset GEMM beats Split-K's
     # contraction parallelism — a JOINT (C, K) gate that is ARCH-DEPENDENT (Hopper's
@@ -1451,7 +1448,7 @@ def tig_grad_weight(
     if index.T:
         grid = ((triton.cdiv(index.T, cfg["L"]) + K) * G
                 * triton.cdiv(C, cfg["BC"]) * triton.cdiv(M, cfg["BM"]),)
-        if K > _BISECT_MIN_K:  # an earlier cycle  (see tig_forward)
+        if K > _BISECT_MIN_K:  # (see tig_forward)
             wrap_triton(_tig_vvor_bisect_kernel)[grid](
                 feat, grad_out, index.flat_j, index.flat_i, gw32,
                 index.flat_seg, index.chunk_table("flat", cfg["L"]),
@@ -1549,7 +1546,7 @@ def _tig_mvmr_backward(ctx, grad_out):
         ctx.exact_cover_out, ctx.exact_cover_in, ctx.uniform_seg_len)
     prec = ctx.precision
     grad_w = grad_f = None
-    #  sweep verdict: split beats the fused one-pass backward at EVERY real
+    # Tuning verdict: split beats the fused one-pass backward at EVERY real
     # stage on sm_89 (the per-m-tile gx atomics dominate); tig_backward_fused
     # is retained for an H200 re-test only.
     if ctx.needs_input_grad[0]:

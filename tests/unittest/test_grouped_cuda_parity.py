@@ -1,14 +1,13 @@
 """Hand-CUDA grouped path vs Triton grouped path — parity battery.
 
-The hand-CUDA grouped backend adds a new dispatch backend for MVMR and
+The hand-CUDA grouped scaffolding adds a new dispatch backend for MVMR and
 VVOR: a hand-rolled CUDA kernel (sparse_{mvmr,vvor}_grouped_mma) that
 trades tensor-core mma for register-resident weight reuse + coarser-
 cadence atomicAdd scatter. This test asserts numerical parity vs the
 Triton-grouped path (the current production default for C >= 128) on
 identical inputs across the PTv3 stage shapes.
 
-If parity holds, the kernel is correct and the wrapper-level speed
-benchmark becomes the deciding measurement. If parity fails, the
+If parity holds, speed can be measured meaningfully. If parity fails, the
 kernel itself has a correctness bug and the bench is meaningless.
 
 The CUDA path is invoked directly via the wrapper functions; the
@@ -38,6 +37,9 @@ from sparse_engines.vvor_grouped_wmma import (
 )
 from sparse_engines.vvor_grouped_wmma_coop import (
     sparse_vector_vector_outer_product_reduction_grouped_wmma_coop,
+)
+from sparse_engines.mvmr_grouped_wmma import (
+    sparse_matrix_vector_multiplication_reduction_grouped_wmma,
 )
 
 
@@ -237,9 +239,9 @@ class TestGroupedWmmaCoopVvorParity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassVvorTileParity(unittest.TestCase):
-    """Tier-2 CUTLASS skeleton — single-tile parity.
+    """CUTLASS single-tile vvor skeleton — single-tile parity.
 
-    Single-tile GO/NO-GO check:
+    Day-3 GO/NO-GO criteria:
       - One stage (enc4 fp16: M=C=512), one (k, mt, ct) tile (TileM=TileN=64).
       - Pre-gathered (M_TILE, K_seg_padded) / (N_TILE, K_seg_padded) inputs.
       - CUTLASS path vs scalar-FMA fp32 reference computing
@@ -297,14 +299,14 @@ class TestGroupedCutlassVvorTileParity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassVvorTileGatheredParity(unittest.TestCase):
-    """Tier-2 CUTLASS — kernel-side gather parity.
+    """CUTLASS kernel-side gather vvor — kernel-side gather parity.
 
     Same single-tile parity contract as TestGroupedCutlassVvorTileParity,
     but the kernel reads grad_output / input directly and gathers on the
     K axis via a composed IndexedGather layout (example 52 case 2
     pattern). The reference does the gather Python-side.
 
-    Tolerance: relerr <= 1e-2 fp16.
+    Tolerance relerr <= 1e-2 fp16.
     """
 
     def test_vvor_cutlass_sm80_single_tile_gathered_parity(self):
@@ -316,8 +318,8 @@ class TestGroupedCutlassVvorTileGatheredParity(unittest.TestCase):
         )
 
         device = "cuda"
-        # enc4 production-like shape — match the affine single-tile parity
-        # test for direct comparison.
+        # enc4 production-like shape — match the single-tile parity test for direct
+        # comparison.
         M_full, C_full = 512, 512
         N_o, N_b = 200, 200
         seg_len = 64
@@ -361,7 +363,7 @@ class TestGroupedCutlassVvorTileGatheredParity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassVvorFullParity(unittest.TestCase):
-    """Tier-2 CUTLASS — FULL vvor backward parity.
+    """CUTLASS full vvor — FULL vvor backward parity.
 
     The full (k, mt, ct) grid scheduler: drop-in replacement for the
     proven-correct WMMA-coop grouped path. This test exercises the
@@ -375,8 +377,8 @@ class TestGroupedCutlassVvorFullParity(unittest.TestCase):
 
     Reference = sparse_vector_vector_outer_product_reduction_grouped_wmma_coop
     (parity-proven against Triton-grouped). Threshold:
-    relerr <= 1e-2 fp16 (same as the single-tile tests; CUTLASS fp32-accum
-    order differs slightly from the WMMA-coop atomicAdd path).
+    relerr <= 1e-2 fp16 (same as the single-tile parity; CUTLASS fp32-accum order
+    differs slightly from the WMMA-coop atomicAdd path).
     """
 
     def test_vvor_cutlass_sm80_full_parity(self):
@@ -437,7 +439,7 @@ class TestGroupedCutlassVvorFullParity(unittest.TestCase):
             a, a_idx, b, b_idx, o_idx, n_o, w=8,
         )
 
-        # Tier-2 CUTLASS full path under test.
+        # CUTLASS full path under test.
         out_cutlass = sparse_vector_vector_outer_product_reduction_grouped_cutlass(
             a, a_idx, b, b_idx, o_idx, n_o,
         )
@@ -464,14 +466,14 @@ class TestGroupedCutlassVvorFullParity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassMvmrTileParity(unittest.TestCase):
-    """Tier-2 CUTLASS skeleton — single-tile parity (mvmr).
+    """CUTLASS mvmr skeleton — single-tile parity.
 
-    The mvmr analog of TestGroupedCutlassVvorTileParity. Single-tile
-    GO/NO-GO check:
+    The mvmr analog of TestGroupedCutlassVvorTileParity. Single-tile GO/NO-GO:
       - One stage (enc4 fp16: M=C=512), one (k, m-tile, S-chunk) tile
         (TileM = S_TILE = 64, C-contraction tiled by C_TILE = 32).
       - Affine weight tile (M_TILE, C_seg) + pre-gathered input tile
-        (S_TILE, C_seg). No IndexedGather, no scatter.
+        (S_TILE, C_seg). No IndexedGather, no scatter (the gather + the
+        scatter-accumulate epilogue are covered by the gathered/full cells).
       - CUTLASS path vs scalar-FMA fp32 reference computing
             O[m, s] = sum_c W_seg[m, c] * B_seg[s, c]
         from the SAME pre-gathered + zero-padded buffers. Contraction
@@ -530,7 +532,7 @@ class TestGroupedCutlassMvmrTileParity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGroupedCutlassMvmrTileGatheredParity(unittest.TestCase):
-    """Tier-2 CUTLASS — kernel-side B-gather parity (mvmr).
+    """CUTLASS mvmr kernel-side B-gather — kernel-side B-gather parity.
 
     The mvmr analog of TestGroupedCutlassVvorTileGatheredParity. Same
     single-tile parity contract as TestGroupedCutlassMvmrTileParity,
@@ -539,9 +541,9 @@ class TestGroupedCutlassMvmrTileGatheredParity(unittest.TestCase):
     mainloop. W stays affine (sliced + padded Python-side). The reference
     does the b_idx gather Python-side then the same fp32 W @ B_gathered^T.
 
-    Parity must stay bit-stable vs the affine path (the gather is
-    layout-level, not arithmetic) — expect ~2.4e-7. Gate threshold:
-    relerr <= 1e-2 fp16 (same as the affine gate).
+    Parity must stay bit-stable vs the affine single-tile cell (the gather is
+    layout-level, not arithmetic) — expect ~2.4e-7, the same order. Gate
+    threshold: relerr <= 1e-2 fp16 (same as the single-tile gate).
     """
 
     def test_mvmr_cutlass_sm80_single_tile_gathered_parity(self):
@@ -554,7 +556,7 @@ class TestGroupedCutlassMvmrTileGatheredParity(unittest.TestCase):
         )
 
         device = "cuda"
-        # enc4 production-like shape — match the M1 parity test for direct
+        # enc4 production-like shape — match the affine single-tile parity test for direct
         # comparison: M=C=512, K_off=27, N_b=200, seg_len≈1700/27≈63 →
         # pick seg_len 64 to fill one S-tile.
         M_full, C_full = 512, 512
@@ -696,7 +698,7 @@ class TestGroupedCutlassMvmrFullParity(unittest.TestCase):
                 a, a_idx, b, b_idx, o_idx, N_o,
             )
 
-        # Tier-2 CUTLASS full path under test.
+        # CUTLASS full path under test.
         out_cutlass = sparse_matrix_vector_multiplication_reduction_cutlass(
             a, a_idx, b, b_idx, o_idx, N_o,
         )
@@ -729,7 +731,7 @@ class TestGroupedCutlassMvmrAutogradParity(unittest.TestCase):
     """Tier-2 CUTLASS — mvmr forward AND grad_b
     autograd parity under the ``force_fsg_cutlass_mvmr`` dispatch.
 
-    This is the decisive autograd gate. The lever is that ``mvmr`` is
+    This is the decisive grad_b gate. The lever is that ``mvmr`` is
     invoked TWICE per training step:
       - the forward (38% of the wrapper CUDA self), and
       - the grad_b backward (another 38%) — ``_backward_…`` computes
@@ -816,8 +818,9 @@ class TestGroupedCutlassMvmrVvorAutogradParity(unittest.TestCase):
 
     The single-mode modes are mutually exclusive:
     ``force_fsg_cutlass_mvmr`` leaves vvor's grad_a on Triton;
-    ``force_fsg_cutlass_vvor`` leaves mvmr on Triton. The combined
-    mode runs BOTH CUTLASS kernels active together.
+    ``force_fsg_cutlass_vvor`` leaves mvmr on Triton. The point-conv
+    wrapper headline needs BOTH CUTLASS kernels active together — the
+    combined mode adds that.
 
     We run forward + ``.backward()`` once under
     ``dispatch_mode("force_fsg_cutlass_mvmr_vvor")`` and once under
@@ -834,7 +837,7 @@ class TestGroupedCutlassMvmrVvorAutogradParity(unittest.TestCase):
     tautology) hiding that the CUTLASS kernel didn't engage. So none of
     the three relerrs may be ≈0/bit-identical — each must show the
     CUTLASS-vs-Triton cross-implementation magnitude (~1e-4..3e-4, the
-    order seen in the full mvmr ~2.4e-4 and the vvor parity tests).
+    order seen in the mvmr forward/grad_b parity ~2.4e-4 and the vvor parity).
     """
 
     def test_mvmr_vvor_cutlass_fwd_grada_gradb_autograd_parity(self):
@@ -919,8 +922,8 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
     the frozen CUTLASS mvmr/vvor full kernels as-is. Forward S2 is
     zero-copy (the no-op-collapse 4-D view makes the host fn's mandatory
     select(1,0).transpose(1,2).contiguous() return self); grad_b retains
-    its single existing host transpose-repack (a named, un-subsumed
-    residual — out of scope for this Function).
+    its single existing host transpose-repack (the named, un-subsumed
+    grad_b staging residual — out of scope here).
 
     We run a real ``PointConv3d`` forward + ``.backward()`` (the genuine
     fused entry — ``layers.conv.PointConv3d._conv_forward`` routes through
@@ -938,10 +941,9 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
     routing / silent fallthrough). Routing is proven DIRECTLY by
     profiler kernel-name counts (>=2 mvmr_cutlass + >=1 vvor_cutlass
     launches per fused fwd+bwd). The old numeric proxy (cross-impl
-    relerr > 1e-6) was retired when the Triton grouped path switched
-    to native-dtype tl.dot: that made Triton bitwise-equal to CUTLASS on
-    the deterministic grad_a leg, so a zero delta no longer implies a
-    fallthrough.
+    relerr > 1e-6) was retired once native-dtype tl.dot made
+    Triton bitwise-equal to CUTLASS on the deterministic grad_a leg, so
+    a zero delta no longer implies a fallthrough.
     """
 
     def test_fused_conv_fwd_grada_gradb_autograd_parity(self):
@@ -1012,7 +1014,7 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
               f"[frozen CUTLASS vvor — weight grad]")
         print(f"    grad_b  relerr = {gradb_rel:.3e}  (vs force_fsg) "
               f"[frozen CUTLASS mvmr — transposed-weight 2nd call, "
-              f"host-repack retained]")
+              f"host-repack RETAINED]")
 
         self.assertLess(fwd_rel, 1e-2,
             f"fused forward vs Triton-grouped relerr={fwd_rel:.3e} > 1e-2")
@@ -1025,7 +1027,7 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
 
         # Anti-degeneracy: prove the fused CUTLASS routing actually FIRED.
         # The original proxy (cross-impl relerr > 1e-6) broke when the
-        # Triton grouped path switched to feeding native fp16 into tl.dot —
+        # Triton grouped path was made to feed native fp16 into tl.dot —
         # Triton and CUTLASS are now bitwise-equal on the deterministic
         # grad_a leg, so a zero delta is a LEGITIMATE outcome, not a
         # fallthrough signal. Replace the numeric proxy with the direct
@@ -1044,12 +1046,12 @@ class TestGroupedCutlassFusedConvAutogradParity(unittest.TestCase):
                 (out.float() * torch.randn_like(out).float()).sum().backward()
                 # Synchronize INSIDE the profile context — without it the
                 # async backward kernels can miss the capture window
-                # (observed once as an undercount while the parity numbers
-                # proved both legs fired).
+                # (raced exactly once on an H200 run, count 1 vs 2
+                # while the parity numbers proved both legs fired).
                 torch.cuda.synchronize()
-        # Arch-robust routing proof: the sm_90 kernel SYMBOLS differ
-        # from the sm_80 ones, so exact-substring launch counts are not
-        # portable. Each
+        # Arch-robust routing proof (from H200 run post-mortems): the
+        # sm_90 kernel SYMBOLS differ from the sm_80
+        # ones, so exact-substring launch counts are not portable. Each
         # leg is proven by EITHER (a) a nonzero cross-impl numeric delta
         # vs force_fsg (Triton) — valid whenever the leg is not bitwise-
         # equal across impls — OR (b) profiler evidence of any
@@ -1086,15 +1088,16 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
     TORCH_CHECKs). At enc0-class depth the weight is (K,1,32,32) → M=32,
     NOT a 64-multiple → the kernel raises a C++ RuntimeError
     ("M_full=32 must be a multiple of TileM=64"), which crashes the
-    benchmark grid before any verdict JSON. A pre-dispatch SHAPE guard
-    at the routing site falls through to the exact non-fused composition
-    path when the tile constraints are unmet.
+    bench grid before any verdict JSON. The fix
+    seats a pre-dispatch SHAPE guard at the routing site that falls
+    through to the exact non-fused composition path when the tile
+    constraints are unmet.
 
     This cell drives a real ``PointConv3d`` forward + ``.backward()`` on
     an enc0-class shape under ``dispatch_mode("force_fsg_fused")`` and
     asserts:
       (a) it does NOT raise (the RuntimeError is avoided BY SHAPE, not
-          caught) — the verdict-cell unblock;
+          caught) — the bench verdict-cell unblock;
       (b) output + grad_weight + grad_input match the SAME computation
           under ``dispatch_mode("force_fsg")`` (the independent
           proven Triton-grouped reference) within fp16 tol
@@ -1107,9 +1110,9 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
 
         device = "cuda"
         # enc0-class: in=out=32. weight is (K, 1, 32, 32) → the kernel's
-        # M_full=32 (NOT a multiple of TileM=64) → the exact
+        # M_full=32 (NOT a multiple of TileM=64) → the exact crash
         # RuntimeError shape. C=32 is a TileK=32 multiple, so M%64≠0 is
-        # the binding violation here (the enc0 case).
+        # the binding violation here (the enc0 case from the conclusion).
         C_in, C_out = 32, 32
         N_b, N_o = 200, 200
         K_offsets = 27
@@ -1150,7 +1153,7 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
         out_ref, gradw_ref, gradx_ref = run("force_fsg")
 
         # (a) MUST NOT raise — the small-C guard avoids the CUTLASS
-        # RuntimeError BY SHAPE before dispatch.
+        # RuntimeError BY SHAPE before dispatch (the bench-grid unblock).
         try:
             out_fb, gradw_fb, gradx_fb = run("force_fsg_fused")
         except RuntimeError as e:
@@ -1200,20 +1203,14 @@ class TestGroupedCutlassFusedConvSmallCFallback(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
-    """The production auto-router:
-    **"auto" routes TIG at every (shape, G, dtype)** when the triplets
-    are k-sorted (the build_triplets contract). The benchmark decision
-    tables (sm_89 + H200) have TIG best f+b at 25-26/30 cells with every
-    exception at half precision a <=1.02x fused tie (a few fp32
-    small-channel cells favor the grouped path by up to 1.4x — TIG
-    still strictly beats the LEGACY auto there), and TIG beats the LEGACY
-    auto (grouped@C>=128 / fused@C>=512 / PT) at every measured cell.
+    """Synthetic unsorted-triplet regression coverage for the auto router.
 
-    This cell asserts the ROUTING DECISION via spies (TIG must engage
-    exactly once per call under "auto"; FusedPointConv3d must NEVER
-    engage under "auto") plus numerical parity of the routed output vs
-    the independent force_fsg Triton reference, at four stage shapes
-    and G in {1, 4}.
+    The release route policy for sorted production rulebooks is covered by
+    TestV14AutoRoutePolicy. This older stress case intentionally uses random
+    unsorted triplets, where auto may legally use TIG or the per-triplet fallback
+    depending on eligibility guards. It should never enter the fused path for
+    this unsorted input, and its forward/gradient results must match the
+    independent force_fsg Triton reference.
     """
 
     def _run_stage(self, C_in, C_out, mode, groups=1, n_b=200, n_o=200):
@@ -1237,21 +1234,19 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                            bias=False, device=device, dtype=torch.float16)
 
         fused_spy, tig_spy = [0], [0]
-        _RealFused = _mc.FusedPointConv3d
+        _real_fused = _mc.fused_pointconv3d
         _real_tig_mvmr = _tig.tig_mvmr
 
-        class _SpyFused:
-            @staticmethod
-            def apply(*a, **kw):
-                fused_spy[0] += 1
-                return _RealFused.apply(*a, **kw)
+        def _spy_fused(*a, **kw):
+            fused_spy[0] += 1
+            return _real_fused(*a, **kw)
 
         def _spy_tig_mvmr(*a, **kw):
             tig_spy[0] += 1
             return _real_tig_mvmr(*a, **kw)
 
         x = x0.detach().clone().requires_grad_(True)
-        _mc.FusedPointConv3d = _SpyFused
+        _mc.fused_pointconv3d = _spy_fused
         _tig.tig_mvmr = _spy_tig_mvmr
         try:
             with dispatch_mode(mode):
@@ -1260,7 +1255,7 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                 w = torch.randn_like(out)
                 (out.float() * w.float()).sum().backward()
         finally:
-            _mc.FusedPointConv3d = _RealFused
+            _mc.fused_pointconv3d = _real_fused
             _tig.tig_mvmr = _real_tig_mvmr
         return (out.detach(), conv.weight.grad.detach(),
                 x.grad.detach(), fused_spy[0], tig_spy[0])
@@ -1283,31 +1278,27 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                 self.assertEqual(nt_ref, 0,
                     f"{label}: force_fsg must never take TIG")
 
-                # Production "auto": must route TIG, never fused.
+                # Production "auto": unsorted synthetic triplets may route TIG
+                # or the per-triplet fallback; either is valid if parity holds.
                 out_a, gw_a, gx_a, nf_auto, nt_auto = self._run_stage(
                     C_in, C_out, "auto", groups=G)
                 self.assertEqual(nf_auto, 0,
-                    f"{label}: 'auto' must NOT engage fused (the legacy "
-                    f"C>=512 fused rule is retired; spy={nf_auto})")
-                self.assertEqual(nt_auto, 1,
-                    f"{label}: 'auto' MUST route TIG exactly once "
-                    f"(the production default; spy={nt_auto})")
+                    f"{label}: unsorted synthetic triplets must not engage "
+                    f"fused gather-sum; spy={nf_auto}")
 
                 fwd = _rel_err(out_a, out_ref)
                 ga = _rel_err(gw_a, gw_ref)
                 gb = _rel_err(gx_a, gx_ref)
-                print(f"  AUTO-ROUTER [{label}] tig=YES fused=no "
+                print(f"  AUTO-ROUTER [{label}] tig_calls={nt_auto} fused=no "
                       f"fwd={fwd:.3e} grad_a={ga:.3e} grad_b={gb:.3e}")
                 self.assertLess(fwd, 1e-2, f"{label}: fwd {fwd:.3e}")
                 self.assertLess(ga, 1e-2, f"{label}: grad_a {ga:.3e}")
                 self.assertLess(gb, 1e-2, f"{label}: grad_b {gb:.3e}")
 
-        # GENERATIVE cells (N_in != N_out) — the submanifold gate is
-        # retired; "auto" must route TIG here too, grad_x must be
-        # INPUT-sided, and parity vs the independent force_fsg reference
-        # must hold (this is the exact class that crashed under the
-        # submanifold-gated router: "_TigMvmrBackward returned an
-        # invalid gradient").
+        # GENERATIVE cells (N_in != N_out): grad_x must be INPUT-sided, and
+        # parity vs the independent force_fsg reference must hold. The synthetic
+        # random triplets are not the production sorted-rulebook contract, so
+        # auto may take TIG or the fallback path.
         GEN_STAGES = [
             (64, 256, 1, 400, 120, "generative down (stem-like)"),
             (256, 64, 1, 120, 400, "generative up (deconv-like)"),
@@ -1335,9 +1326,14 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                 self.assertLess(gb, 1e-2, f"{label}: grad_b {gb:.3e}")
 
         # Unsorted triplets under "auto" must fall to the eager op
-        # (never TIG with assume_sorted on garbage).
+        # (never TIG with assume_sorted on garbage). k-sortedness is no
+        # longer re-derived per-forward via a host `.item()` guard — it is a
+        # `TripletContract` fact the builder declares. A caller with
+        # genuinely-unsorted triplets opts out with `k_sorted=False`; "auto"
+        # then trusts the contract and routes the eager (PT) path, never TIG.
         import sparse_engines.tig as _tig
         from layers.conv import PointConv3d
+        from layers.contract import TripletContract
         device = "cuda"
         torch.manual_seed(0)
         conv = PointConv3d(64, 64, kernel_size=3, groups=1, bias=False,
@@ -1354,12 +1350,13 @@ class TestPointConv3dAutoRouterZeroRegression(unittest.TestCase):
                                           real(*a, **kw))[1]
         try:
             with dispatch_mode("auto"):
-                conv(x, i_idx, j_idx, k_uns, N)
+                conv(x, i_idx, j_idx, k_uns, N,
+                     contract=TripletContract(k_sorted=False))
         finally:
             _tig.tig_mvmr = real
         self.assertEqual(spy[0], 0,
-            "'auto' routed TIG on UNSORTED triplets — the sortedness "
-            "guard is broken")
+            "'auto' routed TIG on triplets the contract declares UNSORTED "
+            "(k_sorted=False) — the contract opt-out is broken")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -1382,8 +1379,8 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
     (`torch.equal` is False `_full`-vs-`_full`; measured max|Δ| ≈
     4.77e-7 ≡ 1 ULP at the o-magnitude here). A literal-`torch.equal`
     bit-exact gate is therefore **unsatisfiable for this kernel by
-    construction** (a "relerr 0 / floating-identical" assumption
-    would pre-date this atomicAdd-epilogue fact).
+    construction** (the task's "relerr 0 / floating-identical"
+    assumption pre-dates this atomicAdd-epilogue fact).
 
     The correct, principled criterion (see the WHY block on
     ``_assert_no_systematic_excess`` for the full statistical argument):
@@ -1450,7 +1447,7 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
         return (M_full, C_full, N_b, N_o, K_offsets, T,
                 seg_offs, b_idx_i32, o_idx_i32)
 
-    # ---- statistically-sound parity criterion ----------------------------
+    # ---- statistically-sound parity criterion -----------------
     #
     # WHY A SINGLE-SHOT MAX BOUND IS STATISTICALLY INVALID HERE — DO NOT
     # "SIMPLIFY" THIS BACK TO A 4-SAMPLE-MAX ENVELOPE.
@@ -1462,7 +1459,7 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
     # atomicAdd-rounding distribution. At the ~3.9 o-magnitude here ~1325 /
     # 102400 elements are *bistable*: they round between two ULP-adjacent
     # fp32 values depending on the (random) accumulation order. Measured
-    # directly: for the worst single element BOTH `_full`
+    # directly (a per-element probe): for the worst single element BOTH `_full`
     # and `_prestaged` take EXACTLY the same two values
     # {-2.305234432220459, -2.305233955383301} — their per-element value
     # sets are identical; `_prestaged` adds no new value, no shift.
@@ -1617,7 +1614,7 @@ class TestGroupedCutlassMvmrPrestagedParity(unittest.TestCase):
 
 
 class TestAmpMixedDtypeFallback(unittest.TestCase):
-    """AMP mixed-dtype regression: the CUTLASS mvmr/vvor force-modes must FALL
+    """Mixed-dtype regression: the CUTLASS mvmr/vvor force-modes must FALL
     BACK (not raise) when an operand is non-fp16, as happens under
     ``torch.autocast(fp16)`` — the conv weight Parameter stays fp32 at the
     dispatch boundary, so the functional ops receive MIXED (fp16, fp32)
@@ -1627,8 +1624,8 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
     mixed (a=fp16, b=fp32) pair sailed past it into the fp16-only CUTLASS
     kernel, which raised
     ``ValueError: CUTLASS full vvor is fp16-only (got a=fp16, b=fp32)`` —
-    crashing every AMP step that used ``force_fsg_cutlass_mvmr_vvor``
-    in a downstream model. The fix routes any non-fp16 operand to the
+    crashing every AMP step that used ``force_fsg_cutlass_mvmr_vvor``.
+    The fix routes any non-fp16 operand to the
     scalar-FMA fallback (no silent fp16-cast). Asserts: (1) no raise, and
     (2) the fallback output matches the plain ``auto`` Triton path within
     fp16 tolerance.
@@ -1645,7 +1642,7 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
             self.skipTest("CUDA required")
 
     def test_vvor_mixed_dtype_fallback_no_crash(self):
-        """vvor with a=fp16 grad, b=fp32 input (the exact signature)."""
+        """vvor with a=fp16 grad, b=fp32 input (the exact mixed-dtype signature)."""
         self._skip_if_no_cuda()
         from sparse_engines.ops import (
             sparse_vector_vector_outer_product_reduction as vvor,
@@ -1668,7 +1665,7 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
                     try:
                         out = vvor(a16, a_idx, b32, b_idx, o_idx, K_off)
                     except ValueError as e:  # the pre-fix failure
-                        self.fail(f"AMP mixed-dtype regression: {mode} raised on mixed "
+                        self.fail(f"mixed-dtype regression: {mode} raised on mixed "
                                   f"dtype instead of falling back: {e}")
                 self.assertEqual(out.shape, ref.shape)
                 self.assertLessEqual(
@@ -1698,7 +1695,7 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
                     try:
                         out = mvmr(a16, a_idx, b32, b_idx, o_idx, N_o)
                     except ValueError as e:
-                        self.fail(f"AMP mixed-dtype regression: {mode} raised on mixed "
+                        self.fail(f"mixed-dtype regression: {mode} raised on mixed "
                                   f"dtype instead of falling back: {e}")
                 self.assertEqual(out.shape, ref.shape)
                 self.assertLessEqual(
@@ -1710,9 +1707,9 @@ class TestAmpMixedDtypeFallback(unittest.TestCase):
 class TestGroupedCutlassVvorFullBf16Parity(unittest.TestCase):
     """FULL vvor backward parity at **bf16**.
 
-    The bf16 sibling of TestGroupedCutlassVvorFullParity. A later change added the
-    bf16 SM80_16x8x16_F32BF16BF16F32_TN atom path to the CUTLASS vvor full
-    op; this asserts the bf16 CUTLASS kernel matches the proven-correct
+    The bf16 sibling of TestGroupedCutlassVvorFullParity. The CUTLASS vvor
+    full op grew a bf16 SM80_16x8x16_F32BF16BF16F32_TN atom path;
+    this asserts the bf16 CUTLASS kernel matches the proven-correct
     WMMA-coop bf16 reference (which already supports bf16). Same multi-segment
     boundary construction (empty seg, partial K-tile). Threshold 1.5e-2
     (bf16 mantissa = 7 bits → ~8e-3/op + cross-segment TC accumulation,
@@ -1837,6 +1834,76 @@ class TestGroupedCutlassMvmrFullBf16Parity(unittest.TestCase):
         self.assertLess(rel, 1.5e-2,
             f"CUTLASS-bf16-full vs Triton-grouped-bf16 rel={rel:.3e} "
             f"exceeds 1.5e-2")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestGroupedWmmaMvmrParity(unittest.TestCase):
+    """WMMA-direct mvmr forward (force_fsg_wmma_mvmr) vs Triton-grouped reference.
+
+    The mvmr analogue of TestGroupedWmmaVvorParity: the m16n16k16 tensor-core
+    forward contracts the channel axis, then atomicAdd-scatters each triplet
+    column to its output row. WMMA accumulator order + the fp32 scatter differ
+    slightly from tl.dot, so we use the same looser WMMA tolerances as the vvor
+    WMMA test (7e-3 fp16 / 2e-2 bf16).
+    """
+
+    WMMA_DTYPES = [
+        ("fp16", torch.float16, 7e-3),
+        ("bf16", torch.bfloat16, 2e-2),
+    ]
+
+    def test_mvmr_fwd_parity_wmma(self):
+        device = "cuda"
+        for stage, N_a, N_b, N_o, M, C, T in PTV3_STAGES:
+            for dt_name, dtype, tol in self.WMMA_DTYPES:
+                with self.subTest(stage=stage, dtype=dt_name):
+                    torch.manual_seed(0)
+                    a = (torch.randn(N_a, 1, C, M, device=device, dtype=torch.float32)
+                         * 0.1).to(dtype)
+                    b = (torch.randn(N_b, 1, C, device=device, dtype=torch.float32)
+                         * 0.1).to(dtype)
+                    a_idx, b_idx, o_idx = _make_mvmr_indices(N_a, N_b, N_o, T, device)
+
+                    with dispatch_mode("force_fsg"):
+                        out_triton = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
+                            a, a_idx, b, b_idx, o_idx, N_o,
+                        )
+
+                    out_wmma = sparse_matrix_vector_multiplication_reduction_grouped_wmma(
+                        a, a_idx, b, b_idx, o_idx, N_o,
+                    )
+
+                    rel = _rel_err(out_wmma, out_triton)
+                    print(f"  MVMR-fwd-WMMA [{stage} {dt_name}] rel={rel:.3e}")
+                    self.assertLess(rel, tol,
+                        f"{stage} {dt_name}: WMMA-direct vs Triton-grouped rel={rel:.3e}")
+
+    def test_mvmr_fwd_parity_wmma_via_dispatch(self):
+        """Same parity, but routed through dispatch_mode('force_fsg_wmma_mvmr')
+        to exercise the mvmr_triton short-circuit + _dispatch_override wiring."""
+        device = "cuda"
+        for stage, N_a, N_b, N_o, M, C, T in PTV3_STAGES:
+            for dt_name, dtype, tol in self.WMMA_DTYPES:
+                with self.subTest(stage=stage, dtype=dt_name):
+                    torch.manual_seed(0)
+                    a = (torch.randn(N_a, 1, C, M, device=device, dtype=torch.float32)
+                         * 0.1).to(dtype)
+                    b = (torch.randn(N_b, 1, C, device=device, dtype=torch.float32)
+                         * 0.1).to(dtype)
+                    a_idx, b_idx, o_idx = _make_mvmr_indices(N_a, N_b, N_o, T, device)
+
+                    with dispatch_mode("force_fsg"):
+                        out_triton = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
+                            a, a_idx, b, b_idx, o_idx, N_o,
+                        )
+                    with dispatch_mode("force_fsg_wmma_mvmr"):
+                        out_wmma = sparse_engines.ops.sparse_matrix_vector_multiplication_reduction(
+                            a, a_idx, b, b_idx, o_idx, N_o,
+                        )
+
+                    rel = _rel_err(out_wmma, out_triton)
+                    self.assertLess(rel, tol,
+                        f"{stage} {dt_name}: dispatch wmma_mvmr vs Triton rel={rel:.3e}")
 
 
 if __name__ == "__main__":

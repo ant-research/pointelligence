@@ -30,8 +30,7 @@ from ._seg_offs import (is_sorted_cached, kernel_offset_segments,
 from ._dispatch_override import current_mode, resolve_input_precision
 
 # Channel threshold: grouped path wins above the tensor-core mma break-even.
-# Empirical (PointConv3d engine bench at PTv3 stage shapes,
-# RTX 5880 Ada, May 2026, fwd+bwd ms vs per_triplet):
+# Empirical stage-shape benchmark on RTX 5880 Ada, fwd+bwd ms vs per_triplet:
 #   - C = 32:   per_triplet wins by ~30%  (tiny C → tl.dot setup cost > tensor-core gain)
 #   - C = 64:   per_triplet wins by ~10%
 #   - C = 128:  grouped wins by 12-21% (fp16/bf16); fp32 within 2% (tied)
@@ -41,12 +40,12 @@ from ._dispatch_override import current_mode, resolve_input_precision
 # dtypes win meaningfully there. Picking dtype-specific thresholds adds
 # complexity for no measurable improvement at the wash point.
 #
-# Lowered 128 → 64 (June 2026). Post-v1.2.0, submanifold+sorted
+# Lowered 128 → 64. Post-v1.2.0, submanifold+sorted
 # production convs route TIG before this gate fires, so its jurisdiction is
 # the GENERATIVE shapes (strided partition / fan-in-1 deconv) + their
 # backward legs + unsorted callers (which fall at the sortedness check
 # regardless of C). At that population, measured on real ScanNet at both
-# sm_89 and sm_90 (generative-shapes operator bench): the
+# sm_89 and sm_90 (benchmarks/operators/bench_generative_shapes.py): the
 # grouped path wins the C=64 fan-in-1 deconv cells by 1.4-1.9x f+b — the
 # old C=64 row above was (a) a submanifold 3^3 shape this gate no longer
 # governs and (b) measured before the native-dtype mma squeeze.
@@ -103,8 +102,8 @@ def _try_grouped_dispatch(
     # bypasses these and runs the sortedness check.
     # The G==1 gate is lifted for force modes — the grouped
     # kernel's grid/pointer math is G-generic (one group per program at
-    # BLOCK_SIZE_G=1, tl.dot fires per group). auto keeps G==1 until the
-    # routing decision lands (no production behavior change).
+    # BLOCK_SIZE_G=1, tl.dot fires per group). auto keeps G==1 (no
+    # production behavior change).
     if mode == "auto":
         if G != 1:
             return False
@@ -152,13 +151,14 @@ def sparse_matrix_vector_multiplication_reduction(
 ) -> Tensor:
     # When the dispatch override is
     # "force_fsg_cutlass_mvmr", route this functional op to the
-    # Tier-2 CUTLASS implicit-GEMM + S-mode IndexedGather + atomicAdd
+    # CUTLASS implicit-GEMM + S-mode IndexedGather + atomicAdd
     # scatter mvmr. Because grad_b is computed by a *second* call to
     # this same functional op (with a transposed weight `a.transpose(2,3)`
     # — see `_backward_…` below), routing here closes BOTH the forward
-    # (38%) and the grad_b backward (38%). The
-    # CUTLASS path is fp16-only (like cutlass vvor); fp32 /
-    # bf16 fall through to the existing Triton-grouped path. The CUTLASS
+    # and the grad_b backward — the whole lever. The
+    # CUTLASS path is half-precision-only (like cutlass vvor); fp32 /
+    # bf16 mismatched pairs fall through to the existing Triton-grouped
+    # path. The CUTLASS
     # wrapper enforces the remaining hard preconditions (G == 1, sorted
     # a_idx, M/C tile multiples) and raises on violation. The autograd
     # hooks registered on this @triton_op below still apply, so the
@@ -166,19 +166,34 @@ def sparse_matrix_vector_multiplication_reduction(
     # The combined "force_fsg_cutlass_mvmr_vvor" mode ALSO routes
     # mvmr (fwd+grad_b) here — it composes this mvmr routing with the
     # vvor grad_a CUTLASS routing in vvor_triton.py so both kernels are
-    # active in the same forward/backward.
+    # active in the same forward/backward (the wrapper headline).
     #
     # Require BOTH operands the SAME tensor-core dtype, not
     # just `a`. The CUTLASS mvmr kernel needs matched operands —
     # `mvmr_cutlass.py` raises on any mismatched or non-{fp16,bf16} pair.
-    # The old `a.dtype == float16`-only guard was safe for standard AMP (the
+    # An `a.dtype == float16`-only guard would be safe for standard AMP (the
     # weight Parameter stays fp32 → a=fp32 → falls through), but a MIXED
     # (a=fp16 weight, b=fp32 input) pair would pass it and crash the kernel.
     # Gating on both operands sharing a CUTLASS-supported dtype mirrors the
     # kernel's real precondition and routes any other pair to the
     # Triton-grouped path below. No silent cast (preserves autocast numerics).
-    # bf16 now also engages CUTLASS (was fp16-only); fp32
+    # bf16 also engages CUTLASS; fp32
     # still falls through (no SM80 fp32-input tensor-core atom).
+    # Hand-WMMA grouped mvmr forward (the mvmr analogue of force_fsg_wmma_vvor):
+    # route the forward through the m16n16k16 tensor-core kernel. fp16/bf16 only
+    # (no fp32 WMMA atom); mixed/fp32 pairs fall through to the Triton path. Like
+    # the cutlass mode, this intercepts only the mvmr forward op — grad_a (vvor)
+    # and grad_b (a second mvmr call) stay on Triton unless a vvor mode is also set.
+    if current_mode() == "force_fsg_wmma_mvmr" \
+            and a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16):
+        from .mvmr_grouped_wmma import (
+            sparse_matrix_vector_multiplication_reduction_grouped_wmma,
+        )
+        out = sparse_matrix_vector_multiplication_reduction_grouped_wmma(
+            a, a_idx, b, b_idx, o_idx, n_o,
+        )
+        return out.to(a.dtype) if out.dtype != a.dtype else out
+
     if current_mode() in (
         "force_fsg_cutlass_mvmr", "force_fsg_cutlass_mvmr_vvor",
     ) and a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16):

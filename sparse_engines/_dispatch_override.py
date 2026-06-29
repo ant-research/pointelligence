@@ -23,6 +23,7 @@ Not thread-safe — tests using these context managers must run serially
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Literal
 
@@ -43,27 +44,28 @@ from typing import Literal
 #   "force_fsg_cutlass_mvmr" — mvmr-only: route the mvmr functional
 #                      op (forward AND the grad_b backward, which is a
 #                      second mvmr call with a transposed weight) through
-#                      the Tier-2 CUTLASS path.
-#                      fp16 OR bf16 (via the
-#                      SM80_16x8x16_F32BF16BF16F32_TN atom) / G==1 /
+#                      the CUTLASS path.
+#                      fp16 OR bf16 (the bf16
+#                      SM80_16x8x16_F32BF16BF16F32_TN atom is supported) / G==1 /
 #                      sorted-a_idx only; fp32 (and mixed-dtype pairs)
 #                      fall back to the existing Triton-grouped path —
 #                      no SM80 fp32-input tensor-core atom of this shape.
 #                      vvor stays on whatever Triton routing applies.
-#   "force_fsg_cutlass_mvmr_vvor" — combined mode: route mvmr fwd+grad_b
-#                      → CUTLASS mvmr AND
+#   "force_fsg_cutlass_mvmr_vvor" — combined mode:
+#                      route mvmr fwd+grad_b → CUTLASS mvmr AND
 #                      vvor grad_a → CUTLASS vvor *simultaneously* in the
 #                      same forward/backward. The single-mode modes are
 #                      mutually exclusive: under
 #                      "force_fsg_cutlass_mvmr" vvor's grad_a falls
 #                      back to Triton, and "force_fsg_cutlass_vvor"
-#                      leaves mvmr on Triton — so having CUTLASS mvmr
-#                      fwd+grad_b AND CUTLASS vvor grad_a active together
-#                      is inexpressible without this. Composes the two
-#                      already-proven component routings under one label;
-#                      each keeps its own dtype gating (both mvmr AND vvor
-#                      CUTLASS now accept fp16 OR bf16; fp32 / mixed-dtype
-#                      pairs fall back — mvmr to Triton-grouped, vvor to
+#                      leaves mvmr on Triton — so the wrapper
+#                      headline (CUTLASS mvmr fwd+grad_b AND CUTLASS vvor
+#                      grad_a active together) is inexpressible without
+#                      this. Composes the two already-proven component
+#                      routings under one label; each keeps its own dtype
+#                      gating (both mvmr AND vvor CUTLASS
+#                      accept fp16 OR bf16; fp32 / mixed-dtype pairs
+#                      fall back — mvmr to Triton-grouped, vvor to
 #                      scalar-FMA).
 #   "force_fsg_fused" — route PointConv3d's mvmr+autograd
 #                      through the single `FusedPointConv3d` Function
@@ -73,7 +75,7 @@ from typing import Literal
 #                      forward S2 is zero-copy (no-op-collapse view), the
 #                      frozen CUTLASS mvmr/vvor full kernels are reused
 #                      as-is. grad_b retains its single existing host
-#                      transpose-repack. fp16/
+#                      transpose-repack (the residual). fp16/
 #                      G==1/sorted/tile-multiple — same hard preconditions
 #                      as the underlying _cutlass entry points (which
 #                      raise on violation). All other modes/paths are
@@ -97,10 +99,10 @@ _LEGACY_RENAMES = {
 
 DispatchMode = Literal[
     "auto", "force_fsg", "force_pt",
-    "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
+    "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor", "force_fsg_wmma_mvmr",
     "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
     "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
-    "force_tig",
+    "force_tig", "force_fused_gather_sum", "force_fgs",
 ]
 
 # ── tl.dot input precision for the grouped path ──
@@ -111,7 +113,16 @@ DispatchMode = Literal[
 PrecisionMode = Literal["default", "ieee", "tf32"]
 
 
-_state: dict = {"mode": "auto", "precision": "default"}
+# PNT_DISPATCH_MODE pins the default dispatch mode process-wide (e.g. a real
+# training run forced to force_tig vs force_fused_gather_sum for an e2e version A/B,
+# where the bench can't wrap every conv call in a dispatch_mode() context). The
+# dispatch_mode() context manager still overrides it locally. Unset = "auto".
+def _normalize_dispatch_mode(mode: DispatchMode) -> DispatchMode:
+    return "force_fused_gather_sum" if mode == "force_fgs" else mode
+
+
+_state: dict = {"mode": _normalize_dispatch_mode(os.environ.get("PNT_DISPATCH_MODE", "auto")),
+                "precision": "default"}
 
 
 def current_mode() -> DispatchMode:
@@ -161,10 +172,10 @@ def dispatch_mode(mode: DispatchMode):
     """
     if mode not in (
         "auto", "force_fsg", "force_pt",
-        "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor",
+        "force_fsg_wmma_vvor", "force_fsg_wmma_coop_vvor", "force_fsg_wmma_mvmr",
         "force_fsg_cutlass_vvor", "force_fsg_cutlass_mvmr",
         "force_fsg_cutlass_mvmr_vvor", "force_fsg_fused",
-        "force_tig",
+        "force_tig", "force_fused_gather_sum", "force_fgs",
     ):
         if mode in _LEGACY_RENAMES:
             raise ValueError(
@@ -172,7 +183,7 @@ def dispatch_mode(mode: DispatchMode):
                 f"{_LEGACY_RENAMES[mode]!r} (v1.2.0 PT/FSG/TIG taxonomy)")
         raise ValueError(f"unknown dispatch mode: {mode!r}")
     prev = _state["mode"]
-    _state["mode"] = mode
+    _state["mode"] = _normalize_dispatch_mode(mode)
     try:
         yield
     finally:
@@ -204,7 +215,7 @@ def precision_mode(mode: PrecisionMode):
         _state["precision"] = prev
 
 
-# ── PT-fallback advisory ─────────────────────────────────────────────────
+# ── PT-fallback advisory (user-requested) ────────────────────────
 # Per-triplet is the correctness fallback, not a performance path: under
 # "auto" every production route prefers TIG (sorted) or the grouped
 # engine. Landing on PT under "auto" therefore signals an optimization

@@ -406,6 +406,7 @@ def radius_search_tiled(
     return_distances=False,
     dtype_num_neighbors=torch.int64,
     distance_type="ball",
+    block_p: int = 256,
 ):
     """Tiled brute-force radius search (PyKeOPS-style).
 
@@ -426,6 +427,7 @@ def radius_search_tiled(
         return_distances: if True, also return per-neighbor distances.
         dtype_num_neighbors: dtype for per-query neighbor counts.
         distance_type: "ball" (Euclidean) or "chebyshev" (L-inf).
+        block_p: number of reference points scanned by each tiled program.
 
     Returns:
         neighbors: (N,) point indices of confirmed neighbors.
@@ -439,7 +441,7 @@ def radius_search_tiled(
 
     device = points.device
     num_points, num_queries = points.shape[0], queries.shape[0]
-    BLOCK_P = 256
+    BLOCK_P = int(block_p)
 
     q_batch_starts, q_batch_ends = _compute_batch_ranges(
         sample_inds, query_sample_inds, num_points, num_queries, device)
@@ -542,7 +544,12 @@ def radius_search(
 
     # Choose backend based on per-batch size
     use_tiled = False
+    tiled_block_p = 256
     if grid_size is not None and (radius / grid_size) >= tiled_radius_multiplier_threshold:
+        # Large-radius strided stems have high candidate density. Wider point
+        # tiles reduce launch and loop overhead while preserving exact radius
+        # membership.
+        tiled_block_p = 4096
         use_tiled = True
     elif sample_inds is not None and tiled_batch_threshold > 0:
         _sample_sizes = (
@@ -573,6 +580,7 @@ def radius_search(
             return_distances=return_distances,
             dtype_num_neighbors=torch.int64,
             distance_type=distance_type,
+            block_p=tiled_block_p,
         )
 
     if point_num <= point_num_max or sample_inds is None:

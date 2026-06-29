@@ -63,9 +63,9 @@ node, 3 kernel launches per forward+backward).
 
 ### The first design — and why it was rejected
 
-The obvious starting point was the approach the specialized *injective*
-voxel engines use, of which **FlexGEMM** is the cleanest published example:
-an **output-stationary masked-tiling** schedule. Sort the output rows so
+The obvious starting point was the approach specialized *injective*
+voxel-convolution engines use: an **output-stationary masked-tiling**
+schedule. Sort the output rows so
 rows with similar tap-occupancy bitmasks share a tile, then run an implicit
 GEMM where each tile computes only its active taps. For the exact-match
 voxel operator this works beautifully — injectivity bounds each row's mask
@@ -287,17 +287,6 @@ TIG's forward by 7–14% at most grouped `c256`/`c512` cells on Ada (one bf16
 cell reaches 21%) and by 6–18%, scattered, on H200. Forward+backward, TIG
 still leads every one of those cells; forward-only deployments can pin
 `force_fsg` there.
-
-### Against external engines
-
-Context, measured on H200 at the same workloads: TIG wins forward+backward
-against a leading specialized voxel-convolution engine at 32/35 cells (22/25
-real-data; the sole losses are indoor shallow-stage fp16 at 1.03–1.09×).
-Against **FlexGEMM** — which executes the narrower *injective* exact-match
-voxel operator, not the general variable-fan-in operator TIG computes — TIG
-pays a measured 1.0–1.6× generality surcharge on real scans, converging to
-parity as fan-in approaches 1: the gap tracks the extra mathematics the
-general operator performs, not kernel quality.
 
 ## Performance — end-to-end
 

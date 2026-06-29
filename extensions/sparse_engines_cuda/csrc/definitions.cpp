@@ -38,18 +38,25 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// fp32 inputs to sparse_vvor_grouped_mma instead.
 	m.def("sparse_vvor_grouped_wmma(Tensor grad_out, Tensor a_idx, Tensor b, Tensor b_idx, Tensor o_idx, Tensor seg_offs, int n) -> Tensor");
 
+	// WMMA-direct mvmr (forward) — the mvmr analogue of the vvor WMMA path.
+	// Same I/O shape as sparse_mvmr_grouped_mma; the inner loop contracts the
+	// channel axis with wmma::mma_sync on m16n16k16 fp16/bf16 tiles and
+	// atomicAdd-scatters each triplet column to out[o_idx]. Requires
+	// M % 16 == 0 and C % 16 == 0; fp32 dispatches to sparse_mvmr_grouped_mma.
+	m.def("sparse_mvmr_grouped_wmma(Tensor a, Tensor a_idx, Tensor b, Tensor b_idx, Tensor o_idx, Tensor seg_offs, int n) -> Tensor");
+
 	// Cooperative-warp split-K WMMA vvor.
 	// Adds an extra `w` parameter for the T-axis slice count per tile.
 	m.def("sparse_vvor_grouped_wmma_coop(Tensor grad_out, Tensor a_idx, Tensor b, Tensor b_idx, Tensor o_idx, Tensor seg_offs, int n, int w) -> Tensor");
 
-	// CUTLASS Ampere single-tile vvor skeleton (Tier-2).
+	// CUTLASS Ampere single-tile vvor skeleton.
 	// Pre-gathered (M_TILE, K_seg) / (N_TILE, K_seg) row-major fp16 inputs;
 	// returns fp32 (M_TILE, N_TILE) tile. Affine layouts only — no IndexedGather.
 	// Caller pads K_seg up to a multiple of Config::TileK (currently 32).
 	m.def("sparse_vvor_cutlass_sm80_single_tile(Tensor A_seg, Tensor B_seg, int k_seg_padded) -> Tensor");
 
-	// CUTLASS Ampere single-tile vvor with kernel-side K-mode IndexedGather
-	// (Tier-2). Takes the FULL grad_output / input
+	// CUTLASS Ampere single-tile vvor with kernel-side K-mode IndexedGather.
+	// Takes the FULL grad_output / input
 	// tensors plus per-K-element row-index arrays (i_idx/j_idx, int32) and
 	// channel-tile offsets (m_start, c_start). The CollectiveMma's cp.async
 	// loads gather along the K axis via ComposedLayout + IndexedGather. Caller
@@ -58,7 +65,7 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// not contribute to the reference either).
 	m.def("sparse_vvor_cutlass_sm80_single_tile_gathered(Tensor grad_output, Tensor input_b, Tensor i_idx_seg, Tensor j_idx_seg, int m_start, int c_start, int k_seg_padded) -> Tensor");
 
-	// Full CUTLASS Ampere vvor backward (Tier-2).
+	// Full CUTLASS Ampere vvor backward.
 	// Outer (k, mt, ct) grid scheduler — drop-in replacement for the
 	// sparse_vvor_grouped_* paths. One CTA per (k-segment, M-tile, C-tile);
 	// each reads its segment bounds from seg_offs[k]/seg_offs[k+1] and runs
@@ -68,7 +75,7 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// grad_weight shaped (n_o, 1, M, C) like the other grouped paths.
 	m.def("sparse_vvor_cutlass_sm80_full(Tensor grad_output, Tensor a_idx, Tensor input_b, Tensor b_idx, Tensor seg_offs, int n_o) -> Tensor");
 
-	// Hopper sm_90 vvor backward (Tier-2).
+	// Hopper sm_90 vvor backward.
 	// Same call signature + algorithm as sparse_vvor_cutlass_sm80_full;
 	// distinct symbol so the Python dispatcher can route sm_90 hardware.
 	// Build-only locally — correctness validated on the H200 cluster cell.
@@ -77,7 +84,7 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// sparse_vvor_cutlass_sm90.cuh for the full rationale).
 	m.def("sparse_vvor_cutlass_sm90_full(Tensor grad_output, Tensor a_idx, Tensor input_b, Tensor b_idx, Tensor seg_offs, int n_o) -> Tensor");
 
-	// CUTLASS Ampere single-tile mvmr skeleton (Tier-2).
+	// CUTLASS Ampere single-tile mvmr skeleton.
 	// Affine layouts only — no IndexedGather, no scatter. Pre-gathered
 	// (M_TILE, C_seg) weight tile + (S_TILE, C_seg) input tile, both fp16
 	// row-major C-contiguous; returns the fp32 (M_TILE, S_TILE) tile
@@ -85,7 +92,7 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// i.e. the mvmr GEMM core with the contraction over the CHANNEL axis
 	// (vs vvor's seg_len contraction). Caller pads C_seg up to a multiple
 	// of Config::TileK (currently 32). The b_idx input gather and the
-	// a_idx scatter-accumulate epilogue are handled by the gathered / full
+	// a_idx scatter-accumulate epilogue are deferred to the gathered/full
 	// entries below.
 	m.def("sparse_mvmr_cutlass_sm80_single_tile(Tensor W_seg, Tensor B_seg, int c_seg_padded) -> Tensor");
 
@@ -128,7 +135,7 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// (drop the .transpose(1,2)), NOT a host transpose flag.
 	m.def("sparse_mvmr_cutlass_sm80_full_prestaged(Tensor aT, Tensor b_idx, Tensor input_b, Tensor o_idx, Tensor seg_offs, int n_o) -> Tensor");
 
-	// Hopper sm_90 mvmr full (Tier-2).
+	// Hopper sm_90 mvmr full.
 	// Same call signature + algorithm as sparse_mvmr_cutlass_sm80_full;
 	// distinct symbol so the Python dispatcher can route sm_90 hardware.
 	// Build-only locally — correctness validated on the H200 cluster cell.
