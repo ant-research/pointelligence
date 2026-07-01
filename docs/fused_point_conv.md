@@ -122,7 +122,7 @@ output tolerance before timing.
 ## Performance Summary
 
 The release numbers below use the shipped `auto` route on real ScanNet scenes.
-They compare PointCNN++ versions under the same point-native triplet semantics;
+They compare `v1.4.0` with `v1.3.0` under the same point-native triplet semantics;
 no voxelization or neighbor dropping is introduced. Forward-only and
 forward-plus-backward are reported separately because the fused gather-sum path
 changes both the forward schedule and the VVOR-side weight-gradient schedule.
@@ -134,12 +134,12 @@ neighborhoods have enough `(output, kernel-slot)` multiplicity for gather-sum to
 avoid repeated channel contractions. `C=512` is near the TIG crossover, so the
 production route falls back where TIG is faster.
 
-| Scope | Card | Data / batch | Precision | v1.4.0 vs v1.0.0 | v1.4.0 vs v1.3.0 |
-|---|---|---|---|---:|---:|
-| Conv forward | RTX 5880 Ada | real ScanNet, val B=12 | fp16 | 8.00-11.84x at C64-C256; C512 10.02x | 1.85-3.93x at C64-C256; C512 1.08x |
-| Conv fwd+bwd | RTX 5880 Ada | real ScanNet, train B=6 | fp16 | 7.45-10.91x at C64-C256; C512 10.06x | 1.73-3.21x at C64-C256; C512 0.96x |
-| Conv forward | H200 | real ScanNet, val B=24 | fp16 | 10.47-23.51x at C64-C256; C512 22.07x | 1.63-2.30x at C64-C256; C512 1.00x |
-| Conv fwd+bwd | H200 | real ScanNet, train B=12 | fp16 | 7.48-18.25x at C64-C256; C512 19.27x | 1.40-1.57x at C64-C256; C512 0.98x |
+| Scope | Card | Data / batch | Precision | v1.4.0 vs v1.3.0 |
+|---|---|---|---|---:|
+| Conv forward | RTX 5880 Ada | real ScanNet, val B=12 | fp16 | 1.85-3.93x at C64-C256; C512 1.08x |
+| Conv fwd+bwd | RTX 5880 Ada | real ScanNet, train B=6 | fp16 | 1.73-3.21x at C64-C256; C512 0.96x |
+| Conv forward | H200 | real ScanNet, val B=24 | fp16 | 1.63-2.30x at C64-C256; C512 1.00x |
+| Conv fwd+bwd | H200 | real ScanNet, train B=12 | fp16 | 1.40-1.57x at C64-C256; C512 0.98x |
 
 The bf16 route is intentionally conservative in this release and should be read
 as a TIG-band policy, not as the fused-path headline.
@@ -152,16 +152,20 @@ ResNet-style models are more diluted, but the final release also includes a
 semantic-preserving large-radius stem scheduling update so the large-batch
 training rows are no longer a regression.
 
-| Scope | Card | Data / batch | Precision | v1.4.0 vs v1.0.0 | v1.4.0 vs v1.3.0 |
-|---|---|---|---|---:|---:|
-| ResNet34 x1 train | RTX 5880 Ada | real ScanNet, B=6 | fp16 | 1.33x | 1.05x |
-| ResNet34 x2 train | RTX 5880 Ada | real ScanNet, B=6 | fp16 | 2.29x | 1.06x |
-| ResNet34 x1 train | H200 | real ScanNet, B=12 | fp16 | 1.42x | 0.99x |
-| ResNet34 x2 train | H200 | real ScanNet, B=12 | fp16 | 2.78x | 1.00x |
-| ResUNet train | RTX 5880 Ada | real ScanNet, B=4 | fp16 | 0.85x | 1.94x |
-| ResUNet train | H200 | real ScanNet, B=12 | fp16 | 2.32x | 2.59x |
+| Scope | Card | Data / batch | Precision | v1.4.0 vs v1.3.0 |
+|---|---|---|---|---:|
+| ResNet34 x1 train | RTX 5880 Ada | real ScanNet, B=6 | fp16 | 1.05x |
+| ResNet34 x2 train | RTX 5880 Ada | real ScanNet, B=6 | fp16 | 1.06x |
+| ResNet34 x1 train | H200 | real ScanNet, B=12 | fp16 | 0.99x |
+| ResNet34 x2 train | H200 | real ScanNet, B=12 | fp16 | 1.00x |
+| ResUNet train | RTX 5880 Ada | real ScanNet, B=4 | fp16 | 1.94x |
+| ResUNet train | H200 | real ScanNet, B=12 | fp16 | 2.59x |
 
-Small-batch validation rows are intentionally not the headline: fixed overheads
+The public table reports `v1.4.0` against `v1.3.0`, the immediately previous
+release with a comparable fp16 operator stack. Earlier-release fp16 comparisons
+should be regenerated from the original release tags, or from the first release
+that shipped a comparable fp16 path, before being used as public claims. Small-
+batch validation rows are also intentionally not the headline: fixed overheads
 and non-convolution work dominate more strongly there.
 
 ## Benchmarking Protocol

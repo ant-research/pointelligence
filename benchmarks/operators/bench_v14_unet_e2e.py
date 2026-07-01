@@ -1,8 +1,13 @@
 """Production ResUNet (PointCNN++) end-to-end: real ScanNet, fwd-only + fwd+bwd,
-version arms v1.0/v1.3/v1.4, small + large batch. v1.4 is the shipped
-auto route; pass --include-force-fused to time the diagnostic force route. The seg UNet is the real
-workload (conv-heavier than the classification ResNet); this decides whether the
-operator win reaches e2e."""
+engine arms PT/TIG/AUTO, small + large batch. v1.4 is the shipped auto route;
+pass --include-force-fused to time the diagnostic force route. The seg UNet is
+the real workload (conv-heavier than the classification ResNet); this decides
+whether the operator win reaches e2e.
+
+Important fairness note: this harness uses manual mixed precision patches for
+BatchNorm/Linear so the Pointcept ResUNet can exercise fp16 conv engines. Those
+PT/TIG/AUTO arms are diagnostic schedules inside the current codebase, not a
+claim that every old release tag shipped a comparable fp16/AMP ResUNet path."""
 import os, sys, argparse
 import numpy as np, torch
 
@@ -49,7 +54,7 @@ SCENES = [
     "scene0187_00", "scene0193_00", "scene0207_00", "scene0217_00",
     "scene0221_00", "scene0011_01", "scene0019_01", "scene0249_00"]
 GS = 0.025
-BASE_ARMS = [("v1.0","force_pt"),("v1.3","force_tig"),("v1.4","auto")]
+BASE_ARMS = [("PT schedule", "force_pt"), ("TIG schedule", "force_tig"), ("AUTO v1.4 route", "auto")]
 
 
 def dedup_first(c, gs):
@@ -79,18 +84,18 @@ def main():
     args=ap.parse_args(); batches=[int(b) for b in args.batches.split(",")]
     arms=list(BASE_ARMS)
     if args.include_force_fused:
-        arms.append(("v1.4-force","force_fused_gather_sum"))
+        arms.append(("forced fused gather-sum", "force_fused_gather_sum"))
     raws=[torch.from_numpy(np.load(f"{SCAN}/{s}/coord.npy")).float().to(dev) for s in SCENES[:max(batches)]]
     model=ResUNet(in_channels=1,num_classes=16,base_channels=32,voxel_size=GS,normalize_feature=False).to(dev).to(torch.float16)
     # parity (B=2)
     inp,_=make_input(raws,2)
     outs={}
-    for _,mode in [("v1.3","force_tig"),("v1.4","auto")]:
+    for _,mode in [("TIG schedule","force_tig"),("AUTO v1.4 route","auto")]:
         with torch.no_grad(), dispatch_mode(mode):
             outs[mode]=model(inp).float()
     a,b=outs["force_tig"],outs["auto"]
     rel=(a-b).abs().max().item()/(a.abs().max().item()+1e-6)
-    print(f"ResUNet parity auto-v1.4 vs force_tig: rel={rel:.2e} shape={tuple(a.shape)} -> {'PASS' if rel<5e-2 else 'FAIL'}")
+    print(f"ResUNet parity AUTO v1.4 route vs TIG schedule: rel={rel:.2e} shape={tuple(a.shape)} -> {'PASS' if rel<5e-2 else 'FAIL'}")
     for B in batches:
         inp,N=make_input(raws,B)
         tgt=torch.randint(0,16,(N,),device=dev)

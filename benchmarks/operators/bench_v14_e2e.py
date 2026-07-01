@@ -1,12 +1,17 @@
 """v1.4.0 end-to-end release benchmark: a REAL-scene ResNet backbone forward and
-forward+backward, version-to-version, at small and large batch.
+forward+backward, across dispatch schedules, at small and large batch.
 
-Arms (same backbone, only the conv operator changes via dispatch_mode):
-  v1.0  per-triplet     force_pt
-  v1.3  TIG (seg bwd)   force_tig
-  v1.4  auto best-known route (eligible k=3/G=1/M=C/fp16 convs route to
-        fused gather-sum where the release table wins; C512 train and all
-        ineligible convs fall through to TIG)
+Arms (same backbone, only the conv operator schedule changes via
+`dispatch_mode`):
+  PT        per-triplet      force_pt
+  TIG       TIG + seg bwd    force_tig
+  AUTO      v1.4 auto route  eligible k=3/G=1/M=C/fp16 convs route to
+            fused gather-sum where the release table wins; C512 train and all
+            ineligible convs fall through to TIG
+
+This is an engine-arm diagnostic inside the current codebase. Treat historical
+release-to-release claims separately: compare only release tags/precision paths
+that actually shipped comparable support.
 
 Eager (the fused operator is a plain autograd.Function; torch.compile of the
 fused path is a separate lane). Real ScanNet scenes, voxel-dedup batched. The
@@ -36,7 +41,7 @@ SCENES = [
     "scene0187_00", "scene0193_00", "scene0207_00", "scene0217_00",
     "scene0221_00", "scene0011_01", "scene0019_01", "scene0249_00"]
 _FACTORY = {18: resnet18, 34: resnet34, 50: resnet50}
-BASE_ARMS = [("v1.0", "force_pt"), ("v1.3", "force_tig"), ("v1.4", "auto")]
+BASE_ARMS = [("PT schedule", "force_pt"), ("TIG schedule", "force_tig"), ("AUTO v1.4 route", "auto")]
 
 
 def dedup_first(coord, gs):
@@ -79,7 +84,7 @@ def main():
     args = ap.parse_args()
     arms = list(BASE_ARMS)
     if args.include_force_fused:
-        arms.append(("v1.4-force", "force_fused_gather_sum"))
+        arms.append(("forced fused gather-sum", "force_fused_gather_sum"))
     batches = [int(b) for b in args.batches.split(",")]
     raws = [torch.from_numpy(np.load(f"{SCANNET}/{s}/coord.npy")).float().to(device)
             for s in SCENES[:max(batches)]]

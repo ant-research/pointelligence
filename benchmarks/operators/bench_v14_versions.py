@@ -2,18 +2,21 @@
 submanifold conv across all five generations on REAL ScanNet, at the production
 batch sizes, in both the train (fwd+bwd) and val (fwd-only) regimes.
 
-Generations (comparison-fair: identical real scenes, shapes, batches, triplets,
-weights, dtype across every arm — only the operator schedule changes):
-  v1.0.0  PT     per-triplet              dispatch_mode("force_pt")
-  v1.1.0  FSG    full-segment grouped     dispatch_mode("force_fsg")
-  v1.2.0  TIG    (atomic Split-K bwd)     force_tig + seg gate disabled
-  v1.3.0  TIG    (no-atomic seg bwd)      force_tig + seg gate on
-  v1.4.0  AUTO   best-known route       dispatch_mode("auto")   <-- this release
+Engine arms (controlled diagnostic: identical real scenes, shapes, batches,
+triplets, weights, and dtype; only the operator schedule changes):
+  PT          per-triplet                    dispatch_mode("force_pt")
+  FSG         full-segment grouped           dispatch_mode("force_fsg")
+  TIG-atomic  TIG with atomic Split-K bwd     force_tig + seg gate disabled
+  TIG-seg     TIG with segment VVOR bwd       force_tig + seg gate on
+  AUTO        best-known v1.4 route           dispatch_mode("auto")
 
-All public version arms route through the PointConv3d layer via dispatch modes
-(identical framing to the v1.3.0 release harness bench_v13_versions.py). The
-v1.4 arm is the shipped auto router: eligible C<=256 fp16 submanifold convs use
-fused gather-sum, C512 fwd+bwd and all ineligible shapes fall back to TIG. The
+These arms are useful for isolating scheduler generations inside one codebase.
+They are not, by themselves, proof that an old release tag shipped an equivalent
+fp16/AMP path. Public release-to-release claims should use only comparable
+release-supported paths; for v1.4.0 the public table reports the shipped `auto`
+route against v1.3.0, the immediately previous comparable fp16 operator stack.
+The v1.4 arm is the shipped auto router: eligible C<=256 fp16 submanifold convs
+use fused gather-sum, C512 fwd+bwd and all ineligible shapes fall back to TIG. The
 standalone fused gather-sum operator remains available via
 ``--include-standalone-fused`` as a diagnostic ceiling/failure-mode arm only. A
 per-stage parity gate checks fused gather-sum forward against the v1.3 forward
@@ -88,11 +91,11 @@ def timed(fn, it=30, warm=8):
     return s.elapsed_time(e) / it
 
 
-# Public dispatch-mode arms. v1.4 is the shipped auto route; the standalone
+# Dispatch-mode arms. AUTO is the shipped v1.4 route; the standalone
 # fused operator is a diagnostic arm gated by --include-standalone-fused.
-ARMS = [("v1.0 PT", "force_pt", False), ("v1.1 FSG", "force_fsg", False),
-        ("v1.2 TIG-atomic", "force_tig", True), ("v1.3 TIG-seg", "force_tig", False),
-        ("v1.4 AUTO", "auto", False)]
+ARMS = [("PT schedule", "force_pt", False), ("FSG schedule", "force_fsg", False),
+        ("TIG atomic schedule", "force_tig", True), ("TIG segment schedule", "force_tig", False),
+        ("AUTO v1.4 route", "auto", False)]
 
 
 def seg_disabled():
@@ -177,7 +180,8 @@ def main():
                     print(f"    !! PARITY FLAG {label} {regime}: rel={rel:.2e} "
                           f"> tol={args.parity_tol:.0e}")
 
-                # v1.0-v1.3 dispatch-mode arms.
+                # Dispatch-mode arms. These are scheduler diagnostics, not old
+                # release tags.
                 for aname, mode, force_atomic in ARMS:
                     def run_train():
                         f = feat0.clone().requires_grad_(True)
