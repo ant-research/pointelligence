@@ -6,9 +6,37 @@ center reductions.
 """
 
 import torch
-from .indexing import arange_cached
-from .grid_lookup import build_lookup_struct
-from .grid_lookup import compute_grid_indices
+from .grid_indexing import build_sorted_grid_segments
+from .grid_indexing import compute_grid_indices
+from .grid_sample_triton_kernel import center_nearest_segment_indices
+
+
+def _center_nearest_indices_torch(
+    points, grid_inds, grid_size, sorter, grid_sizes, lookup_inds
+):
+    """Reference selector with deterministic lowest-source-index tie breaking."""
+    grid_inds_pure = grid_inds[:, :3]
+    grid_centers = (grid_inds_pure + 0.5).mul_(grid_size)
+    distances = torch.sum(grid_centers.sub_(points).square_(), dim=-1)
+    distances_min = torch.segment_reduce(
+        distances[sorter], reduce="min", lengths=grid_sizes
+    )
+    point_indices = torch.arange(points.shape[0], device=points.device)
+    candidates = torch.where(
+        distances == distances_min[lookup_inds],
+        point_indices,
+        torch.full_like(point_indices, points.shape[0]),
+    )
+    selected = torch.full(
+        (grid_sizes.numel(),),
+        points.shape[0],
+        dtype=point_indices.dtype,
+        device=points.device,
+    )
+    selected.scatter_reduce_(
+        0, lookup_inds, candidates, reduce="amin", include_self=True
+    )
+    return selected
 
 
 def grid_sample_filter(
@@ -17,47 +45,50 @@ def grid_sample_filter(
     sample_inds=None,
     reduction="center_nearest",
     return_mapping=False,
+    center_nearest_impl="auto",
 ):
     reduction_list = ["center", "center_nearest", "random", "mean"]
     assert reduction in reduction_list, "reduction should be in one of %s!" % (
         " ".join(reduction_list)
     )
+    if center_nearest_impl not in ("auto", "torch", "triton"):
+        raise ValueError("center_nearest_impl must be one of: auto, torch, triton")
+    selector_impl = center_nearest_impl
+    if selector_impl == "auto":
+        selector_impl = "triton" if points.is_cuda else "torch"
+    if selector_impl == "triton" and not points.is_cuda:
+        raise ValueError("center_nearest_impl='triton' requires CUDA tensors")
 
-    grid_inds = compute_grid_indices(points, grid_size, sample_inds, with_shifts=False)
-    require_sorter_and_unique_counts = "center_nearest" == reduction
-    x = build_lookup_struct(
-        grid_inds,
-        return_unique_inds=True,
-        return_sorter=require_sorter_and_unique_counts,
-        return_unique_counts=require_sorter_and_unique_counts,
+    grid_inds = compute_grid_indices(points, grid_size, sample_inds)
+    is_center_nearest = reduction == "center_nearest"
+    require_inverse = (
+        return_mapping
+        or reduction == "mean"
+        or (is_center_nearest and selector_impl == "torch")
     )
-    lookup_struct, lookup_inds, indices = x[0], x[1], x[2]
-    num_points_filtered = lookup_struct.size()
-    del lookup_struct
+    sorter, grid_sizes, lookup_inds = build_sorted_grid_segments(
+        grid_inds,
+        return_inverse=require_inverse,
+    )
+    num_points_filtered = grid_sizes.numel()
+    indices = None
 
-    if "center_nearest" == reduction:
-        grid_inds_pure = grid_inds if sample_inds is None else grid_inds[:, :3]
-        grid_centers = (grid_inds_pure + 0.5).mul_(grid_size)
-        distances = torch.sum(grid_centers.sub_(points).square_(), dim=-1)
-
-        sorter, grid_sizes = x[3], x[4]
-        distances_min = torch.segment_reduce(
-            distances[sorter], reduce="min", lengths=grid_sizes
-        )
-        distances_min_repeated = distances_min[lookup_inds]
-
-        nearest_mask = distances_min_repeated.sub_(distances) == 0
-        nearest_indices = torch.nonzero(nearest_mask).squeeze(dim=-1)
-
-        if not return_mapping and nearest_indices.numel() == indices.numel():
-            indices = nearest_indices
-        else:
-            # in case there are multiple min distances in a neighborhood
-            # in case return_mapping need make sampled points order match lookup_inds
-            inds_arange = arange_cached(lookup_inds.shape[0], device=points.device)
-            indices.index_copy_(
-                0, lookup_inds[nearest_indices], inds_arange[nearest_indices]
+    if is_center_nearest:
+        if selector_impl == "triton":
+            indices = center_nearest_segment_indices(
+                points,
+                grid_inds,
+                sorter,
+                grid_sizes,
+                grid_size,
             )
+        else:
+            indices = _center_nearest_indices_torch(
+                points, grid_inds, grid_size, sorter, grid_sizes, lookup_inds
+            )
+    else:
+        segment_ends = torch.cumsum(grid_sizes, dim=0).sub_(1)
+        indices = sorter[segment_ends]
 
     # use indices to get sample_inds_filtered for return
     sample_inds_filtered = None
@@ -66,7 +97,11 @@ def grid_sample_filter(
 
     if "center" == reduction:
         # use grid centers as points_filtered to return
-        grid_inds_filtered = grid_inds[indices]
+        # ``sample_inds`` is appended to the lookup key for batch isolation,
+        # but it is not a spatial coordinate.  Keep the public point shape
+        # [num_voxels, 3] for batched and unbatched inputs alike.
+        grid_inds_pure = grid_inds if sample_inds is None else grid_inds[:, :3]
+        grid_inds_filtered = grid_inds_pure[indices]
         points_filtered = (grid_inds_filtered + 0.5).mul_(grid_size)
     elif "random" == reduction or "center_nearest" == reduction:
         # use indices to get points_filtered for return

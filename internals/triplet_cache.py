@@ -26,7 +26,7 @@ from contextlib import contextmanager
 
 _state = threading.local()
 
-# Read once at import (consistent with grid_lookup._GRID_OVERFLOW_CHECK).
+# Read once at import (consistent with grid_indexing._GRID_OVERFLOW_CHECK).
 _DISABLED = os.environ.get("POINTELLIGENCE_DISABLE_TRIPLET_CACHE", "0") == "1"
 
 

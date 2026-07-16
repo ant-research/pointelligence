@@ -17,7 +17,13 @@ import triton.language as tl
         triton.Config({"BLOCK_SIZE": 256, "num_warps": 4}, num_stages=1),
         triton.Config({"BLOCK_SIZE": 512, "num_warps": 4}, num_stages=1),
     ],
-    key=["n"],
+    # key must be n-independent: point-cloud augmentation produces a fresh
+    # `n` every iter, so keying on it re-autotunes every iter (~900 do_bench
+    # trials each, 256 MB L2 flush apiece). This is a memory-bound
+    # elementwise hash whose optimal (BLOCK_SIZE, num_warps) is effectively
+    # n-independent, so a single tuned config (key=[]) is correct and matches
+    # the convention in sparse_engines/indexed_distance{,_mask}_triton_kernel.py.
+    key=[],
 )
 @triton.jit
 def grid_hash_kernel_4d(

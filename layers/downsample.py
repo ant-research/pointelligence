@@ -20,13 +20,13 @@ def downsample(
 ):
     """
     Downsample point cloud by voxelizing and selecting representative points.
-    
+
     Args:
         points: Point coordinates [N, 3]
         sample_inds: Sample indices for each point
         grid_size: Current grid size
         stride: Downsample stride factor
-        
+
     Returns:
         points_, sample_inds_, grid_size, indices
     """
@@ -37,6 +37,6 @@ def downsample(
             grid_size=grid_size,
             sample_inds=sample_inds,
             reduction="center_nearest",
-            return_mapping=True,
+            return_mapping=False,
         )
         return points_, sample_inds_, grid_size, indices

@@ -29,7 +29,7 @@ from torch import Tensor
 from torch.nn.common_types import _size_3_t
 from torch.nn.modules.utils import _triple
 
-from internals.grid_lookup import reduce_indices_to_1d
+from internals.grid_indexing import reduce_indices_to_1d
 
 from .metadata import MetaData
 from .contract import TripletContract
