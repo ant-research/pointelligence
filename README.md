@@ -40,6 +40,33 @@
 
 ---
 
+## 🆕 v1.5.0 — Faster Convolution Geometry
+
+`v1.5.0` accelerates the geometry work around `PointConv3d` while preserving
+exact fixed-radius neighbor sets and convolution-triplet semantics:
+
+- exact sorted-grid radius search is now the production `auto` backend;
+- radius search can emit kernel-tap segments directly, avoiding a separate
+  global triplet sort;
+- center-nearest grid downsampling uses a compact segmented GPU selector;
+- `conv_with_stride_full_cover` adds an opt-in overlapping strided convolution
+  whose centers are observed input points and whose input coverage is
+  guaranteed by construction.
+
+Against the exact public v1.4.0 implementations on identical transformed
+ScanNet workloads, correctness-gated real-data benchmarks measured a **2.179x**
+geometric-mean radius-search speedup with **76.0% lower** geometric-mean
+incremental peak allocation, and a **1.827x** geometric-mean center-nearest
+downsampling speedup with **27.1% lower** peak allocation (16 cells each, RTX
+5880 Ada). Direct tap-segmented triplet preparation independently measured a
+**1.301x** geometric-mean speedup across six indoor/outdoor cells. These are
+geometry-stage measurements rather than whole-network speedups. See the exact
+v1.4.0 comparison, H200 backend-selection study, memory tables, caveats, and
+reproduction commands in
+[Sorted-Grid Convolution Geometry](docs/sorted_grid_geometry.md).
+
+---
+
 ## 📊 Performance
 
 PointCNN++ delivers state-of-the-art performance with significantly lower memory usage and faster training times compared to existing methods.
@@ -193,4 +220,6 @@ For building custom architectures, see **[docs/ADVANCED.md](docs/ADVANCED.md)** 
 - **Neighborhoods** — fixed-radius search producing (i, j) pairs
 - **Convolution triplets** — extending (i, j) to (i, j, k) to route data through kernel weights
 - **MVMR** — the sparse convolution operator: `output[i] += weight[k] @ input[j]`
-
+- **Sorted-grid geometry** — exact radius search, tap-segmented triplets,
+  full-cover strided convolution, and center-nearest downsampling in
+  [v1.5.0](docs/sorted_grid_geometry.md)

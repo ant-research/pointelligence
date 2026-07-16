@@ -119,6 +119,20 @@ engine: the set of neighbor triplets is unchanged, point contributions are not
 dropped, and validation uses exact rulebook parity plus normal floating-point
 output tolerance before timing.
 
+### v1.5.0 geometry follow-up
+
+The paragraph above describes the v1.4.0 release state. In v1.5.0, the
+production radius-search `auto` route is the compact exact-eight sorted-grid
+backend for both ordinary and large-radius calls. It preserves the same exact
+neighbor contract while removing the shifted-grid candidate expansion and its
+large-query chunk/concatenate workaround. The v1.4 tiled backend remains an
+explicit diagnostic path, not the automatic strided-stem route. Against the
+exact v1.4.0 shifted lookup, the new path measures a 2.179x geometric-mean
+speedup and 76.0% lower geometric-mean incremental peak allocation on the
+16-cell real-ScanNet matrix. See
+[`sorted_grid_geometry.md`](sorted_grid_geometry.md) for that cross-release
+table and the separate matched H200 stem/backend-selection results.
+
 ## Performance Summary
 
 The release numbers below use the shipped `auto` route on real ScanNet scenes.

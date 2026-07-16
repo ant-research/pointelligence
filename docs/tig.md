@@ -357,6 +357,15 @@ to end, on a real scene a user can recognize in their own workload. The
 floor is also the next frontier: index construction (`build_triplets`) is
 now the largest remaining term at shallow stages.
 
+**v1.5.0 follow-up.** The geometry release addresses that fixed floor without
+changing TIG's convolution math. Exact sorted-grid radius search can emit tap
+segments directly, so the common path avoids the separate global triplet sort
+and retired bucket-arrangement extension. The strict real-data comparison
+measures a 1.301x geometric-mean improvement for production-ready triplet
+preparation across ScanNet, nuScenes, and Waymo; see
+[`sorted_grid_geometry.md`](sorted_grid_geometry.md). The v1.2.0 kernel and
+whole-network tables in this document remain historical measurements.
+
 ## Numerical contract
 
 TIG accumulates in fp32 regardless of operand dtype (native fp16/bf16 into

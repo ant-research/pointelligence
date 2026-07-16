@@ -22,6 +22,15 @@ All layers in the library operate on this ragged format. The `MetaData` dataclas
 
 Voxel-based downsampling via `grid_sample_filter` with `center_nearest` mode: partition space into a grid, keep the point closest to each voxel center. This preserves thin structures better than random selection.
 
+On CUDA, `center_nearest_impl="auto"` uses the compact segmented Triton
+selector introduced in v1.5.0. `center_nearest_impl="torch"` retains the
+reference implementation for parity checks and CPU use. Selection is stable:
+an exact distance tie keeps the lower original source index. Batch identity is
+part of the signed integer cell key, so cells on either side of a coordinate
+origin remain isolated by sample but otherwise follow the same floor-based
+partition. Set `return_mapping=True` only when the point-to-output-cell inverse
+is needed; omitting it avoids constructing that array.
+
 The `grid_size` parameter is the fundamental spatial unit (analogous to pixel size). Strides and receptive fields are defined as multiples of `grid_size`. A smaller `grid_size` gives higher resolution at greater compute cost.
 
 **Tip:** apply a preliminary downsample at `grid_size / 3` before the network to handle irregular point density.
@@ -75,6 +84,19 @@ Flattened:
 
 Points are globally indexed across the batch, but edges never cross sample boundaries.
 
+`radius_search(..., backend="auto")` uses the exact sorted-eight backend in
+v1.5.0. It sorts points into cells of side `2R`, binary-searches the eight cells
+that cover each query's radius box, and applies the exact distance predicate.
+It does not materialize candidate pairs or split large query sets on the host.
+`sorted27_materialized` is available as an explicit alternative, while
+`tiled` remains a diagnostic/reference path. Neighbor order is unspecified;
+unique `(i, j)` membership and per-query counts are stable API guarantees.
+The strict real-ScanNet comparison against the exact v1.4.0 shifted lookup
+measures a 2.179x geometric-mean speedup and 76.0% lower geometric-mean
+incremental peak allocation across 16 cells; see
+[`sorted_grid_geometry.md`](sorted_grid_geometry.md) for the full speed/memory
+table and the separate H200 backend-selection study.
+
 ## Convolution Triplets: (i, j, k)
 
 To route each neighbor through the right kernel weight, we extend `(i, j)` to `(i, j, k)` where `k` is the kernel weight index:
@@ -86,6 +108,13 @@ To route each neighbor through the right kernel weight, we extend `(i, j)` to `(
 ```
 
 How `k` is computed: the neighbor's position relative to the query point is transformed into a local coordinate frame, then discretized into a `kernel_size^3` voxel grid. The voxel index becomes `k`. This is done by `voxelize_3d` in `layers/triplets.py`.
+
+For a k-sorted triplet list, `seg_offs` is the compact companion to `k`:
+`seg_offs[t] : seg_offs[t + 1]` gives the contiguous edge interval for tap
+`t`. `k` has one entry per edge; `seg_offs` has one boundary per tap. The
+v1.5.0 sorted-eight path can emit `(i, j, seg_offs)` directly in tap-major
+order, avoiding a separate global sort. Public convolution metadata still
+materializes `k` where compatibility or diagnostics require it.
 
 ### `kernel_size` vs `receptive_field_scaler`
 
@@ -146,6 +175,35 @@ features_out, m_out = conv_with_stride(conv, features, m, stride=2)
 # m_out now has downsampled points, updated grid_size, and new triplets
 ```
 
+### Full-cover overlapping stride
+
+Use `conv_with_stride_full_cover` when every raw input must lie within the
+actual search radius of at least one observed-point output center:
+
+```python
+from layers import conv_with_stride_full_cover
+
+patchify = PointConv3d(64, 128, kernel_size=15)
+features_out, m_out = conv_with_stride_full_cover(
+    patchify,
+    features,
+    m,
+    stride=8,
+    radius_margin=1e-2,
+    radius_backend="auto",
+)
+```
+
+The initial centers are the observed input points nearest occupied stride-cell
+centers. If they leave uncovered inputs, a deterministic residual maximal
+radius-net adds observed centers until coverage is complete. Initial and
+residual centers use the same radius. For stride 8, the analytical radius plus
+the default margin requires K15; the builder raises for an insufficient kernel
+instead of clamping offsets. The exact reverse rulebook is cached for matching
+unpatchification. The lower-level
+`build_full_cover_strided_rulebook` API exposes source indices, counts,
+selector rounds, and per-input coverage diagnostics.
+
 For full architecture examples, see `models/resnet.py`.
 
 ### torch.compile and the triplet contract
@@ -173,12 +231,32 @@ opt into the eager per-triplet path (or use the `force_pt` dispatch mode);
 a bare unsorted `MetaData` is otherwise treated as sorted. Set
 `POINTELLIGENCE_DEBUG_CONTRACTS=1` to re-validate a contract against its data in eager.
 
+### Hoisting geometry with the two-phase scheduler
+
+`GeometryScheduler` separates feature-independent triplet construction from
+the feature-compute chain. `ConvOp.build_indices` produces the same metadata as
+`conv_with_stride`; `ConvOp.apply` runs `PointConv3d` over that prebuilt bundle.
+All builds in a separable segment are hoisted under one triplet-cache scope,
+after which the break-free apply chain may be compiled as a full graph:
+
+```python
+from internals.two_phase import GeometryScheduler
+from layers.two_phase_conv import ConvOp
+
+ops = [ConvOp(conv0, stride=2), ConvOp(conv1, stride=1)]
+out = GeometryScheduler().run(ops, features, m, compile_segments=True)
+```
+
+Use `ForceFused(op)` to restore the original interleaved build/apply ordering
+as a parity reference. The scheduler does not change triplets or convolution
+math; it changes only when geometry is prepared.
+
 ## Caching triplets — the forward-scoped ambient cache (`internals/triplet_cache.py`)
 
 Submanifold triplets `(i, j, k)` are a pure function of a point set's geometry,
 search radius, kernel, query set, and sort order. Within a single forward the
 *same* geometry+kernel recurs, and rebuilding the triplets each time repeats the
-host-bound `radius_search` (the dominant preprocessing cost). The recurrences:
+same radius search, tap segmentation, and metadata work. The recurrences:
 
 - **U-Net encoder/decoder cascade** — each resolution level is visited descending
   and again ascending (the decoder's `Upsample` restores `m.points` to the *exact*
