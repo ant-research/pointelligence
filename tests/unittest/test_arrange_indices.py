@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from internals.indexing import arrange_indices as arrange_indices_cuda
-from internals.indexing import arange_cached, cumsum_exclusive
+from internals.indexing import cumsum_exclusive
 
 
 def arrange_indices_torch(indices, num_indices=None, num_shifts=1, mask=None):
@@ -13,7 +13,7 @@ def arrange_indices_torch(indices, num_indices=None, num_shifts=1, mask=None):
         indices_of_indices = torch.nonzero(mask).squeeze(dim=-1)
         indices = indices[indices_of_indices]
     else:
-        indices_of_indices = arange_cached(indices.shape[0], device=device)
+        indices_of_indices = torch.arange(indices.shape[0], device=device)
 
     if num_shifts > 1:
         indices_of_indices = torch.div(
@@ -25,7 +25,7 @@ def arrange_indices_torch(indices, num_indices=None, num_shifts=1, mask=None):
 
     sorter = torch.argsort(indices)
     bucket_slots = torch.empty_like(sorter, dtype=sorter.dtype, device=device)
-    bucket_slots.index_copy_(0, sorter, arange_cached(sorter.shape[0], device=device))
+    bucket_slots.index_copy_(0, sorter, torch.arange(sorter.shape[0], device=device))
 
     bucket_sizes = torch.bincount(indices, minlength=num_indices)
     bucket_splits = cumsum_exclusive(bucket_sizes)

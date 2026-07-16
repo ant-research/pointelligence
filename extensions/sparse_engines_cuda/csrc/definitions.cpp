@@ -148,5 +148,4 @@ TORCH_LIBRARY(sparse_engines_cuda, m) {
 	// (same repack-skip; build-only locally, executed on the H200 cell).
 	m.def("sparse_mvmr_cutlass_sm90_full_prestaged(Tensor aT, Tensor b_idx, Tensor input_b, Tensor o_idx, Tensor seg_offs, int n_o) -> Tensor");
 
-	m.def("bucket_arrange(Tensor bucket_indices, int num_buckets) -> (Tensor, Tensor)");
 }

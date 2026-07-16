@@ -5,11 +5,7 @@ __all__ = [
     "sparse_matrix_vector_multiplication_reduction",
     "sparse_vector_vector_outer_product_reduction",
 
-    "bucket_arrange",
 ]
-
-def bucket_arrange(bucket_indices: Tensor, num_buckets: int) -> (Tensor, Tensor):
-    return torch.ops.sparse_engines_cuda.bucket_arrange(bucket_indices, num_buckets)
 
 def sparse_matrix_vector_multiplication_reduction(
     a: Tensor, a_idx: Tensor, b: Tensor, b_idx: Tensor, o_idx: Tensor, n: int
