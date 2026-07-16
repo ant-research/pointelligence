@@ -6,7 +6,14 @@ from functools import partial
 
 from layers.metadata import MetaData
 from layers.conv import PointConv3d
-from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kernel_size
+from layers.triplets import (
+    build_triplets,
+    build_triplets_segmented,
+    should_use_direct_segmented_triplets,
+    voxelize_3d,
+    radius_scaler_for_kernel_size,
+)
+from sparse_engines._seg_offs import kernel_offset_segments
 from layers.contract import TripletContract
 
 
@@ -135,6 +142,7 @@ class Upsample(torch.nn.Module):
             (self.recompute_k or m_low.parent.k_upsample is not None)
         )
 
+        seg_offs = None
         if use_cached:
             # Fast path: reuse the (i, j) neighbour edges cached during downsampling.
             i_high = m_low.parent.i_upsample
@@ -152,10 +160,13 @@ class Upsample(torch.nn.Module):
                 k = recompute_cached_upsample_k(m_low, self.kernel_size)
                 k, order = torch.sort(k)          # match build_triplets' sort_by="k"
                 i_high, j_low = i_high[order], j_low[order]
+                seg_offs = kernel_offset_segments(
+                    k.long(), self.kernel_size ** 3)
             else:
                 # Cached k_upsample is the downsample's m.k — already k-sorted
                 # (handle_stride_and_build_triplets uses sort_by="k").
                 k = m_low.parent.k_upsample
+                seg_offs = m_low.parent.seg_offs_upsample
         else:
             # Direct search below also returns k-sorted triplets (sort_by="k").
             # Direct search: high-res queries among low-res sources
@@ -179,25 +190,47 @@ class Upsample(torch.nn.Module):
                     f"Increase receptive_field_scaler (currently {self.receptive_field_scaler})."
                 )
 
-            i_high, j_low, k, _ = build_triplets(
-                points=m_low.points,
-                sample_inds=m_low.sample_inds,
-                sample_sizes=m_low.sample_sizes,
-                neighbor_radius=neighbor_radius,
-                kernel_indexer=partial(voxelize_3d, kernel_size=self.kernel_size),
-                query_points=points_high,
-                query_sample_inds=sample_inds_high,
-                query_sample_sizes=sample_sizes_high,
-                sort_by="k",
-                return_num_neighbors=False,
-                radius_scaler=radius_scaler,
-            )
+            if (
+                self.distance_type == "ball"
+                and should_use_direct_segmented_triplets(self.kernel_size)
+            ):
+                (i_high, j_low, k, seg_offs,
+                 _) = build_triplets_segmented(
+                    points=m_low.points,
+                    sample_inds=m_low.sample_inds,
+                    sample_sizes=m_low.sample_sizes,
+                    neighbor_radius=neighbor_radius,
+                    kernel_size=self.kernel_size,
+                    query_points=points_high,
+                    query_sample_inds=sample_inds_high,
+                    query_sample_sizes=sample_sizes_high,
+                    return_num_neighbors=False,
+                    radius_scaler=radius_scaler,
+                )
+            else:
+                i_high, j_low, k, _ = build_triplets(
+                    points=m_low.points,
+                    sample_inds=m_low.sample_inds,
+                    sample_sizes=m_low.sample_sizes,
+                    neighbor_radius=neighbor_radius,
+                    kernel_indexer=partial(
+                        voxelize_3d, kernel_size=self.kernel_size),
+                    query_points=points_high,
+                    query_sample_inds=sample_inds_high,
+                    query_sample_sizes=sample_sizes_high,
+                    sort_by="k",
+                    return_num_neighbors=False,
+                    radius_scaler=radius_scaler,
+                )
+                seg_offs = kernel_offset_segments(
+                    k, self.kernel_size ** 3)
 
-        # : build_triplets uses sort_by="k" (line above) and the upsample
-        # rulebook is submanifold-shaped (T != n_high) ⇒ the submanifold
+        # torch.compile contract: both builders emit k-major triplets, and the
+        # upsample rulebook is submanifold-shaped (T != n_high) ⇒ the submanifold
         # contract holds; pass it so the conv traces under torch.compile.
-        x_high = self.conv(x_low, i_high, j_low, k, points_high.shape[0],
-                            contract=TripletContract.submanifold())
+        x_high = self.conv(
+            x_low, i_high, j_low, k, points_high.shape[0],
+            contract=TripletContract.submanifold(), seg_offs=seg_offs)
 
         m_high = MetaData(
             points=points_high,
@@ -207,6 +240,7 @@ class Upsample(torch.nn.Module):
             i=i_high,
             j=j_low,
             k=k,
+            seg_offs=seg_offs,
             parent=m_low.parent.parent if m_low.parent is not None else None,
         )
         

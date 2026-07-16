@@ -42,6 +42,15 @@ def _old_inline_triplet_rebuild(m):
     return i, j, k
 
 
+def _canonical_triplets(i, j, k, num_points):
+    key = (
+        k.to(torch.int64) * num_points * num_points
+        + i.to(torch.int64) * num_points
+        + j.to(torch.int64)
+    )
+    return torch.sort(key).values
+
+
 def _make_metadata(points, sample_inds, sample_sizes, grid_size):
     return MetaData(
         points=points.clone(),
@@ -175,9 +184,11 @@ def test_triplet_equivalence_multi_stride():
 
             assert torch.equal(m_old.points, m_new.points), f"Points differ at stride={s}!"
             assert m_old.grid_size == m_new.grid_size, f"Grid size differs at stride={s}!"
-            assert torch.equal(i_old, m_new.i), f"i differs at stride={s}!"
-            assert torch.equal(j_old, m_new.j), f"j differs at stride={s}!"
-            assert torch.equal(k_old, m_new.k), f"k differs at stride={s}!"
+            assert torch.equal(
+                _canonical_triplets(i_old, j_old, k_old, m_new.num_points()),
+                _canonical_triplets(
+                    m_new.i, m_new.j, m_new.k, m_new.num_points()),
+            ), f"triplet set differs at stride={s}!"
 
             # Also update m_old's triplets so next stride sees same state
             m_old.i, m_old.j, m_old.k = i_old, j_old, k_old
@@ -215,9 +226,10 @@ def test_triplet_equivalence_multi_batch():
     m_new.dirty_triplets()
     m_new = handle_stride_and_build_triplets(m_new, stride=1, kernel_size=(3, 3, 3))
 
-    assert torch.equal(i_old, m_new.i), "i differs (multi-batch)!"
-    assert torch.equal(j_old, m_new.j), "j differs (multi-batch)!"
-    assert torch.equal(k_old, m_new.k), "k differs (multi-batch)!"
+    assert torch.equal(
+        _canonical_triplets(i_old, j_old, k_old, m_new.num_points()),
+        _canonical_triplets(m_new.i, m_new.j, m_new.k, m_new.num_points()),
+    ), "triplet set differs (multi-batch)!"
 
     print(f"  [PASS] multi-batch {sizes}: {m_new.num_points()} pts, {m_new.i.shape[0]} triplets")
 

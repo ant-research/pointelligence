@@ -19,7 +19,7 @@ from layers import (
     conv_with_stride,
     RaggedNorm,
 )
-from layers.triplets import build_triplets, voxelize_3d, radius_scaler_for_kernel_size
+from layers.triplets import build_triplets_segmented, radius_scaler_for_kernel_size
 from layers.metadata import MetaData
 from layers.upsample import Upsample
 from sparse_engines.ops import large_segment_reduce
@@ -74,15 +74,16 @@ class BasicBlock(nn.Module):
 
         if self.stride != 1.0:
             radius_scaler = radius_scaler_for_kernel_size(kernel_size=3, receptive_field_scaler=2.5)
-            m.i, m.j, m.k, _ = build_triplets(
+            m.i, m.j, m.k, m.seg_offs, _ = build_triplets_segmented(
                 points=m.points,
                 sample_inds=m.sample_inds,
                 sample_sizes=m.sample_sizes,
                 neighbor_radius=m.grid_size * radius_scaler,
-                kernel_indexer=partial(voxelize_3d, kernel_size=3),
+                kernel_size=3,
                 radius_scaler=radius_scaler,
             )
-        x = self.conv2(x, m.i, m.j, m.k, m.num_points())
+        x = self.conv2(
+            x, m.i, m.j, m.k, m.num_points(), seg_offs=m.seg_offs)
         x = self.bn2(x)
 
         if self.downsample is not None:
@@ -399,15 +400,18 @@ class ResUNetPointCNNpp(nn.Module):
             m_high.dirty_triplets()
             radius_scaler = radius_scaler_for_kernel_size(kernel_size=1, receptive_field_scaler=2.5)
             neighbor_radius = m_high.grid_size * radius_scaler
-            m_high.i, m_high.j, m_high.k, _ = build_triplets(
+            (m_high.i, m_high.j, m_high.k, m_high.seg_offs,
+             _) = build_triplets_segmented(
                 points=m_high.points,
                 sample_inds=m_high.sample_inds,
                 sample_sizes=m_high.sample_sizes,
                 neighbor_radius=neighbor_radius,
-                kernel_indexer=partial(voxelize_3d, kernel_size=1),
+                kernel_size=1,
                 radius_scaler=radius_scaler,
             )
-            x_high = self.final_conv(x_high, m_high.i, m_high.j, m_high.k, m_high.num_points())
+            x_high = self.final_conv(
+                x_high, m_high.i, m_high.j, m_high.k,
+                m_high.num_points(), seg_offs=m_high.seg_offs)
         
         if self.normalize_feature:
             x_high = x_high / torch.norm(x_high, p=2, dim=1, keepdim=True).clamp(min=1e-8)

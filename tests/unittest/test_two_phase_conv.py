@@ -16,12 +16,13 @@ def _toy(n=4096, c=16, b=2, seed=0):
 
 
 def test_convop_scheduler_matches_serial():
-    """ConvOp adapter == serial conv_with_stride. The conv build (downsample +
-    triplets) is deterministic, so the index bundle is asserted BIT-EXACT. PointConv3d's
-    forward uses an atomic segment-reduce CUDA kernel whose accumulation order is NOT
-    bitwise-reproducible (serial-vs-serial on identical inputs flips torch.equal,
-    maxdiff ~1.5e-8; torch.use_deterministic_algorithms does not help), so the feature
-    OUTPUT is asserted allclose, not equal."""
+    """ConvOp adapter == serial conv_with_stride.
+
+    Radius-search ordering within one kernel-tap segment is intentionally
+    unspecified, so independently built rulebooks are compared as canonical
+    (k, i, j) sets. PointConv3d also uses atomic reduction; feature output is
+    therefore asserted allclose rather than bit-exact.
+    """
     from layers.conv import PointConv3d, conv_with_stride
     from layers.metadata import MetaData
     from layers.two_phase_conv import ConvOp
@@ -36,13 +37,23 @@ def test_convop_scheduler_matches_serial():
                      sample_sizes=ss.clone(), grid_size=0.05)
     y_ref, m_ref_out = conv_with_stride(conv, x.clone(), m_ref, stride=2.0)
 
-    # (a) build parity — bit-exact (the adapter's actual contribution).
+    # (a) build parity — exact semantic rulebook, unspecified within-tap order.
     m_idx = MetaData(points=pts.clone(), sample_inds=batch.clone(),
                      sample_sizes=ss.clone(), grid_size=0.05)
     bundle = ConvOp(conv, stride=2.0).build_indices(m_idx)
-    assert torch.equal(bundle.meta.i, m_ref_out.i)
-    assert torch.equal(bundle.meta.j, m_ref_out.j)
-    assert torch.equal(bundle.meta.k, m_ref_out.k)
+    num_points_in = pts.shape[0]
+    num_points_out = bundle.meta.points.shape[0]
+
+    def canonical(meta):
+        key = (
+            meta.k.long() * (num_points_out * num_points_in)
+            + meta.i.long() * num_points_in
+            + meta.j.long()
+        )
+        return torch.sort(key).values
+
+    assert torch.equal(canonical(bundle.meta), canonical(m_ref_out))
+    assert torch.equal(bundle.meta.seg_offs, m_ref_out.seg_offs)
     assert torch.equal(bundle.meta.points, m_ref_out.points)
     assert bundle.meta.contract == m_ref_out.contract
 

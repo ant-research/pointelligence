@@ -24,6 +24,7 @@ from sparse_engines._dispatch_override import current_mode, resolve_input_precis
 from .metadata import MetaData
 from .contract import TripletContract
 from .triplets import (
+    build_full_cover_strided_rulebook,
     handle_stride_and_build_triplets,
     handle_stride_disjoint_and_build_triplets,
     radius_scaler_for_kernel_size,
@@ -208,6 +209,7 @@ class GeneralConv(Module):
         bias: Optional[Tensor],
         *,
         contract: "Optional[TripletContract]" = None,
+        seg_offs: Optional[Tensor] = None,
     ) -> Tensor:
         # torch.compile contract: `contract` is the triplet index's
         # structural facts (k-sortedness, exact-cover, uniform segments),
@@ -424,12 +426,28 @@ class GeneralConv(Module):
                     weight, input_3d.view(_n_in_rows, -1), i, j, k, n,
                 ).view(-1, self.groups, self.out_channels // self.groups)
             else:
-                idx = TigIndex(i, j, k, n, _K,
-                                build_hybrid=False, assume_sorted=True,
-                                n_in=_n_in_rows,
-                                uniform_seg_len=contract.uniform_seg_len,
-                                exact_cover_out=_eco,
-                                exact_cover_in=_eci)
+                if seg_offs is not None:
+                    idx = TigIndex.from_flat(
+                        i,
+                        j,
+                        seg_offs,
+                        n_out=n,
+                        n_in=_n_in_rows,
+                        num_kernel_offsets=_K,
+                        exact_cover_out=_eco,
+                        exact_cover_in=_eci,
+                        uniform_seg_len=(
+                            contract.uniform_seg_len
+                            if contract.uniform_seg_len is not None else -1),
+                    )
+                else:
+                    idx = TigIndex(
+                        i, j, k, n, _K,
+                        build_hybrid=False, assume_sorted=True,
+                        n_in=_n_in_rows,
+                        uniform_seg_len=contract.uniform_seg_len,
+                        exact_cover_out=_eco,
+                        exact_cover_in=_eci)
                 output = tig_mvmr(
                     weight, input_3d.view(_n_in_rows, -1), idx,
                     input_precision=resolve_input_precision(input_3d.dtype),
@@ -472,15 +490,24 @@ class PointConv3d(GeneralConv):
             **factory_kwargs,
         )
 
-    def forward(self, input: Tensor, i: Tensor, j: Tensor, k: Tensor, n: int,
-                contract: "Optional[TripletContract]" = None) -> Tensor:
+    def forward(
+        self,
+        input: Tensor,
+        i: Tensor,
+        j: Tensor,
+        k: Tensor,
+        n: int,
+        contract: "Optional[TripletContract]" = None,
+        seg_offs: Optional[Tensor] = None,
+    ) -> Tensor:
         # Forward the triplet's structural contract (k-sorted / exact-cover
         # / uniform segments — produced by the builder) so `auto` reaches the
         # FI1 forward + native-fp16 grad_input fast paths WITHOUT a per-forward
         # host sync. None defaults to the submanifold contract (the conv-path
         # invariant); the forward then traces under torch.compile.
-        return self._conv_forward(input, i, j, k, n, self.weight, self.bias,
-                                  contract=contract)
+        return self._conv_forward(
+            input, i, j, k, n, self.weight, self.bias,
+            contract=contract, seg_offs=seg_offs)
 
 
 def conv_with_stride(
@@ -513,8 +540,97 @@ def conv_with_stride(
         m, stride, conv_op.kernel_size_3, receptive_field_scaler,
         distance_type=distance_type,
     )
-    x = conv_op(x, m.i, m.j, m.k, m.num_points(), contract=m.contract)
+    x = conv_op(
+        x, m.i, m.j, m.k, m.num_points(), contract=m.contract,
+        seg_offs=m.seg_offs)
     return x, m
+
+
+def conv_with_stride_full_cover(
+    conv_op: Callable,
+    x: Tensor,
+    m: MetaData,
+    stride: float,
+    radius_margin: float = 1e-2,
+    radius_backend: str = "auto",
+) -> Tuple[Tensor, MetaData]:
+    """Overlapping strided point convolution with guaranteed input coverage.
+
+    Output centers are observed input points. The initial center set picks the
+    nearest input point to each occupied stride-cell center, then a deterministic
+    residual R-net adds observed points until every input point lies within the
+    strided radius of at least one center. The cached reverse rulebook is the
+    exact transpose graph over the same edges.
+    """
+    if stride <= 1:
+        raise ValueError(
+            f"conv_with_stride_full_cover requires stride > 1; got {stride}.")
+    with torch.no_grad():
+        if (m.parent is not None and
+            m.parent.points.shape == m.points.shape and
+            m.parent.grid_size == m.grid_size and
+            torch.equal(m.parent.points, m.points) and
+            torch.equal(m.parent.sample_inds, m.sample_inds)):
+            parent_meta = m.parent
+        else:
+            parent_meta = MetaData(
+                points=m.points,
+                sample_inds=m.sample_inds,
+                sample_sizes=m.sample_sizes,
+                grid_size=m.grid_size,
+                parent=m.parent,
+            )
+            m.parent = parent_meta
+
+        rb = build_full_cover_strided_rulebook(
+            points=parent_meta.points,
+            sample_inds=parent_meta.sample_inds,
+            sample_sizes=parent_meta.sample_sizes,
+            stride=stride,
+            input_grid_size=parent_meta.grid_size,
+            kernel_size=conv_op.kernel_size_3,
+            radius_margin=radius_margin,
+            radius_backend=radius_backend,
+            return_num_neighbors=True,
+        )
+
+        m.points = rb.points
+        m.sample_inds = rb.sample_inds
+        m.sample_sizes = rb.sample_sizes
+        m.grid_size = float(stride) * parent_meta.grid_size
+        m.downsample_indices = rb.center_source_indices
+        m.i = rb.i
+        m.j = rb.j
+        m.k = rb.k
+        from sparse_engines._seg_offs import kernel_offset_segments
+        num_kernel_offsets = math.prod(conv_op.kernel_size_3)
+        m.seg_offs = kernel_offset_segments(m.k, num_kernel_offsets)
+        m.num_neighbors = rb.num_neighbors
+        m.contract = TripletContract(k_sorted=True)
+
+        parent_meta.i_upsample = rb.i_upsample
+        parent_meta.j_upsample = rb.j_upsample
+        parent_meta.k_upsample = rb.k_upsample
+        parent_meta.seg_offs_upsample = kernel_offset_segments(
+            rb.k_upsample, num_kernel_offsets)
+        parent_meta.full_cover_point_to_initial_center = rb.point_to_initial_center
+        parent_meta.full_cover_initial_center_indices = rb.initial_center_source_indices
+        parent_meta.full_cover_additional_center_indices = rb.additional_center_source_indices
+        parent_meta.full_cover_coverage_per_input = rb.coverage_per_input
+        parent_meta.full_cover_telemetry = {
+            "radius": rb.radius,
+            "radius_scaler": rb.radius_scaler,
+            "initial_center_count": int(rb.initial_center_source_indices.numel()),
+            "additional_center_count": int(rb.additional_center_source_indices.numel()),
+            "selector_round_count": rb.selector_round_count,
+            "edge_count": int(rb.k.numel()),
+        }
+
+    x = conv_op(
+        x, m.i, m.j, m.k, m.num_points(), contract=m.contract,
+        seg_offs=m.seg_offs)
+    return x, m
+
 
 
 def conv_with_stride_disjoint(
@@ -562,7 +678,9 @@ def conv_with_stride_disjoint(
     no search radius).
     """
     m = handle_stride_disjoint_and_build_triplets(m, stride, conv_op.kernel_size_3)
-    x = conv_op(x, m.i, m.j, m.k, m.num_points(), contract=m.contract)
+    x = conv_op(
+        x, m.i, m.j, m.k, m.num_points(), contract=m.contract,
+        seg_offs=m.seg_offs)
     return x, m
 
 

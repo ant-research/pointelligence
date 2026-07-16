@@ -41,4 +41,6 @@ class ConvOp:
 
     def apply(self, x: torch.Tensor, b: ConvBundle) -> torch.Tensor:
         m = b.meta
-        return self.conv_op(x, m.i, m.j, m.k, m.num_points(), contract=m.contract)
+        return self.conv_op(
+            x, m.i, m.j, m.k, m.num_points(), contract=m.contract,
+            seg_offs=m.seg_offs)

@@ -16,8 +16,7 @@ from sparse_engines.ops import large_segment_reduce
 from internals.triplet_cache import triplet_cache_scope
 from layers import (
     max_pool3d,
-    voxelize_3d,
-    build_triplets,
+    build_triplets_segmented,
     conv_with_stride,
     radius_scaler_for_kernel_size,
     TripletContract,
@@ -97,12 +96,13 @@ class BasicBlock(nn.Module):
 
         if self.stride != 1:
             neighbor_radius = m.grid_size * radius_scaler_for_kernel_size(kernel_size=3)
-            m.i, m.j, m.k, _ = build_triplets(
+            (m.i, m.j, m.k, m.seg_offs,
+             _) = build_triplets_segmented(
                 points=m.points,
                 sample_inds=m.sample_inds,
                 sample_sizes=m.sample_sizes,
                 neighbor_radius=neighbor_radius,
-                kernel_indexer=partial(voxelize_3d, kernel_size=3),
+                kernel_size=3,
                 radius_scaler=radius_scaler_for_kernel_size(kernel_size=3),
                 return_num_neighbors=False,
             )
@@ -111,8 +111,9 @@ class BasicBlock(nn.Module):
         # conv2 is the in-place 3^3 submanifold conv (sort_by="k", T != n)
         # — pass the submanifold contract so the conv traces under
         # torch.compile without a per-forward sortedness sync.
-        out = self.conv2(out, m.i, m.j, m.k, m.num_points(),
-                         contract=TripletContract.submanifold())
+        out = self.conv2(
+            out, m.i, m.j, m.k, m.num_points(),
+            contract=TripletContract.submanifold(), seg_offs=m.seg_offs)
         out = self.bn2(out, m.sample_sizes)
 
         if self.downsample is not None:

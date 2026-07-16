@@ -6,11 +6,13 @@ features flow through convolution, pooling, and normalization layers.
 """
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple, Callable
 from functools import partial
 
 import torch
 from torch import Tensor
+from torch.nn.modules.utils import _triple
 
 from .contract import TripletContract
 
@@ -24,6 +26,7 @@ class MetaData:
     i: Tensor = None
     j: Tensor = None
     k: Tensor = None
+    seg_offs: Tensor = None
     num_neighbors: Tensor = None
     downsample_indices: Tensor = None
 
@@ -36,6 +39,7 @@ class MetaData:
     i_upsample: Tensor = None
     j_upsample: Tensor = None
     k_upsample: Tensor = None
+    seg_offs_upsample: Tensor = None
 
     parent: Optional['MetaData'] = None
 
@@ -65,20 +69,32 @@ class MetaData:
         kernel_indexer: Optional[Callable] = None,
         **kwargs
     ):
-        from .triplets import build_triplets, radius_scaler_for_kernel_size, voxelize_3d
+        from .triplets import (
+            build_triplets,
+            build_triplets_segmented,
+            radius_scaler_for_kernel_size,
+            should_use_direct_segmented_triplets,
+            voxelize_3d,
+        )
 
         kernel_size = kernel_size or self.kernel_size
         if kernel_size is None:
             raise ValueError("kernel_size must be provided either in __init__ or build_triplets()")
 
+        radius_scaler = radius_scaler_for_kernel_size(
+            kernel_size,
+            kwargs.get('receptive_field_scaler', self.receptive_field_scaler),
+            kwargs.get('distance_type', self.distance_type)
+        )
         if neighbor_radius is None:
-            radius_scaler = radius_scaler_for_kernel_size(
-                kernel_size,
-                kwargs.get('receptive_field_scaler', self.receptive_field_scaler),
-                kwargs.get('distance_type', self.distance_type)
-            )
             neighbor_radius = self.grid_size * radius_scaler
 
+        use_segmented = (
+            kernel_indexer is None
+            and kwargs.get('sort_by', self.sort_by) == "k"
+            and kwargs.get('distance_type', self.distance_type) == "ball"
+            and should_use_direct_segmented_triplets(kernel_size)
+        )
         if kernel_indexer is None:
             kernel_indexer = partial(voxelize_3d, kernel_size=kernel_size)
 
@@ -96,21 +112,37 @@ class MetaData:
             'radius_scaler': radius_scaler,
         }
 
-        i, j, k, num_neighbors = build_triplets(**build_params)
+        if use_segmented:
+            segmented_params = dict(build_params)
+            segmented_params.pop('kernel_indexer')
+            segmented_params.pop('sort_by')
+            i, j, k, seg_offs, num_neighbors = build_triplets_segmented(
+                kernel_size=kernel_size, **segmented_params)
+        else:
+            i, j, k, num_neighbors = build_triplets(**build_params)
+            if kwargs.get('sort_by', self.sort_by) == "k":
+                from sparse_engines._seg_offs import kernel_offset_segments
+                seg_offs = kernel_offset_segments(
+                    k, math.prod(_triple(kernel_size)))
+            else:
+                seg_offs = None
 
         self.i = i
         self.j = j
         self.k = k
+        self.seg_offs = seg_offs
         self.num_neighbors = num_neighbors
         # Radius-search submanifold rulebook: k-sorted (sort_by="k"), variable
         # per-tap neighbor counts (T != n, never uniform / exact-cover). No
         # host reduction — the contract is a structural constant here.
-        self.contract = TripletContract.submanifold()
+        self.contract = TripletContract(
+            k_sorted=(kwargs.get("sort_by", self.sort_by) == "k"))
 
     def dirty_triplets(self):
         self.i = None
         self.j = None
         self.k = None
+        self.seg_offs = None
         self.contract = None
 
     def empty_triplets(self):
