@@ -9,8 +9,6 @@ import torch
 
 from .constants import Constants
 
-from sparse_engines_cuda.ops import bucket_arrange
-
 
 def cumsum_inclusive(x, dim=0):
     # x:                1 2 3 4
@@ -33,14 +31,6 @@ def cumsum_exclusive(x, dim=0, return_sum=False):
 def cumsum_inclusive_zero_prefixed(x):
     zero = Constants.get_zero(x.device, x.dtype)
     return torch.cat((zero, torch.cumsum(x, dim=0)), dim=0)
-
-
-def arange_cached(end, device, dtype=torch.int64):
-    constant_range = Constants.get_range(device, dtype)
-    if end < constant_range.numel():
-        return constant_range[:end]
-    else:
-        return torch.arange(end, dtype=dtype, device=device)
 
 
 def repeat_interleave_indices(
@@ -111,7 +101,7 @@ def arrange_indices(indices, num_indices=None, num_shifts=1, mask=None):
         indices_of_indices = torch.nonzero(mask).squeeze(dim=-1)
         indices = indices[indices_of_indices]
     else:
-        indices_of_indices = arange_cached(indices.shape[0], device=device)
+        indices_of_indices = torch.arange(indices.shape[0], device=device)
 
     if num_shifts > 1:
         indices_of_indices = torch.div(
@@ -121,20 +111,13 @@ def arrange_indices(indices, num_indices=None, num_shifts=1, mask=None):
     if num_indices is None:
         num_indices = torch.max(indices).item() + 1
 
-    # bucket_sizes same as unique counts, eg. indices:[0, 1, 2, 1, 1, 2] bucket_sizes:[1, 3, 2]
-    # bucket_slots unique number increment ID eg. indices:[0, 1, 2, 1, 1, 2] bucket_slots:[0, 0, 0, 1, 2, 1]
-    bucket_sizes, bucket_slots = bucket_arrange(indices, num_indices)
-    # get split id by bucket_sizes eg. bucket_sizes:[1, 3, 1] bucket_splits:[0, 1, 4]
+    # Stable sorting provides the complete grouping directly. The former custom
+    # extension assigned an atomic slot inside each group and then scattered
+    # through group boundaries; no production caller depended on that
+    # unspecified within-group order.
+    sorter = torch.argsort(indices, stable=True)
+    indices_arranged = indices_of_indices[sorter]
+    bucket_sizes = torch.bincount(indices, minlength=num_indices)
     bucket_splits = cumsum_exclusive(bucket_sizes)
-
-    # eg. indices:[0, 1, 2, 1, 1, 2] bucket_splits:[0, 1, 4] bucket_slots:[0, 0, 0, 1, 2, 1]
-    # bucket_slots: [0, 0, 0, 1, 2, 1] + [0, 1, 4, 1, 1, 4] = [0, 1, 4, 2, 3, 5]
-    bucket_slots += bucket_splits[indices.to(torch.int64)]
-
-    # indices_of_indices: [0, 1, 2, 3, 4, 5] --> indices_arranged: [0, 1, 3, 4, 2, 5]
-    indices_arranged = torch.empty_like(
-        indices_of_indices, dtype=indices_of_indices.dtype, device=device
-    )
-    indices_arranged.index_copy_(0, bucket_slots.to(torch.int64), indices_of_indices)
 
     return indices_arranged, bucket_sizes, bucket_splits
