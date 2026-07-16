@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import pointops
 
-from internals.neighbors import radius_search_lookup
+from internals.neighbors import radius_search_sorted_grid8
 from internals.indexing import repeat_interleave_indices
 
 
@@ -47,7 +47,7 @@ def bench(fn, warmup=5, repeats=20):
 
 
 def run_pointelligence(points, queries, radius, sample_inds, query_sample_inds):
-    return radius_search_lookup(points, queries, radius, sample_inds, query_sample_inds)
+    return radius_search_sorted_grid8(points, queries, radius, sample_inds, query_sample_inds)
 
 
 def run_pointcept(xyz, new_xyz, radius, offset, new_offset, nsample):
